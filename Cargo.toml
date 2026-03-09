@@ -10,3 +10,4 @@ rand = "0.10.0"
 ratatui = "0.30.0"
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
+arboard = "3"

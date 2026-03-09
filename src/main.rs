@@ -1,5 +1,6 @@
 const SEARCH_HEIGHT: u16 = 3;
 const SEARCH_HEIGHT_MIN: u16 = 1;
+use arboard::Clipboard;
 use color_eyre::Result;
 use ratatui::{
     DefaultTerminal, Frame,
@@ -7,31 +8,45 @@ use ratatui::{
     layout::{Constraint, Layout, Position},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span, Text},
-    widgets::{Block, List, ListItem, Paragraph},
+    widgets::{Block, List, ListDirection, ListItem, ListState, Paragraph},
 };
 use serde_json::Value;
-use std::fs::File;
 use std::io::BufReader;
+use std::{array, fs::File};
 
 fn main() -> Result<()> {
     let file = File::open("cmds.json")?;
     let reader = BufReader::new(file);
     let data: Value = serde_json::from_reader(reader)?;
-    let entries = data["entries"].as_array();
+    let entries = data["entries"].as_array().expect("Entries should be Arrs");
+    let entries: Vec<Entry> = entries
+        .iter()
+        .map(|e| Entry {
+            cmd: e["cmd"].as_str().unwrap_or("").to_string(),
+            desc: e["desc"].as_str().unwrap_or("").to_string(),
+            heading: e["heading"].as_str().unwrap_or("").to_string(),
+        })
+        .collect();
 
-    println!("{:#?}", entries);
     color_eyre::install()?;
     let terminal = ratatui::init();
-    let app_result = App::new().run(terminal);
+    let app_result = App::new(entries).run(terminal);
     ratatui::restore();
     app_result
 }
-
+struct Entry {
+    cmd: String,
+    desc: String,
+    heading: String,
+}
 struct App {
     /// Current value of the input box
     input: String,
     /// Position of cursor in the editor area.
+    clipboard: Clipboard,
     character_index: usize,
+    selected: usize,
+    entries: Vec<Entry>,
     // Current input mode
     //input_mode: InputMode,
     // History of recorded messages
@@ -39,10 +54,13 @@ struct App {
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(entries: Vec<Entry>) -> Self {
         Self {
             input: String::new(),
+            clipboard: Clipboard::new().expect("Failed to init clipboard"),
             character_index: 0,
+            selected: 0,
+            entries,
         }
     }
 
@@ -58,6 +76,23 @@ impl App {
                             self.input.pop();
                         }
                         KeyCode::Esc => return Ok(()),
+                        KeyCode::Up => {
+                            self.selected = self.selected.saturating_sub(1);
+                        }
+                        KeyCode::Down => {
+                            self.selected =
+                                (self.selected + 1).min(self.filtered_count().saturating_sub(1));
+                        }
+                        KeyCode::Enter => {
+                            let cmd = self
+                                .get_filtered()
+                                .get(self.selected)
+                                .map(|e| e.cmd.clone());
+                            if let Some(text) = cmd {
+                                self.clipboard.set_text(&text).ok();
+                                return Ok(());
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -75,6 +110,46 @@ impl App {
 
         let input = Paragraph::new(self.input.as_str()).block(Block::bordered().title("F1nder"));
 
+        let filtered: Vec<&Entry> = self.get_filtered();
+
+        let items: Vec<ListItem> = filtered
+            .iter()
+            .map(|e| ListItem::new(format!("{} - {}", e.cmd, e.desc)))
+            .collect();
+
+        let list = List::new(items)
+            .block(Block::bordered().title("Commands"))
+            .highlight_style(Style::new().reversed());
+
+        let mut state = ListState::default();
+        state.select(Some(self.selected));
+
         frame.render_widget(input, input_area);
+        frame.render_stateful_widget(list, results_area, &mut state);
+        // frame.render_widget(list, results_area);
+    }
+
+    fn get_filtered(&self) -> Vec<&Entry> {
+        let query = self.input.to_lowercase();
+        self.entries
+            .iter()
+            .filter(|e| {
+                query.is_empty() || e.cmd.to_lowercase().contains(&query)
+                // || e.desc.to_lowercase().contains(&query)
+                // || e.heading.to_lowercase().contains(&query)
+            })
+            .collect()
+    }
+
+    fn filtered_count(&self) -> usize {
+        let query = self.input.to_lowercase();
+        self.entries
+            .iter()
+            .filter(|e| {
+                query.is_empty() || e.cmd.to_lowercase().contains(&query)
+                // || e.desc.to_lowercase().contains(&query)
+                // || e.heading.to_lowercase().contains(&query)
+            })
+            .count()
     }
 }
