@@ -122,7 +122,7 @@ impl App {
 
         let items: Vec<ListItem> = filtered
             .iter()
-            .map(|e| ListItem::new(format!("{} - {}", e.cmd, e.desc)))
+            .map(|e| ListItem::new(format!("{}", e.cmd)))
             .collect();
 
         let list = List::new(items)
