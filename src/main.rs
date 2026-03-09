@@ -71,9 +71,13 @@ impl App {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
                     match key.code {
-                        KeyCode::Char(c) => self.input.push(c),
+                        KeyCode::Char(c) => {
+                            self.input.push(c);
+                            self.selected = 0;
+                        }
                         KeyCode::Backspace => {
                             self.input.pop();
+                            self.selected = 0;
                         }
                         KeyCode::Esc => return Ok(()),
                         KeyCode::Up => {
@@ -106,7 +110,11 @@ impl App {
         ])
         .areas(frame.area());
 
-        let [input_area, results_area] = chunks;
+        let [input_area, content_area] = chunks;
+
+        let [list_area, desc_area] =
+            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .areas(content_area);
 
         let input = Paragraph::new(self.input.as_str()).block(Block::bordered().title("F1nder"));
 
@@ -124,9 +132,18 @@ impl App {
         let mut state = ListState::default();
         state.select(Some(self.selected));
 
+        let desc_text = filtered
+            .get(self.selected)
+            .map(|e| e.desc.as_str())
+            .unwrap_or("");
+
+        let desc = Paragraph::new(desc_text)
+            .block(Block::bordered().title("Description"))
+            .wrap(ratatui::widgets::Wrap { trim: true });
+
         frame.render_widget(input, input_area);
-        frame.render_stateful_widget(list, results_area, &mut state);
-        // frame.render_widget(list, results_area);
+        frame.render_stateful_widget(list, list_area, &mut state);
+        frame.render_widget(desc, desc_area);
     }
 
     fn get_filtered(&self) -> Vec<&Entry> {
