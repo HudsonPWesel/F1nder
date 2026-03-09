@@ -2,6 +2,8 @@ const SEARCH_HEIGHT: u16 = 3;
 const SEARCH_HEIGHT_MIN: u16 = 1;
 use arboard::Clipboard;
 use color_eyre::Result;
+use nucleo::{self, Utf32Str};
+use nucleo_matcher;
 use ratatui::{
     DefaultTerminal, Frame,
     crossterm::event::{self, Event, KeyCode, KeyEventKind},
@@ -147,26 +149,43 @@ impl App {
     }
 
     fn get_filtered(&self) -> Vec<&Entry> {
-        let query = self.input.to_lowercase();
-        self.entries
+        if self.input.is_empty() {
+            return self.entries.iter().collect();
+        }
+        let config = nucleo::Config::DEFAULT;
+        let mut matcher = nucleo::Matcher::new(config);
+        let pattern = nucleo_matcher::pattern::Pattern::parse(
+            &self.input,
+            nucleo_matcher::pattern::CaseMatching::Ignore,
+            nucleo_matcher::pattern::Normalization::Smart,
+        );
+
+        let mut scored: Vec<(u32, &Entry)> = self
+            .entries
             .iter()
-            .filter(|e| {
-                query.is_empty() || e.cmd.to_lowercase().contains(&query)
-                // || e.desc.to_lowercase().contains(&query)
-                // || e.heading.to_lowercase().contains(&query)
+            .filter_map(|e| {
+                let mut buf = Vec::new();
+                let haystack = nucleo_matcher::Utf32Str::new(&e.cmd, &mut buf);
+                pattern
+                    .score(haystack, &mut matcher)
+                    .map(|score| (score, e))
             })
-            .collect()
+            .collect();
+
+        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        scored.iter().map(|(_, e)| *e).collect()
+
+        // self.entries
+        //     .iter()
+        //     .filter(|e| {
+        //         query.is_empty() || e.cmd.to_lowercase().contains(&query)
+        //         // || e.desc.to_lowercase().contains(&query)
+        //         // || e.heading.to_lowercase().contains(&query)
+        //     })
+        //     .collect()
     }
 
     fn filtered_count(&self) -> usize {
-        let query = self.input.to_lowercase();
-        self.entries
-            .iter()
-            .filter(|e| {
-                query.is_empty() || e.cmd.to_lowercase().contains(&query)
-                // || e.desc.to_lowercase().contains(&query)
-                // || e.heading.to_lowercase().contains(&query)
-            })
-            .count()
+        self.get_filtered().len()
     }
 }
