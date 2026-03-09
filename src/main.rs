@@ -13,8 +13,9 @@ use ratatui::{
     widgets::{Block, List, ListDirection, ListItem, ListState, Paragraph},
 };
 use serde_json::Value;
-use std::io::BufReader;
 use std::{array, fs::File};
+use std::{io::BufReader, os::unix::raw::mode_t};
+use strum_macros::{Display, EnumIter, EnumString};
 
 fn main() -> Result<()> {
     let file = File::open("cmds.json")?;
@@ -41,6 +42,15 @@ struct Entry {
     desc: String,
     heading: String,
 }
+
+#[derive(Display, EnumString, EnumIter)]
+enum SearchMode {
+    Cmd,
+    Desc,
+    Heading,
+    All,
+}
+
 struct App {
     /// Current value of the input box
     input: String,
@@ -49,10 +59,10 @@ struct App {
     character_index: usize,
     selected: usize,
     entries: Vec<Entry>,
-    // Current input mode
-    //input_mode: InputMode,
-    // History of recorded messages
-    // messages: Vec<String>,
+    search_mode: SearchMode, // Current input mode
+                             //input_mode: InputMode,
+                             // History of recorded messages
+                             // messages: Vec<String>,
 }
 
 impl App {
@@ -63,6 +73,7 @@ impl App {
             character_index: 0,
             selected: 0,
             entries,
+            search_mode: SearchMode::All,
         }
     }
 
@@ -73,6 +84,24 @@ impl App {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
                     match key.code {
+                        KeyCode::Char('[') => {
+                            self.search_mode = match self.search_mode {
+                                SearchMode::All => SearchMode::Heading,
+                                SearchMode::Heading => SearchMode::Desc,
+                                SearchMode::Desc => SearchMode::Cmd,
+                                SearchMode::Cmd => SearchMode::All,
+                            };
+                            self.selected = 0;
+                        }
+                        KeyCode::Char(']') => {
+                            self.search_mode = match self.search_mode {
+                                SearchMode::All => SearchMode::Cmd,
+                                SearchMode::Cmd => SearchMode::Desc,
+                                SearchMode::Desc => SearchMode::Heading,
+                                SearchMode::Heading => SearchMode::All,
+                            };
+                            self.selected = 0;
+                        }
                         KeyCode::Char(c) => {
                             self.input.push(c);
                             self.selected = 0;
@@ -118,7 +147,8 @@ impl App {
             Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
                 .areas(content_area);
 
-        let input = Paragraph::new(self.input.as_str()).block(Block::bordered().title("F1nder"));
+        let input = Paragraph::new(self.input.as_str())
+            .block(Block::bordered().title(format!("F1nder [{}]", self.search_mode.to_string())));
 
         let filtered: Vec<&Entry> = self.get_filtered();
 
@@ -152,6 +182,7 @@ impl App {
         if self.input.is_empty() {
             return self.entries.iter().collect();
         }
+
         let config = nucleo::Config::DEFAULT;
         let mut matcher = nucleo::Matcher::new(config);
         let pattern = nucleo_matcher::pattern::Pattern::parse(
@@ -164,25 +195,22 @@ impl App {
             .entries
             .iter()
             .filter_map(|e| {
+                let haystack_str: &String = match self.search_mode {
+                    SearchMode::Cmd => &e.cmd,
+                    SearchMode::Desc => &e.desc,
+                    SearchMode::Heading => &e.heading,
+                    SearchMode::All => &e.cmd,
+                };
                 let mut buf = Vec::new();
-                let haystack = nucleo_matcher::Utf32Str::new(&e.cmd, &mut buf);
+                let haystack = Utf32Str::new(haystack_str, &mut buf);
                 pattern
-                    .score(haystack, &mut matcher)
+                    .score(Utf32Str::from(haystack), &mut matcher)
                     .map(|score| (score, e))
             })
             .collect();
 
         scored.sort_by(|a, b| b.0.cmp(&a.0));
         scored.iter().map(|(_, e)| *e).collect()
-
-        // self.entries
-        //     .iter()
-        //     .filter(|e| {
-        //         query.is_empty() || e.cmd.to_lowercase().contains(&query)
-        //         // || e.desc.to_lowercase().contains(&query)
-        //         // || e.heading.to_lowercase().contains(&query)
-        //     })
-        //     .collect()
     }
 
     fn filtered_count(&self) -> usize {
