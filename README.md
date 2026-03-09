@@ -1,11 +1,12 @@
 Notes on disk  →  Parse into Vec<Entry>  →  Fuzzy match against query  →  Render results
                   { cmd, attack, desc }      scored & sorted                in TUI list
 
+The structure means your fuzzy search can match against any field — search "kerberoast" and it hits topic/section, search "ntlmrelayx" and it hits cmd, search "dump" and it hits desc. When you display results in the TUI you can show the topic/section as breadcrumbs above the command so you know where it came from.
+
 ratatui — the standard TUI framework (renders the search box, results list, preview pane). This is what gives you that nvim-like feel.
 crossterm — handles raw terminal input (keypresses, escape, etc.). Ratatui sits on top of this.
 nucleo or fuzzy-matcher — fuzzy search scoring (like fzf). nucleo is what the Helix editor uses and is very fast.
 serde + serde_yaml/toml — if you want structured note files instead of raw markdown parsing.
-
 
 Each Entry is just a struct with fields like cmd: String, attack: String, desc: String, and maybe source_file: String.
 How the TUI Loop Works
