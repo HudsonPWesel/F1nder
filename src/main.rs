@@ -144,7 +144,7 @@ impl App {
         let [input_area, content_area] = chunks;
 
         let [list_area, desc_area] =
-            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+            Layout::horizontal([Constraint::Percentage(70), Constraint::Percentage(30)])
                 .areas(content_area);
 
         let input = Paragraph::new(self.input.as_str())

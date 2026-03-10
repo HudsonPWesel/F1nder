@@ -6,24 +6,27 @@ Outputs clean JSON ready for F1nder.
 
 Usage: python3 parse_notes.py <input_dir_or_file> <output.json>
 """
+
 import re
 import json
 import sys
 import os
 
+
 def clean(text):
     """Strip markdown artifacts from text."""
     # Remove markdown links [text](url) -> text
-    text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
     # Remove backticks
-    text = text.replace('`', '')
+    text = text.replace("`", "")
     # Remove bold/italic
-    text = text.replace('**', '').replace('*', '')
+    text = text.replace("**", "").replace("*", "")
     # Clean non-breaking spaces
-    text = text.replace('\u00a0', ' ')
+    text = text.replace("\u00a0", " ")
     # Collapse whitespace
-    text = re.sub(r'  +', ' ', text)
+    text = re.sub(r"  +", " ", text)
     return text.strip()
+
 
 def split_table_row(row):
     """Split a markdown table row on | but ignore pipes inside backticks."""
@@ -32,10 +35,10 @@ def split_table_row(row):
     in_backtick = False
 
     for char in row:
-        if char == '`':
+        if char == "`":
             in_backtick = not in_backtick
             current += char
-        elif char == '|' and not in_backtick:
+        elif char == "|" and not in_backtick:
             parts.append(current.strip())
             current = ""
         else:
@@ -47,12 +50,13 @@ def split_table_row(row):
     # Remove empty strings from leading/trailing |
     return [p for p in parts if p]
 
+
 def parse_md_file(filepath):
     """Parse a single markdown file into entries."""
-    with open(filepath, 'r', encoding='utf-8') as f:
+    with open(filepath, "r", encoding="utf-8") as f:
         content = f.read()
 
-    lines = content.split('\n')
+    lines = content.split("\n")
     entries = []
     h1 = ""
     h2 = ""
@@ -70,47 +74,67 @@ def parse_md_file(filepath):
         stripped = lines[i].strip()
 
         # Track headings
-        if re.match(r'^# [^#]', stripped):
-            h1 = clean(stripped.lstrip('# '))
+        if re.match(r"^# [^#]", stripped):
+            h1 = clean(stripped.lstrip("# "))
             h2 = ""
             h3 = ""
             context_lines = []
             in_table = False
             table_header_cols = None
-        elif re.match(r'^## [^#]', stripped):
-            h2 = clean(stripped.lstrip('# '))
+        elif re.match(r"^## [^#]", stripped):
+            h2 = clean(stripped.lstrip("# "))
             h3 = ""
             context_lines = []
             in_table = False
             table_header_cols = None
-        elif re.match(r'^### ', stripped):
-            h3 = clean(stripped.lstrip('# '))
+        elif re.match(r"^### ", stripped):
+            h3 = clean(stripped.lstrip("# "))
             context_lines = []
             in_table = False
             table_header_cols = None
 
         # Detect table header row
-        elif stripped.startswith('|') and not in_table:
+        elif stripped.startswith("|") and not in_table:
             parts = split_table_row(stripped)
             if len(parts) >= 2:
                 # Check if next line is separator
-                if i + 1 < len(lines) and '---' in lines[i + 1]:
+                if i + 1 < len(lines) and "---" in lines[i + 1]:
                     table_header_cols = [clean(p).lower() for p in parts]
                     in_table = True
                     i += 2  # skip header and separator
                     continue
 
         # Parse table data rows
-        elif in_table and stripped.startswith('|'):
+        elif in_table and stripped.startswith("|"):
             # Handle multi-line table cells (lines that don't start with |)
             full_row = stripped
             while i + 1 < len(lines):
                 next_line = lines[i + 1].strip()
                 # If next line starts with | it's a new row
-                if next_line.startswith('|') or next_line.startswith('#') or next_line == '':
+                if next_line.startswith("|"):
                     break
+                # If it's a heading, table is done
+                if next_line.startswith("#"):
+                    break
+                # Blank lines: look ahead to see if table continues
+                if next_line == "":
+                    # Check if there's a | row within the next few lines (multi-line cell)
+                    found_table_row = False
+                    for lookahead in range(i + 2, min(i + 5, len(lines))):
+                        la_line = lines[lookahead].strip()
+                        if la_line.startswith("|"):
+                            found_table_row = True
+                            break
+                        if la_line.startswith("#"):
+                            break
+                    if not found_table_row:
+                        break
+                    # It's a blank line inside a multi-line cell, include it
+                    full_row += "\n"
+                    i += 1
+                    continue
                 # Otherwise it's a continuation of this cell
-                full_row += '\n' + next_line
+                full_row += "\n" + next_line
                 i += 1
 
             parts = split_table_row(full_row)
@@ -130,25 +154,45 @@ def parse_md_file(filepath):
 
                 # Add context if available
                 if context_lines:
-                    extra = [c for c in context_lines[-2:] if c.lower() not in desc.lower()]
+                    extra = [
+                        c for c in context_lines[-2:] if c.lower() not in desc.lower()
+                    ]
                     if extra:
-                        desc = desc + '\n' + '\n'.join(extra)
+                        desc = desc + "\n" + "\n".join(extra)
 
                 if cmd:  # only add if there's actually a command
-                    entries.append({
-                        "cmd": cmd,
-                        "desc": desc,
-                        "heading": heading(),
-                    })
-        elif in_table and not stripped.startswith('|'):
-            # Exited the table
+                    entries.append(
+                        {
+                            "cmd": cmd,
+                            "desc": desc,
+                            "heading": heading(),
+                        }
+                    )
+        elif in_table and not stripped.startswith("|"):
+            # Maybe exited the table - but check if it's just a blank line in a cell
+            if stripped == "":
+                # Look ahead for more table rows
+                found_table_row = False
+                for lookahead in range(i + 1, min(i + 5, len(lines))):
+                    la_line = lines[lookahead].strip()
+                    if la_line.startswith("|"):
+                        found_table_row = True
+                        break
+                    if la_line.startswith("#"):
+                        break
+                if found_table_row:
+                    i += 1
+                    continue
+            # Actually exited the table
             in_table = False
             table_header_cols = None
             # This line might be context for next table
             c = clean(stripped)
             if c:
                 context_lines.append(c)
-        elif stripped and not stripped.startswith('|') and not stripped.startswith('- ['):
+        elif (
+            stripped and not stripped.startswith("|") and not stripped.startswith("- [")
+        ):
             c = clean(stripped)
             if c:
                 context_lines.append(c)
@@ -156,6 +200,7 @@ def parse_md_file(filepath):
         i += 1
 
     return entries
+
 
 def parse_directory(path):
     """Parse all .md files in a directory."""
@@ -167,7 +212,7 @@ def parse_directory(path):
     else:
         for root, dirs, files in os.walk(path):
             for f in files:
-                if f.endswith('.md'):
+                if f.endswith(".md"):
                     md_files.append(os.path.join(root, f))
 
     for filepath in sorted(md_files):
@@ -178,6 +223,7 @@ def parse_directory(path):
         all_entries.extend(entries)
 
     return all_entries
+
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
@@ -194,7 +240,7 @@ if __name__ == "__main__":
         "entries": entries,
     }
 
-    with open(output_path, 'w') as f:
+    with open(output_path, "w") as f:
         json.dump(output, f, indent=2)
 
     print(f"\nTotal: {len(entries)} entries -> {output_path}")
