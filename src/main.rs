@@ -14,6 +14,7 @@ use ratatui::{
     widgets::{Block, List, ListDirection, ListItem, ListState, Paragraph},
 };
 use serde_json::Value;
+use std::env::consts::OS;
 use std::{array, fs::File};
 use std::{io::BufReader, os::unix::raw::mode_t};
 use strum_macros::{Display, EnumIter, EnumString};
@@ -127,6 +128,7 @@ impl App {
                                 .map(|e| e.cmd.clone());
                             if let Some(text) = cmd {
                                 //copy_osc52(&text);
+                                println!("Current OS: {}", OS);
                                 // self.clipboard.set_text(&text).ok();
                                 copy_to_linux_clipboard(&text);
                                 return Ok(());
