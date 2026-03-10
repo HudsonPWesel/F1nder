@@ -18,7 +18,7 @@ use std::{io::BufReader, os::unix::raw::mode_t};
 use strum_macros::{Display, EnumIter, EnumString};
 
 fn main() -> Result<()> {
-    let file = File::open("cmds.json")?;
+    let file = File::open("out.json")?;
     let reader = BufReader::new(file);
     let data: Value = serde_json::from_reader(reader)?;
     let entries = data["entries"].as_array().expect("Entries should be Arrs");
@@ -199,7 +199,7 @@ impl App {
                     SearchMode::Cmd => &e.cmd,
                     SearchMode::Desc => &e.desc,
                     SearchMode::Heading => &e.heading,
-                    SearchMode::All => &e.cmd,
+                    SearchMode::All => &e.cmd, //TODO FIX
                 };
                 let mut buf = Vec::new();
                 let haystack = Utf32Str::new(haystack_str, &mut buf);
