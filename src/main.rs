@@ -126,8 +126,9 @@ impl App {
                                 .get(self.selected)
                                 .map(|e| e.cmd.clone());
                             if let Some(text) = cmd {
-                                copy_osc52(&text);
+                                //copy_osc52(&text);
                                 // self.clipboard.set_text(&text).ok();
+                                copy_to_linux_clipboard(&text);
                                 return Ok(());
                             }
                         }
@@ -233,4 +234,20 @@ fn copy_osc52(text: &str) {
 
     // Crucial: Give the terminal a split second to ingest the sequence
     std::thread::sleep(std::time::Duration::from_millis(50));
+}
+
+use std::process::{Command, Stdio};
+
+fn copy_to_linux_clipboard(text: &str) {
+    // This effectively runs: echo -n "text" | xclip -selection clipboard
+    if let Ok(mut child) = Command::new("xclip")
+        .arg("-selection")
+        .arg("clipboard")
+        .stdin(Stdio::piped())
+        .spawn()
+    {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+    }
 }
