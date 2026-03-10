@@ -19,7 +19,8 @@ use std::{io::BufReader, os::unix::raw::mode_t};
 use strum_macros::{Display, EnumIter, EnumString};
 
 fn main() -> Result<()> {
-    let file = File::open("out.json")?;
+    // let file = File::open("out.json")?;
+    let file = File::open("/home/p1erce/PentestingTools/F1nder/cmds.json")?;
     let reader = BufReader::new(file);
     let data: Value = serde_json::from_reader(reader)?;
     let entries = data["entries"].as_array().expect("Entries should be Arrs");
@@ -125,8 +126,8 @@ impl App {
                                 .get(self.selected)
                                 .map(|e| e.cmd.clone());
                             if let Some(text) = cmd {
-                                // copy_osc52(&text);
-                                self.clipboard.set_text(&text).ok();
+                                copy_osc52(&text);
+                                // self.clipboard.set_text(&text).ok();
                                 return Ok(());
                             }
                         }
