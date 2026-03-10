@@ -1,3 +1,14 @@
+```bash
+function f1(){
+  /home/p1erce/PentestingTools/F1nder/target/release/F1nder
+}
+
+zle -N f1
+
+bindkey "\C-p" f1
+```
+
+
 Notes on disk  →  Parse into Vec<Entry>  →  Fuzzy match against query  →  Render results
                   { cmd, attack, desc }      scored & sorted                in TUI list
 
