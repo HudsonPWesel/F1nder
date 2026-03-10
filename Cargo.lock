@@ -7,6 +7,7 @@ name = "F1nder"
 version = "0.1.0"
 dependencies = [
  "arboard",
+ "base64",
  "color-eyre",
  "crossterm",
  "nucleo",

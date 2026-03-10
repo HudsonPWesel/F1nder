@@ -1,6 +1,7 @@
 const SEARCH_HEIGHT: u16 = 3;
 const SEARCH_HEIGHT_MIN: u16 = 1;
 use arboard::Clipboard;
+use base64::{Engine, engine::general_purpose};
 use color_eyre::Result;
 use nucleo::{self, Utf32Str};
 use nucleo_matcher;
@@ -124,6 +125,7 @@ impl App {
                                 .get(self.selected)
                                 .map(|e| e.cmd.clone());
                             if let Some(text) = cmd {
+                                // copy_osc52(&text);
                                 self.clipboard.set_text(&text).ok();
                                 return Ok(());
                             }
@@ -216,4 +218,18 @@ impl App {
     fn filtered_count(&self) -> usize {
         self.get_filtered().len()
     }
+}
+
+use std::io::{self, Write};
+
+fn copy_osc52(text: &str) {
+    let encoded = general_purpose::STANDARD.encode(text);
+    // \x1b]52;c; is the escape sequence for the system clipboard
+    let sequence = format!("\x1b]52;c;{}\x07", encoded);
+    let mut stderr = io::stderr(); // Using stderr is often safer in TUIs to avoid rendering artifacts
+    let _ = stderr.write_all(sequence.as_bytes());
+    let _ = stderr.flush();
+
+    // Crucial: Give the terminal a split second to ingest the sequence
+    std::thread::sleep(std::time::Duration::from_millis(50));
 }
