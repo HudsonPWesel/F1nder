@@ -241,16 +241,17 @@ fn copy_osc52(text: &str) {
 
 use std::process::{Command, Stdio};
 
+// #[cfg(target_os = "linux")]
 fn copy_to_linux_clipboard(text: &str) {
-    // This effectively runs: echo -n "text" | xclip -selection clipboard
-    if let Ok(mut child) = Command::new("xclip")
-        .arg("-selection")
-        .arg("clipboard")
-        .stdin(Stdio::piped())
-        .spawn()
     {
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(text.as_bytes());
-        }
+        use std::process::Command;
+        // We use 'nohup' or a subshell to ensure xclip survives the terminal closing
+        let _ = Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "echo -n '{}' | nohup xclip -selection clipboard >/dev/null 2>&1 &",
+                text
+            ))
+            .spawn();
     }
 }
