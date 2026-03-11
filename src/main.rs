@@ -3,6 +3,7 @@ const SEARCH_HEIGHT_MIN: u16 = 1;
 use arboard::Clipboard;
 use base64::{Engine, engine::general_purpose};
 use color_eyre::Result;
+use crossterm::terminal;
 use nucleo::{self, Utf32Str};
 use nucleo_matcher;
 use ratatui::{
@@ -73,7 +74,7 @@ impl App {
         Self {
             input: String::new(),
             clipboard: Clipboard::new().expect("Failed to init clipboard"),
-            character_index: 0,
+            character_index: 1,
             selected: 0,
             entries,
             search_mode: SearchMode::All,
@@ -82,7 +83,7 @@ impl App {
 
     fn run(mut self, mut terminal: DefaultTerminal) -> Result<()> {
         loop {
-            terminal.draw(|frame| self.draw(frame))?;
+            terminal.draw(|frame: &mut Frame<'_>| self.draw(frame))?;
 
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
@@ -108,10 +109,14 @@ impl App {
                         KeyCode::Char(c) => {
                             self.input.push(c);
                             self.selected = 0;
+                            self.move_cursor_right();
                         }
                         KeyCode::Backspace => {
-                            self.input.pop();
-                            self.selected = 0;
+                            if self.character_index != 1 {
+                                self.input.remove(self.character_index - 2);
+                                self.selected = 0;
+                                self.move_cursor_left();
+                            }
                         }
                         KeyCode::Esc => return Ok(()),
                         KeyCode::Up => {
@@ -135,6 +140,8 @@ impl App {
                                 return Ok(());
                             }
                         }
+                        KeyCode::Left => self.move_cursor_left(),
+                        KeyCode::Right => self.move_cursor_right(),
                         _ => {}
                     }
                 }
@@ -142,6 +149,7 @@ impl App {
         }
     }
     fn draw(&self, frame: &mut Frame) {
+        frame.set_cursor_position(Position::new(self.character_index.try_into().unwrap(), 1));
         let chunks = Layout::vertical([
             Constraint::Length(SEARCH_HEIGHT),
             Constraint::Min(SEARCH_HEIGHT_MIN),
@@ -222,6 +230,18 @@ impl App {
 
     fn filtered_count(&self) -> usize {
         self.get_filtered().len()
+    }
+    fn clamp_cursor(&self, new_cursor_pos: usize) -> usize {
+        new_cursor_pos.clamp(0, self.input.chars().count() + 1)
+    }
+    fn move_cursor_left(&mut self) {
+        let cursor_moved_left = self.character_index.saturating_sub(1);
+        self.character_index = self.clamp_cursor(cursor_moved_left);
+    }
+
+    fn move_cursor_right(&mut self) {
+        let cursor_moved_right = self.character_index.saturating_add(1);
+        self.character_index = self.clamp_cursor(cursor_moved_right);
     }
 }
 
