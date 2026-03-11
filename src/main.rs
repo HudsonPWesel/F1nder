@@ -3,7 +3,7 @@ const SEARCH_HEIGHT_MIN: u16 = 1;
 use arboard::Clipboard;
 use base64::{Engine, engine::general_purpose};
 use color_eyre::Result;
-use crossterm::terminal;
+use crossterm::{event::KeyModifiers, terminal};
 use nucleo::{self, Utf32Str};
 use nucleo_matcher;
 use ratatui::{
@@ -16,6 +16,7 @@ use ratatui::{
 };
 use serde_json::Value;
 use std::env::consts::OS;
+use std::fs;
 use std::{array, fs::File};
 use std::{io::BufReader, os::unix::raw::mode_t};
 use strum_macros::{Display, EnumIter, EnumString};
@@ -107,9 +108,35 @@ impl App {
                             self.selected = 0;
                         }
                         KeyCode::Char(c) => {
-                            self.input.push(c);
-                            self.selected = 0;
-                            self.move_cursor_right();
+                            if c == 'e' && key.modifiers.contains(KeyModifiers::CONTROL) {
+                                ratatui::restore();
+
+                                let filtered_entries = self.get_filtered();
+                                let old_cmd = filtered_entries[self.selected].cmd.clone();
+
+                                let _ = fs::write("tempfile.txt", &old_cmd);
+
+                                std::process::Command::new("nvim")
+                                    .arg("tempfile.txt")
+                                    .status()
+                                    .expect("Failed to launch editor");
+
+                                let new_cmd =
+                                    fs::read_to_string("tempfile.txt")?.trim().to_string();
+
+                                if let Some(entry) =
+                                    self.entries.iter_mut().find(|e| e.cmd == old_cmd)
+                                {
+                                    entry.cmd = new_cmd;
+                                }
+                                self.save_entries()?;
+
+                                terminal = ratatui::init();
+                            } else {
+                                self.input.push(c);
+                                self.selected = 0;
+                                self.move_cursor_right();
+                            }
                         }
                         KeyCode::Backspace => {
                             if self.character_index != 1 {
@@ -242,6 +269,21 @@ impl App {
     fn move_cursor_right(&mut self) {
         let cursor_moved_right = self.character_index.saturating_add(1);
         self.character_index = self.clamp_cursor(cursor_moved_right);
+    }
+
+    fn save_entries(&self) -> Result<()> {
+        let output = serde_json::json!({
+            "source": "combined",
+            "entries": self.entries.iter().map(|e| {
+                serde_json::json!({
+                    "cmd": e.cmd,
+                    "desc": e.desc,
+                    "heading": e.heading,
+                })
+            }).collect::<Vec<_>>()
+        });
+        fs::write("out.json", serde_json::to_string_pretty(&output)?)?;
+        Ok(())
     }
 }
 
