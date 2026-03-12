@@ -157,6 +157,18 @@ impl App {
                                 self.entries.push(new_entry);
                                 self.save_entries()?;
                                 terminal = ratatui::init();
+                            }
+                            if c == 'd' && key.modifiers.contains(KeyModifiers::CONTROL) {
+                                ratatui::restore();
+
+                                let filtered_entries = self.get_filtered();
+                                let old_cmd = filtered_entries[self.selected].cmd.clone();
+                                // if let Some(entry) =
+                                self.entries.retain(|e| e.cmd != old_cmd);
+
+                                self.save_entries()?;
+
+                                terminal = ratatui::init();
                             } else {
                                 self.input.push(c);
                                 self.selected = 0;
