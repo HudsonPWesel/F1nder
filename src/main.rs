@@ -234,26 +234,22 @@ impl App {
             Layout::horizontal([Constraint::Percentage(70), Constraint::Percentage(30)])
                 .areas(content_area);
 
-        let [description_area, environment_area] =
-            Layout::vertical([Constraint::Percentage(30), Constraint::Percentage(70)])
-                .areas(desc_area);
+        let [breadcrumb_area, chain_area, description_area] = Layout::vertical([
+            Constraint::Length(4),      // breadcrumb
+            Constraint::Percentage(50), // attack chain
+            Constraint::Min(3),         // description
+        ])
+        .areas(desc_area);
 
         let input = Paragraph::new(self.input.as_str())
             .block(Block::bordered().title(format!("F1nder [{}]", self.search_mode.to_string())));
 
-        let cmd_strings: Vec<String> = self
-            .get_filtered_entries()
-            .iter()
-            .map(|e| e.cmd.clone())
-            .collect();
-        let alias_strings: Vec<String> = self
-            .get_filtered_aliases()
-            .iter()
-            .map(|a| a.to_string())
-            .collect();
+        let filtered = self.get_filtered_entries();
+        let cmd_strings: Vec<String> = filtered.iter().map(|e| e.cmd.clone()).collect();
+        // let alias_strings: Vec<String> = filtered.iter().map(|a| a.to_string()).collect();
 
         let cmd_list = App::build_list(&cmd_strings, "Commands");
-        let alias_list = App::build_list(&alias_strings, "Aliases");
+        // let alias_list = App::build_list(&alias_strings, "Aliases");
 
         let mut cmd_state = ListState::default();
         cmd_state.select(Some(self.selected));
@@ -261,6 +257,24 @@ impl App {
         let mut alias_state = ListState::default();
         alias_state.select(Some(self.selected));
 
+        let chain = if let Some(selected_entry) = self.get_filtered_entries().get(self.selected) {
+            let heading = &filtered.get(self.selected).unwrap().heading;
+
+            // breadcrumb - split and reverse
+            let breadcrumb: String = heading.rsplit(" > ").collect::<Vec<&str>>().join("\n  > ");
+
+            let chain_entries = self.get_chain(heading);
+
+            // find which chain entry matches the selected cmd
+            let chain_index = chain_entries
+                .iter()
+                .position(|e| e.cmd == selected_entry.cmd)
+                .unwrap_or(0);
+
+            (breadcrumb, chain_entries, chain_index)
+        } else {
+            (String::new(), vec![], 0)
+        };
         let desc_text = self
             .get_filtered_entries()
             .get(self.selected)
@@ -271,11 +285,19 @@ impl App {
             .block(Block::bordered().title("Description"))
             .wrap(ratatui::widgets::Wrap { trim: true });
 
+        let breadcrumb_widget =
+            Paragraph::new(chain.0.as_str()).block(Block::bordered().title("Heading"));
+
+        let chain_items: Vec<String> = chain.1.iter().map(|e| e.cmd.clone()).collect();
+        let chain_list = App::build_list(&chain_items, "Attack Chain");
+        let mut chain_state = ListState::default();
+        chain_state.select(Some(chain.2));
+
         frame.render_widget(input, input_area);
         frame.render_stateful_widget(cmd_list, list_area, &mut cmd_state);
-        frame.render_stateful_widget(alias_list, environment_area, &mut alias_state);
-        frame.render_widget(desc_widget, desc_area);
-        // frame.render_widget(env_widget, environment_area);
+        frame.render_widget(breadcrumb_widget, breadcrumb_area);
+        frame.render_stateful_widget(chain_list, chain_area, &mut chain_state);
+        frame.render_widget(desc_widget, description_area);
         Ok(())
     }
 
@@ -381,6 +403,12 @@ impl App {
         });
         fs::write("out.json", serde_json::to_string_pretty(&output)?)?;
         Ok(())
+    }
+    fn get_chain(&self, heading: &str) -> Vec<&Entry> {
+        self.entries
+            .iter()
+            .filter(|e| e.heading == heading)
+            .collect()
     }
 }
 
