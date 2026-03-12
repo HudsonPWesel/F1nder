@@ -132,6 +132,31 @@ impl App {
                                 self.save_entries()?;
 
                                 terminal = ratatui::init();
+                            } else if c == 'a' && key.modifiers.contains(KeyModifiers::CONTROL) {
+                                ratatui::restore();
+
+                                let _ = fs::write(
+                                    "tempfile.txt",
+                                    "command here\n---\ndescription here\n---\nHeading > Subheading",
+                                )?;
+
+                                std::process::Command::new("nvim")
+                                    .arg("tempfile.txt")
+                                    .status()
+                                    .expect("Failed to launch editor");
+
+                                let content = fs::read_to_string("tempfile.txt")?;
+
+                                let parts: Vec<&str> = content.split("---").collect();
+                                let new_entry = Entry {
+                                    cmd: parts.get(0).unwrap_or(&"").trim().to_string(),
+                                    desc: parts.get(1).unwrap_or(&"").trim().to_string(),
+                                    heading: parts.get(2).unwrap_or(&"").trim().to_string(),
+                                };
+
+                                self.entries.push(new_entry);
+                                self.save_entries()?;
+                                terminal = ratatui::init();
                             } else {
                                 self.input.push(c);
                                 self.selected = 0;
@@ -303,11 +328,9 @@ fn copy_osc52(text: &str) {
 
 use std::process::{Command, Stdio};
 
-// #[cfg(target_os = "linux")]
 fn copy_to_linux_clipboard(text: &str) {
     {
         use std::process::Command;
-        // We use 'nohup' or a subshell to ensure xclip survives the terminal closing
         let _ = Command::new("sh")
             .arg("-c")
             .arg(format!(
