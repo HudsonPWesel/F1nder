@@ -147,6 +147,11 @@ pub struct App {
     /// Folders the user has collapsed *while filtering* (reset when the filter
     /// text changes). Filtered folders are expanded by default.
     pub browse_collapsed: HashSet<String>,
+    /// File-name filter options: `"All"` at index 0, then each source-file stem.
+    pub file_filters: Vec<String>,
+    /// Index into `file_filters` of the active file filter (0 = All). Shared by
+    /// both the Search and Browse tabs, cycled with Ctrl+F.
+    pub file_filter: usize,
     pub query: String,
     pub mode: SearchMode,
     pub list_state: ListState,
@@ -197,6 +202,31 @@ impl App {
             browse_state.select(Some(saved_browse_sel.unwrap_or(0)));
         }
 
+        // File-filter options: "All" plus each distinct source-file stem.
+        let mut stems: Vec<String> = entries
+            .iter()
+            .filter_map(|e| {
+                e.source_file
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+            })
+            .collect();
+        stems.sort();
+        stems.dedup();
+        let mut file_filters = vec!["All".to_string()];
+        file_filters.extend(stems);
+
+        let saved_file = fs::read_to_string(get_prev_search_path())
+            .unwrap_or_default()
+            .lines()
+            .nth(2)
+            .unwrap_or("")
+            .to_owned();
+        let file_filter = file_filters
+            .iter()
+            .position(|f| f == &saved_file)
+            .unwrap_or(0);
+
         let entry_index = entries
             .iter()
             .enumerate()
@@ -227,6 +257,8 @@ impl App {
             browse_state,
             browse_query: saved_browse_query,
             browse_collapsed: HashSet::new(),
+            file_filters,
+            file_filter,
             results: vec![],
             cursor_index: fs::read_to_string(get_prev_search_path())
                 .unwrap_or(String::new())
@@ -390,10 +422,39 @@ impl App {
             .collect()
     }
 
+    /// The active file-filter name, or `None` when set to "All".
+    pub fn file_filter_name(&self) -> Option<&str> {
+        if self.file_filter == 0 {
+            None
+        } else {
+            self.file_filters.get(self.file_filter).map(|s| s.as_str())
+        }
+    }
+
+    /// Advance the file filter to the next option, wrapping around.
+    pub fn cycle_file_filter(&mut self) {
+        if !self.file_filters.is_empty() {
+            self.file_filter = (self.file_filter + 1) % self.file_filters.len();
+        }
+    }
+
+    /// Move the file filter to the previous option, wrapping around.
+    pub fn cycle_file_filter_rev(&mut self) {
+        let n = self.file_filters.len();
+        if n != 0 {
+            self.file_filter = (self.file_filter + n - 1) % n;
+        }
+    }
+
     pub fn save_prev_search(&self) {
+        let file = self
+            .file_filters
+            .get(self.file_filter)
+            .map(|s| s.as_str())
+            .unwrap_or("All");
         let _ = fs::write(
             get_prev_search_path(),
-            format!("{}\n{}", self.query, self.mode),
+            format!("{}\n{}\n{}", self.query, self.mode, file),
         );
     }
 

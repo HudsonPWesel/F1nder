@@ -454,6 +454,22 @@ fn handle_key_event(app: &mut App, terminal: &mut DefaultTerminal) -> Result<boo
                 };
                 search(app, true);
             }
+            // File filter: Ctrl+F or Super+F cycles forward; add Shift (or an
+            // uppercase 'F') to cycle in reverse.
+            KeyCode::Char('f' | 'F')
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
+            {
+                let reverse = matches!(key.code, KeyCode::Char('F'))
+                    || key.modifiers.contains(KeyModifiers::SHIFT);
+                if reverse {
+                    app.cycle_file_filter_rev();
+                } else {
+                    app.cycle_file_filter();
+                }
+                search(app, true);
+            }
 
             KeyCode::Char('[') => {
                 app.top_tab = if app.top_tab == 0 { 1 } else { 0 };
@@ -502,8 +518,9 @@ fn handle_key_event(app: &mut App, terminal: &mut DefaultTerminal) -> Result<boo
                 }
             }
             KeyCode::Char(c)
-                if !key.modifiers.contains(KeyModifiers::CONTROL)
-                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+                if !key.modifiers.intersects(
+                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                ) =>
             {
                 app.query.insert(app.cursor_index, c);
                 app.cursor_index += 1;
@@ -534,7 +551,15 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             render_main(frame, chunks[3], app);
         }
         _ => {
-            render_folder_view(frame, chunks[3], app);
+            // Use the combined search-input + main area so the FILTER box sits
+            // right under the tabs, aligned with where the search bar renders.
+            let area = Rect {
+                x: chunks[2].x,
+                y: chunks[2].y,
+                width: chunks[2].width,
+                height: chunks[2].height + chunks[3].height,
+            };
+            render_folder_view(frame, area, app);
         }
     }
 }
@@ -571,10 +596,14 @@ fn count_matches(node: &TreeNode, matches: Option<&HashSet<usize>>) -> usize {
 fn browse_match_set(app: &App) -> HashSet<usize> {
     let ql = app.browse_query.to_lowercase();
     let terms: Vec<&str> = ql.split_whitespace().collect();
+    let file_ref = app.file_filter_name();
     app.entries
         .iter()
         .enumerate()
         .filter_map(|(i, e)| {
+            if !entry_in_file(e, file_ref) {
+                return None;
+            }
             let hay = format!("{} {}", e.title, e.heading_path.join(" ")).to_lowercase();
             if terms.iter().all(|t| hay.contains(t)) {
                 Some(i)
@@ -587,22 +616,24 @@ fn browse_match_set(app: &App) -> HashSet<usize> {
 
 /// Walk the tree, emitting only rows whose ancestor folders are all expanded.
 /// A folder's key is its path (ancestor texts joined by NUL) so it stays stable
-/// across rebuilds. When `filter` is set, only matching leaves and their ancestor
-/// folders are shown; those folders are expanded by default but can be collapsed
-/// (tracked in `collapsed`).
+/// across rebuilds. When `prune` is set, only matching leaves and their ancestor
+/// folders are shown. `auto_expand` (true only for a text filter) force-expands
+/// surviving folders unless explicitly collapsed; otherwise the normal
+/// `expanded` set is honored so file-only filtering stays browsable.
 fn flatten(
     nodes: &[TreeNode],
     depth: usize,
     prefix: &str,
     expanded: &HashSet<String>,
     collapsed: &HashSet<String>,
-    filter: Option<&HashSet<usize>>,
+    prune: Option<&HashSet<usize>>,
+    auto_expand: bool,
     out: &mut Vec<BrowseRow>,
 ) {
     for node in nodes {
         let is_folder = node.entry_index.is_none();
 
-        if let Some(m) = filter {
+        if let Some(m) = prune {
             let keep = match node.entry_index {
                 Some(i) => m.contains(&i),
                 None => count_matches(node, Some(m)) > 0,
@@ -617,9 +648,7 @@ fn flatten(
         } else {
             format!("{}\u{0}{}", prefix, node.text)
         };
-        // While filtering, folders default to expanded unless explicitly collapsed;
-        // otherwise honor the normal expanded set.
-        let is_expanded = if filter.is_some() {
+        let is_expanded = if auto_expand {
             !collapsed.contains(&key)
         } else {
             expanded.contains(&key)
@@ -632,25 +661,38 @@ fn flatten(
             is_folder,
             expanded: is_expanded,
             count: if is_folder {
-                count_matches(node, filter)
+                count_matches(node, prune)
             } else {
                 1
             },
         });
         if is_folder && is_expanded {
-            flatten(&node.children, depth + 1, &key, expanded, collapsed, filter, out);
+            flatten(
+                &node.children,
+                depth + 1,
+                &key,
+                expanded,
+                collapsed,
+                prune,
+                auto_expand,
+                out,
+            );
         }
     }
 }
 
-/// The Browse tree flattened to its currently-visible rows, honoring the filter.
+/// The Browse tree flattened to its currently-visible rows, honoring the filters.
 fn browse_rows(app: &App) -> Vec<BrowseRow> {
     let roots = build_tree(&app.entries);
 
-    let filter: Option<HashSet<usize>> = if app.browse_query.trim().is_empty() {
-        None
-    } else {
+    // A text filter auto-expands to reveal matches; a file-only filter just
+    // prunes to that file's subtree and stays foldable.
+    let has_text = !app.browse_query.trim().is_empty();
+    let has_file = app.file_filter_name().is_some();
+    let prune: Option<HashSet<usize>> = if has_text || has_file {
         Some(browse_match_set(app))
+    } else {
+        None
     };
 
     let mut out = Vec::new();
@@ -660,7 +702,8 @@ fn browse_rows(app: &App) -> Vec<BrowseRow> {
         "",
         &app.expanded,
         &app.browse_collapsed,
-        filter.as_ref(),
+        prune.as_ref(),
+        has_text,
         &mut out,
     );
     out
@@ -685,6 +728,32 @@ fn set_folder_expanded(app: &mut App, key: &str, expanded: bool, filtering: bool
         app.expanded.insert(key.to_string());
     } else {
         app.expanded.remove(key);
+    }
+}
+
+/// Rename a heading folder across every entry beneath its path. `key` is the
+/// folder's tree key: the source-file stem then heading components, joined by NUL.
+fn rename_heading(app: &mut App, key: &str, new_name: &str) {
+    let comps: Vec<&str> = key.split('\u{0}').collect();
+    if comps.len() < 2 {
+        return; // file-level node or invalid — nothing to rename
+    }
+    let file = comps[0];
+    let prefix = &comps[1..]; // matches entry.heading_path[..prefix.len()]
+    let idx = prefix.len() - 1;
+
+    for e in &mut app.entries {
+        if entry_stem(e) != file {
+            continue;
+        }
+        if e.heading_path.len() >= prefix.len()
+            && e.heading_path[..prefix.len()]
+                .iter()
+                .zip(prefix.iter())
+                .all(|(a, b)| a == b)
+        {
+            e.heading_path[idx] = new_name.to_string();
+        }
     }
 }
 
@@ -752,23 +821,58 @@ fn handle_browse_key(app: &mut App, terminal: &mut DefaultTerminal, key: KeyEven
             }
         }
         // Edit the selected command, reusing the existing editor template flow.
+        // Ctrl+E: edit the selected command, or rename the selected heading folder.
         KeyCode::Char('e') if ctrl => {
-            if let Some(idx) = browse_selected_entry_index(app) {
-                let entry = app.entries[idx].clone();
+            let rows = browse_rows(app);
+            let selected = app
+                .browse_state
+                .selected()
+                .and_then(|s| rows.get(s))
+                .map(|r| (r.is_folder, r.depth, r.key.clone(), r.text.clone(), r.entry_index));
 
-                disable_raw_mode()?;
-                execute!(stdout(), LeaveAlternateScreen, Show)?;
+            if let Some((is_folder, depth, key, text, entry_index)) = selected {
+                if is_folder {
+                    // depth 0 is the source-file node — not an editable heading.
+                    if depth >= 1 {
+                        disable_raw_mode()?;
+                        execute!(stdout(), LeaveAlternateScreen, Show)?;
 
-                fs::write(get_editor_temp_path(), entry_to_template(&entry))?;
-                let _ = open_editor(get_editor_temp_path());
-                let updated_entry = parse_template(&entry.id, app)?;
-                app.entries[idx] = updated_entry;
-                app.dirty = true;
-                fs::remove_file(get_editor_temp_path())?;
+                        fs::write(get_editor_temp_path(), format!("{}\n", text))?;
+                        let _ = open_editor(get_editor_temp_path());
+                        let new_name = fs::read_to_string(get_editor_temp_path())?
+                            .lines()
+                            .next()
+                            .unwrap_or("")
+                            .trim()
+                            .to_string();
+                        fs::remove_file(get_editor_temp_path())?;
 
-                enable_raw_mode()?;
-                execute!(stdout(), EnterAlternateScreen, Hide)?;
-                terminal.clear()?;
+                        enable_raw_mode()?;
+                        execute!(stdout(), EnterAlternateScreen, Hide)?;
+                        terminal.clear()?;
+
+                        if !new_name.is_empty() && new_name != text {
+                            rename_heading(app, &key, &new_name);
+                            app.dirty = true;
+                        }
+                    }
+                } else if let Some(idx) = entry_index {
+                    let entry = app.entries[idx].clone();
+
+                    disable_raw_mode()?;
+                    execute!(stdout(), LeaveAlternateScreen, Show)?;
+
+                    fs::write(get_editor_temp_path(), entry_to_template(&entry))?;
+                    let _ = open_editor(get_editor_temp_path());
+                    let updated_entry = parse_template(&entry.id, app)?;
+                    app.entries[idx] = updated_entry;
+                    app.dirty = true;
+                    fs::remove_file(get_editor_temp_path())?;
+
+                    enable_raw_mode()?;
+                    execute!(stdout(), EnterAlternateScreen, Hide)?;
+                    terminal.clear()?;
+                }
             }
         }
         KeyCode::Char('d') if ctrl => {
@@ -813,6 +917,22 @@ fn handle_browse_key(app: &mut App, terminal: &mut DefaultTerminal, key: KeyEven
             execute!(stdout(), EnterAlternateScreen, Hide)?;
             terminal.clear()?;
         }
+        // File filter: Ctrl+F or Super+F forward; add Shift (or 'F') for reverse.
+        KeyCode::Char('f' | 'F')
+            if key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
+        {
+            let reverse = matches!(key.code, KeyCode::Char('F'))
+                || key.modifiers.contains(KeyModifiers::SHIFT);
+            if reverse {
+                app.cycle_file_filter_rev();
+            } else {
+                app.cycle_file_filter();
+            }
+            app.browse_collapsed.clear();
+            app.browse_state.select(Some(0));
+        }
         // Incremental filter typing. Editing the filter resets transient
         // collapse state so new matches are revealed.
         KeyCode::Char('u') if ctrl => {
@@ -825,7 +945,12 @@ fn handle_browse_key(app: &mut App, terminal: &mut DefaultTerminal, key: KeyEven
             app.browse_collapsed.clear();
             app.browse_state.select(Some(0));
         }
-        KeyCode::Char(c) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
+        KeyCode::Char(c)
+            if !ctrl
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::ALT | KeyModifiers::SUPER) =>
+        {
             app.browse_query.push(c);
             app.browse_collapsed.clear();
             app.browse_state.select(Some(0));
@@ -872,6 +997,14 @@ fn render_browse_filter(frame: &mut Frame, area: Rect, app: &App) {
             Style::default()
                 .bg(C_ACCENT)
                 .fg(C_ACCENT_BG)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            format!(" file:{} ", app.file_filter_name().unwrap_or("ALL")),
+            Style::default()
+                .bg(C_DIM)
+                .fg(C_FG_BRIGHT)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" "),
@@ -1008,7 +1141,9 @@ fn render_browse_detail(frame: &mut Frame, area: Rect, entry: Option<&Entry>) {
         )));
     }
 
-    let p = Paragraph::new(lines).wrap(Wrap { trim: false }).block(block);
+    let p = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .block(block);
     frame.render_widget(p, area);
 }
 fn render_top_tabs(frame: &mut Frame, area: Rect, app: &App) {
@@ -1038,17 +1173,15 @@ fn render_search_input(frame: &mut Frame, area: Rect, app: &App) {
         ),
     ];
 
-    // Show an active file: filter as a badge next to the mode badge.
-    if let (Some(filter), _) = parse_query(&app.query) {
-        mode_spans.push(Span::raw(" "));
-        mode_spans.push(Span::styled(
-            format!(" file:{} ", filter),
-            Style::default()
-                .bg(C_DIM)
-                .fg(C_FG_BRIGHT)
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
+    // Show the file filter as a badge next to the mode badge (Ctrl+F cycles it).
+    mode_spans.push(Span::raw(" "));
+    mode_spans.push(Span::styled(
+        format!(" file:{} ", app.file_filter_name().unwrap_or("ALL")),
+        Style::default()
+            .bg(C_DIM)
+            .fg(C_FG_BRIGHT)
+            .add_modifier(Modifier::BOLD),
+    ));
     mode_spans.push(Span::raw(" "));
     let mode_title = Line::from(mode_spans);
 
@@ -1111,36 +1244,20 @@ fn render_main(frame: &mut Frame, area: Rect, app: &mut App) {
     render_chain(frame, right_rows[1], current_chain, &entry_id);
 }
 
-/// Split a raw query into an optional `file:<stem>` filter and the remaining
-/// fuzzy query. Only the first `file:` token is honored; the rest is the query.
-pub fn parse_query(raw: &str) -> (Option<String>, String) {
-    let mut file_filter: Option<String> = None;
-    let mut rest: Vec<&str> = Vec::new();
-
-    for tok in raw.split_whitespace() {
-        let lower = tok.to_lowercase();
-        if let Some(value) = lower.strip_prefix("file:") {
-            if file_filter.is_none() && !value.is_empty() {
-                // Preserve the original-case value ("file:" is 5 ASCII bytes).
-                file_filter = Some(tok[5..].to_string());
-                continue;
-            }
-        }
-        rest.push(tok);
-    }
-
-    (file_filter, rest.join(" "))
+/// The source-file stem of an entry (e.g. `CAPE-CMDs`).
+fn entry_stem(entry: &Entry) -> String {
+    entry
+        .source_file
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
-/// Whether an entry's source-file stem contains the (lowercased) filter.
-fn entry_matches_file(entry: &Entry, filter_lc: &Option<String>) -> bool {
-    match filter_lc {
+/// Whether an entry belongs to the active file filter (`None` = all files).
+fn entry_in_file(entry: &Entry, filter: Option<&str>) -> bool {
+    match filter {
         None => true,
-        Some(f) => entry
-            .source_file
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_lowercase().contains(f))
-            .unwrap_or(false),
+        Some(name) => entry_stem(entry) == name,
     }
 }
 
@@ -1148,14 +1265,14 @@ fn search(app: &mut App, reset_selection: bool) {
     app.current_chain_index = 0;
     let previous_selection = app.list_state.selected();
 
-    let (file_filter, raw_query) = parse_query(&app.query);
-    let filter_lc = file_filter.as_ref().map(|s| s.to_lowercase());
-    let query = raw_query.trim();
+    let file_filter = app.file_filter_name().map(|s| s.to_string());
+    let file_ref = file_filter.as_deref();
+    let query = app.query.trim();
 
     if query.is_empty() {
         // No fuzzy query: list every entry that passes the file filter.
         app.results = (0..app.entries.len())
-            .filter(|&i| entry_matches_file(&app.entries[i], &filter_lc))
+            .filter(|&i| entry_in_file(&app.entries[i], file_ref))
             .collect();
     } else {
         let mut config = Config::DEFAULT;
@@ -1188,7 +1305,7 @@ fn search(app: &mut App, reset_selection: bool) {
         let mut scored: Vec<(usize, u32)> = Vec::new();
 
         for (i, entry) in app.entries.iter().enumerate() {
-            if !entry_matches_file(entry, &filter_lc) {
+            if !entry_in_file(entry, file_ref) {
                 continue;
             }
             match app.mode {
