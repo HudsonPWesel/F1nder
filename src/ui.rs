@@ -550,31 +550,80 @@ struct BrowseRow {
     count: usize,
 }
 
-fn count_leaves(node: &TreeNode) -> usize {
-    if node.entry_index.is_some() {
-        return 1;
+/// Count matching leaf descendants (all leaves when `matches` is None).
+fn count_matches(node: &TreeNode, matches: Option<&HashSet<usize>>) -> usize {
+    match node.entry_index {
+        Some(i) => match matches {
+            Some(m) => usize::from(m.contains(&i)),
+            None => 1,
+        },
+        None => node
+            .children
+            .iter()
+            .map(|c| count_matches(c, matches))
+            .sum(),
     }
-    node.children.iter().map(count_leaves).sum()
+}
+
+/// The set of entry indices matching the Browse filter: every whitespace-separated
+/// word must appear (case-insensitively) as a substring of the entry's title or
+/// heading path. Predictable and precise — `sql injection` needs both words.
+fn browse_match_set(app: &App) -> HashSet<usize> {
+    let ql = app.browse_query.to_lowercase();
+    let terms: Vec<&str> = ql.split_whitespace().collect();
+    app.entries
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| {
+            let hay = format!("{} {}", e.title, e.heading_path.join(" ")).to_lowercase();
+            if terms.iter().all(|t| hay.contains(t)) {
+                Some(i)
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// Walk the tree, emitting only rows whose ancestor folders are all expanded.
 /// A folder's key is its path (ancestor texts joined by NUL) so it stays stable
-/// across rebuilds.
+/// across rebuilds. When `filter` is set, only matching leaves and their ancestor
+/// folders are shown; those folders are expanded by default but can be collapsed
+/// (tracked in `collapsed`).
 fn flatten(
     nodes: &[TreeNode],
     depth: usize,
     prefix: &str,
     expanded: &HashSet<String>,
+    collapsed: &HashSet<String>,
+    filter: Option<&HashSet<usize>>,
     out: &mut Vec<BrowseRow>,
 ) {
     for node in nodes {
         let is_folder = node.entry_index.is_none();
+
+        if let Some(m) = filter {
+            let keep = match node.entry_index {
+                Some(i) => m.contains(&i),
+                None => count_matches(node, Some(m)) > 0,
+            };
+            if !keep {
+                continue;
+            }
+        }
+
         let key = if prefix.is_empty() {
             node.text.clone()
         } else {
             format!("{}\u{0}{}", prefix, node.text)
         };
-        let is_expanded = expanded.contains(&key);
+        // While filtering, folders default to expanded unless explicitly collapsed;
+        // otherwise honor the normal expanded set.
+        let is_expanded = if filter.is_some() {
+            !collapsed.contains(&key)
+        } else {
+            expanded.contains(&key)
+        };
         out.push(BrowseRow {
             depth,
             text: node.text.clone(),
@@ -582,25 +631,61 @@ fn flatten(
             entry_index: node.entry_index,
             is_folder,
             expanded: is_expanded,
-            count: if is_folder { count_leaves(node) } else { 1 },
+            count: if is_folder {
+                count_matches(node, filter)
+            } else {
+                1
+            },
         });
         if is_folder && is_expanded {
-            flatten(&node.children, depth + 1, &key, expanded, out);
+            flatten(&node.children, depth + 1, &key, expanded, collapsed, filter, out);
         }
     }
 }
 
-/// The Browse tree flattened to its currently-visible rows.
+/// The Browse tree flattened to its currently-visible rows, honoring the filter.
 fn browse_rows(app: &App) -> Vec<BrowseRow> {
     let roots = build_tree(&app.entries);
+
+    let filter: Option<HashSet<usize>> = if app.browse_query.trim().is_empty() {
+        None
+    } else {
+        Some(browse_match_set(app))
+    };
+
     let mut out = Vec::new();
-    flatten(&roots, 0, "", &app.expanded, &mut out);
+    flatten(
+        &roots,
+        0,
+        "",
+        &app.expanded,
+        &app.browse_collapsed,
+        filter.as_ref(),
+        &mut out,
+    );
     out
 }
 
 fn browse_selected_entry_index(app: &App) -> Option<usize> {
     let sel = app.browse_state.selected()?;
     browse_rows(app).get(sel).and_then(|r| r.entry_index)
+}
+
+/// Set a folder's expanded state, writing to the store that matches the current
+/// mode: the persistent `expanded` set normally, or the transient
+/// `browse_collapsed` set (inverted meaning) while filtering.
+fn set_folder_expanded(app: &mut App, key: &str, expanded: bool, filtering: bool) {
+    if filtering {
+        if expanded {
+            app.browse_collapsed.remove(key);
+        } else {
+            app.browse_collapsed.insert(key.to_string());
+        }
+    } else if expanded {
+        app.expanded.insert(key.to_string());
+    } else {
+        app.expanded.remove(key);
+    }
 }
 
 fn handle_browse_key(app: &mut App, terminal: &mut DefaultTerminal, key: KeyEvent) -> Result<bool> {
@@ -628,16 +713,15 @@ fn handle_browse_key(app: &mut App, terminal: &mut DefaultTerminal, key: KeyEven
                 app.browse_state.select(Some(i));
             }
         }
-        // Enter/Right: expand a folder, or copy + exit on a command.
+        // Enter/Right: toggle a folder, or copy + exit on a command.
         KeyCode::Enter | KeyCode::Right => {
+            let filtering = !app.browse_query.trim().is_empty();
             let rows = browse_rows(app);
             if let Some(row) = app.browse_state.selected().and_then(|s| rows.get(s)) {
                 if row.is_folder {
-                    if row.expanded {
-                        app.expanded.remove(&row.key);
-                    } else {
-                        app.expanded.insert(row.key.clone());
-                    }
+                    let key = row.key.clone();
+                    let expanded_now = row.expanded;
+                    set_folder_expanded(app, &key, !expanded_now, filtering);
                 } else if key.code == KeyCode::Enter {
                     if let Some(idx) = row.entry_index {
                         copy_to_clipboard(&app.entries[idx].cmd);
@@ -648,11 +732,13 @@ fn handle_browse_key(app: &mut App, terminal: &mut DefaultTerminal, key: KeyEven
         }
         // Left: collapse an expanded folder, else jump to the parent row.
         KeyCode::Left => {
+            let filtering = !app.browse_query.trim().is_empty();
             let rows = browse_rows(app);
             if let Some(sel) = app.browse_state.selected() {
                 if let Some(row) = rows.get(sel) {
                     if row.is_folder && row.expanded {
-                        app.expanded.remove(&row.key);
+                        let key = row.key.clone();
+                        set_folder_expanded(app, &key, false, filtering);
                     } else {
                         let depth = row.depth;
                         for j in (0..sel).rev() {
@@ -727,6 +813,23 @@ fn handle_browse_key(app: &mut App, terminal: &mut DefaultTerminal, key: KeyEven
             execute!(stdout(), EnterAlternateScreen, Hide)?;
             terminal.clear()?;
         }
+        // Incremental filter typing. Editing the filter resets transient
+        // collapse state so new matches are revealed.
+        KeyCode::Char('u') if ctrl => {
+            app.browse_query.clear();
+            app.browse_collapsed.clear();
+            app.browse_state.select(Some(0));
+        }
+        KeyCode::Backspace => {
+            app.browse_query.pop();
+            app.browse_collapsed.clear();
+            app.browse_state.select(Some(0));
+        }
+        KeyCode::Char(c) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
+            app.browse_query.push(c);
+            app.browse_collapsed.clear();
+            app.browse_state.select(Some(0));
+        }
         _ => {}
     }
     Ok(false)
@@ -761,9 +864,48 @@ fn build_tree(entries: &[Entry]) -> Vec<TreeNode> {
     }
     roots
 }
+fn render_browse_filter(frame: &mut Frame, area: Rect, app: &App) {
+    let title = Line::from(vec![
+        Span::raw(" "),
+        Span::styled(
+            " FILTER ",
+            Style::default()
+                .bg(C_ACCENT)
+                .fg(C_ACCENT_BG)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+    ]);
+    let block = Block::default()
+        .title_top(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(C_BORDER));
+
+    let line = if app.browse_query.is_empty() {
+        Line::from(vec![Span::styled(
+            "  type to filter…",
+            Style::default().fg(C_DIM),
+        )])
+    } else {
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(app.browse_query.as_str(), Style::default().fg(C_FG_BRIGHT)),
+        ])
+    };
+
+    frame.set_cursor_position(Position::new(
+        area.x + 1 + 2 + app.browse_query.len() as u16,
+        area.y + 1,
+    ));
+    frame.render_widget(Paragraph::new(line).block(block), area);
+}
+
 fn render_folder_view(frame: &mut Frame, area: Rect, app: &mut App) {
-    let cols =
-        Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)]).split(area);
+    let vparts = Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).split(area);
+    render_browse_filter(frame, vparts[0], app);
+
+    let cols = Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .split(vparts[1]);
 
     let rows = browse_rows(app);
 
@@ -1016,14 +1158,32 @@ fn search(app: &mut App, reset_selection: bool) {
             .filter(|&i| entry_matches_file(&app.entries[i], &filter_lc))
             .collect();
     } else {
-        let mut matcher = nucleo::Matcher::new(Config::DEFAULT);
+        let mut config = Config::DEFAULT;
+        config.prefer_prefix = true;
+        let mut matcher = nucleo::Matcher::new(config);
         let pattern = Pattern::parse(query, CaseMatching::Ignore, Normalization::Smart);
         let query_lower = query.to_lowercase();
 
         let has_substr = |text: &str| text.to_lowercase().contains(&query_lower);
-        let title_bonus = |t: &str| if has_substr(t) { 512 } else { 0 };
-        let cmd_bonus = |t: &str| if has_substr(t) { 256 } else { 0 };
-        let heading_bonus = |t: &str| if has_substr(t) { 128 } else { 0 };
+        let title_bonus = |t: &str| -> u32 { if has_substr(t) { 512 } else { 0 } };
+        let cmd_bonus = |t: &str| -> u32 { if has_substr(t) { 256 } else { 0 } };
+        let heading_bonus = |t: &str| -> u32 { if has_substr(t) { 128 } else { 0 } };
+
+        // Reward matches at the start of the title or at a word boundary within
+        // it, so typing the beginning of a title surfaces it in a few keystrokes.
+        let prefix_bonus = |t: &str| -> u32 {
+            let tl = t.to_lowercase();
+            if tl.starts_with(&query_lower) {
+                1024
+            } else if tl
+                .split(|c: char| !c.is_alphanumeric())
+                .any(|w| !w.is_empty() && w.starts_with(&query_lower))
+            {
+                384
+            } else {
+                0
+            }
+        };
 
         let mut scored: Vec<(usize, u32)> = Vec::new();
 
@@ -1043,7 +1203,9 @@ fn search(app: &mut App, reset_selection: bool) {
                     let mut buf = Vec::new();
                     let haystack = nucleo::Utf32Str::new(entry.title.as_str(), &mut buf);
                     if let Some(score) = pattern.score(haystack, &mut matcher) {
-                        scored.push((i, score.saturating_add(title_bonus(&entry.title))));
+                        let bonus =
+                            title_bonus(&entry.title).saturating_add(prefix_bonus(&entry.title));
+                        scored.push((i, score.saturating_add(bonus)));
                     }
                 }
                 SearchMode::HEADING => {
@@ -1055,29 +1217,39 @@ fn search(app: &mut App, reset_selection: bool) {
                     }
                 }
                 SearchMode::ALL => {
-                    let heading_str = entry.heading_path.join(" > ");
+                    let heading_str = entry.heading_path.join(" ");
 
-                    let mut h_buf = Vec::new();
-                    let h_hay = nucleo::Utf32Str::new(&heading_str, &mut h_buf);
-                    let h_score = pattern.score(h_hay, &mut matcher).unwrap_or(0);
+                    // Recall: one haystack across all fields so a multi-word query
+                    // (e.g. "mssql linux") can match a word in the title and a word
+                    // in the heading/description/command.
+                    let combined = format!(
+                        "{}  {}  {}  {}",
+                        entry.title, heading_str, entry.description, entry.cmd
+                    );
+                    let mut cb = Vec::new();
+                    let c_hay = nucleo::Utf32Str::new(&combined, &mut cb);
 
-                    let mut t_buf = Vec::new();
-                    let t_hay = nucleo::Utf32Str::new(entry.title.as_str(), &mut t_buf);
-                    let t_score = pattern.score(t_hay, &mut matcher).unwrap_or(0);
+                    if let Some(base) = pattern.score(c_hay, &mut matcher) {
+                        // Ranking: pull title (and to a lesser extent heading)
+                        // matches to the top of the recall set.
+                        let mut t_buf = Vec::new();
+                        let t_hay = nucleo::Utf32Str::new(entry.title.as_str(), &mut t_buf);
+                        let t_score = pattern.score(t_hay, &mut matcher).unwrap_or(0);
 
-                    let mut c_buf = Vec::new();
-                    let c_hay = nucleo::Utf32Str::new(entry.cmd.as_str(), &mut c_buf);
-                    let c_score = pattern.score(c_hay, &mut matcher).unwrap_or(0);
+                        let mut h_buf = Vec::new();
+                        let h_hay = nucleo::Utf32Str::new(&heading_str, &mut h_buf);
+                        let h_score = pattern.score(h_hay, &mut matcher).unwrap_or(0);
 
-                    let combined = (h_score.saturating_mul(2))
-                        .saturating_add(t_score.saturating_mul(3))
-                        .saturating_add(c_score);
+                        let bonus = title_bonus(&entry.title)
+                            .saturating_add(prefix_bonus(&entry.title))
+                            .saturating_add(heading_bonus(&heading_str))
+                            .saturating_add(cmd_bonus(&entry.cmd));
 
-                    if combined > 0 {
-                        let bonus = heading_bonus(&heading_str)
-                            .max(title_bonus(&entry.title))
-                            .max(cmd_bonus(&entry.cmd));
-                        scored.push((i, combined.saturating_add(bonus)));
+                        let total = base
+                            .saturating_add(t_score.saturating_mul(3))
+                            .saturating_add(h_score)
+                            .saturating_add(bonus);
+                        scored.push((i, total));
                     }
                 }
             }

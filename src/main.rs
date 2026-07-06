@@ -23,6 +23,18 @@ pub fn get_prev_search_path() -> &'static str {
         return "/tmp/prev_search.txt".to_string();
     })
 }
+
+static PREV_BROWSE_PATH: OnceLock<String> = OnceLock::new();
+
+pub fn get_prev_browse_path() -> &'static str {
+    PREV_BROWSE_PATH.get_or_init(|| {
+        #[cfg(target_os = "windows")]
+        return std::env::var("TEMP").unwrap_or("C:\\Windows\\Temp".into()) + "\\prev_browse.txt";
+
+        #[cfg(not(target_os = "windows"))]
+        return "/tmp/prev_browse.txt".to_string();
+    })
+}
 pub struct TreeNode {
     pub text: String,
     pub children: Vec<TreeNode>,
@@ -130,6 +142,11 @@ pub struct App {
     pub top_tab: usize,
     pub entries: Vec<Entry>,
     pub browse_state: ListState,
+    /// Incremental filter text for the Browse tab.
+    pub browse_query: String,
+    /// Folders the user has collapsed *while filtering* (reset when the filter
+    /// text changes). Filtered folders are expanded by default.
+    pub browse_collapsed: HashSet<String>,
     pub query: String,
     pub mode: SearchMode,
     pub list_state: ListState,
@@ -158,10 +175,28 @@ impl App {
         if !entries.is_empty() {
             list_state.select(Some(0));
         }
+        // Restore persisted Browse view + filter:
+        //   line 0: top_tab, line 1: selected row, line 2: filter query,
+        //   line 3+: expanded folder keys (one per line).
+        let browse_saved = fs::read_to_string(get_prev_browse_path()).unwrap_or_default();
+        let mut browse_lines = browse_saved.lines();
+        let saved_top_tab = browse_lines
+            .next()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0)
+            .min(1);
+        let saved_browse_sel = browse_lines.next().and_then(|s| s.parse::<usize>().ok());
+        let saved_browse_query = browse_lines.next().unwrap_or("").to_owned();
+        let saved_expanded: HashSet<String> = browse_lines
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_owned())
+            .collect();
+
         let mut browse_state = ListState::default();
         if !entries.is_empty() {
-            browse_state.select(Some(0));
+            browse_state.select(Some(saved_browse_sel.unwrap_or(0)));
         }
+
         let entry_index = entries
             .iter()
             .enumerate()
@@ -186,10 +221,12 @@ impl App {
                 "TITLE" => SearchMode::TITLE,
                 _ => SearchMode::ALL,
             },
-            top_tab: 0,
+            top_tab: saved_top_tab,
             list_state,
-            expanded: HashSet::new(),
+            expanded: saved_expanded,
             browse_state,
+            browse_query: saved_browse_query,
+            browse_collapsed: HashSet::new(),
             results: vec![],
             cursor_index: fs::read_to_string(get_prev_search_path())
                 .unwrap_or(String::new())
@@ -359,6 +396,25 @@ impl App {
             format!("{}\n{}", self.query, self.mode),
         );
     }
+
+    pub fn save_prev_browse(&self) {
+        let sel = self
+            .browse_state
+            .selected()
+            .map(|i| i.to_string())
+            .unwrap_or_default();
+        let expanded: Vec<&str> = self.expanded.iter().map(|s| s.as_str()).collect();
+        let _ = fs::write(
+            get_prev_browse_path(),
+            format!(
+                "{}\n{}\n{}\n{}",
+                self.top_tab,
+                sel,
+                self.browse_query,
+                expanded.join("\n")
+            ),
+        );
+    }
 }
 
 fn main() -> Result<()> {
@@ -421,6 +477,7 @@ fn main() -> Result<()> {
         app.write_chains_to_json()?;
     }
     app.save_prev_search();
+    app.save_prev_browse();
 
     Ok(())
 }
