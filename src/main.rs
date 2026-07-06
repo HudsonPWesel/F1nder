@@ -23,6 +23,27 @@ pub fn get_prev_search_path() -> &'static str {
         return "/tmp/prev_search.txt".to_string();
     })
 }
+pub struct TreeNode {
+    pub text: String,
+    pub children: Vec<TreeNode>,
+    pub entry_index: Option<usize>,
+}
+impl TreeNode {
+    pub fn folder(text: String) -> Self {
+        Self {
+            text,
+            children: vec![],
+            entry_index: None,
+        }
+    }
+    pub fn leaf(display_text: String, index: usize) -> Self {
+        Self {
+            text: display_text,
+            children: vec![],
+            entry_index: Some(index),
+        }
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Entry {
     pub id: String,
@@ -108,9 +129,12 @@ pub enum SearchMode {
 pub struct App {
     pub top_tab: usize,
     pub entries: Vec<Entry>,
+    pub browse_state: ListState,
     pub query: String,
     pub mode: SearchMode,
     pub list_state: ListState,
+    /// Expanded folder keys in the Browse tab (folder path joined by NUL).
+    pub expanded: HashSet<String>,
     pub results: Vec<usize>,
     pub cursor_index: usize,
     pub chains: Vec<Chain>,
@@ -133,6 +157,10 @@ impl App {
         let mut list_state = ListState::default();
         if !entries.is_empty() {
             list_state.select(Some(0));
+        }
+        let mut browse_state = ListState::default();
+        if !entries.is_empty() {
+            browse_state.select(Some(0));
         }
         let entry_index = entries
             .iter()
@@ -160,6 +188,8 @@ impl App {
             },
             top_tab: 0,
             list_state,
+            expanded: HashSet::new(),
+            browse_state,
             results: vec![],
             cursor_index: fs::read_to_string(get_prev_search_path())
                 .unwrap_or(String::new())

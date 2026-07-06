@@ -1,15 +1,16 @@
 use rand::RngExt;
 use ratatui::widgets::Wrap;
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::stdout;
 use std::path::{Path, PathBuf};
 
-use crate::{App, Chain, Entry, SearchMode};
+use crate::{App, Chain, Entry, SearchMode, TreeNode};
 use color_eyre::Result;
 use color_eyre::eyre::eyre;
 use crossterm::cursor::{Hide, Show};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -287,6 +288,14 @@ fn handle_key_event(app: &mut App, terminal: &mut DefaultTerminal) -> Result<boo
         if key.kind != KeyEventKind::Press {
             return Ok(false);
         }
+        // The Browse tab has its own key handling. Esc (quit) and `[`/`]` (tab
+        // switching) still fall through to the shared match below.
+        if app.top_tab == 1
+            && key.code != KeyCode::Esc
+            && !matches!(key.code, KeyCode::Char('[') | KeyCode::Char(']'))
+        {
+            return handle_browse_key(app, terminal, key);
+        }
         match key.code {
             KeyCode::Esc => return Ok(true),
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -518,12 +527,350 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     render_top_tabs(frame, chunks[0], app);
     // chunks[1] is intentional whitespace
-    render_search_input(frame, chunks[2], app);
-    render_main(frame, chunks[3], app);
+
+    match app.top_tab {
+        0 => {
+            render_search_input(frame, chunks[2], app);
+            render_main(frame, chunks[3], app);
+        }
+        _ => {
+            render_folder_view(frame, chunks[3], app);
+        }
+    }
 }
 
+/// A single visible line of the Browse tree, after expand/collapse is applied.
+struct BrowseRow {
+    depth: usize,
+    text: String,
+    key: String,
+    entry_index: Option<usize>,
+    is_folder: bool,
+    expanded: bool,
+    count: usize,
+}
+
+fn count_leaves(node: &TreeNode) -> usize {
+    if node.entry_index.is_some() {
+        return 1;
+    }
+    node.children.iter().map(count_leaves).sum()
+}
+
+/// Walk the tree, emitting only rows whose ancestor folders are all expanded.
+/// A folder's key is its path (ancestor texts joined by NUL) so it stays stable
+/// across rebuilds.
+fn flatten(
+    nodes: &[TreeNode],
+    depth: usize,
+    prefix: &str,
+    expanded: &HashSet<String>,
+    out: &mut Vec<BrowseRow>,
+) {
+    for node in nodes {
+        let is_folder = node.entry_index.is_none();
+        let key = if prefix.is_empty() {
+            node.text.clone()
+        } else {
+            format!("{}\u{0}{}", prefix, node.text)
+        };
+        let is_expanded = expanded.contains(&key);
+        out.push(BrowseRow {
+            depth,
+            text: node.text.clone(),
+            key: key.clone(),
+            entry_index: node.entry_index,
+            is_folder,
+            expanded: is_expanded,
+            count: if is_folder { count_leaves(node) } else { 1 },
+        });
+        if is_folder && is_expanded {
+            flatten(&node.children, depth + 1, &key, expanded, out);
+        }
+    }
+}
+
+/// The Browse tree flattened to its currently-visible rows.
+fn browse_rows(app: &App) -> Vec<BrowseRow> {
+    let roots = build_tree(&app.entries);
+    let mut out = Vec::new();
+    flatten(&roots, 0, "", &app.expanded, &mut out);
+    out
+}
+
+fn browse_selected_entry_index(app: &App) -> Option<usize> {
+    let sel = app.browse_state.selected()?;
+    browse_rows(app).get(sel).and_then(|r| r.entry_index)
+}
+
+fn handle_browse_key(app: &mut App, terminal: &mut DefaultTerminal, key: KeyEvent) -> Result<bool> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Down => {
+            let len = browse_rows(app).len();
+            if len > 0 {
+                let i = app
+                    .browse_state
+                    .selected()
+                    .map(|i| (i + 1).min(len - 1))
+                    .unwrap_or(0);
+                app.browse_state.select(Some(i));
+            }
+        }
+        KeyCode::Up => {
+            let len = browse_rows(app).len();
+            if len > 0 {
+                let i = app
+                    .browse_state
+                    .selected()
+                    .map(|i| i.saturating_sub(1))
+                    .unwrap_or(0);
+                app.browse_state.select(Some(i));
+            }
+        }
+        // Enter/Right: expand a folder, or copy + exit on a command.
+        KeyCode::Enter | KeyCode::Right => {
+            let rows = browse_rows(app);
+            if let Some(row) = app.browse_state.selected().and_then(|s| rows.get(s)) {
+                if row.is_folder {
+                    if row.expanded {
+                        app.expanded.remove(&row.key);
+                    } else {
+                        app.expanded.insert(row.key.clone());
+                    }
+                } else if key.code == KeyCode::Enter {
+                    if let Some(idx) = row.entry_index {
+                        copy_to_clipboard(&app.entries[idx].cmd);
+                    }
+                    return Ok(true);
+                }
+            }
+        }
+        // Left: collapse an expanded folder, else jump to the parent row.
+        KeyCode::Left => {
+            let rows = browse_rows(app);
+            if let Some(sel) = app.browse_state.selected() {
+                if let Some(row) = rows.get(sel) {
+                    if row.is_folder && row.expanded {
+                        app.expanded.remove(&row.key);
+                    } else {
+                        let depth = row.depth;
+                        for j in (0..sel).rev() {
+                            if rows[j].depth < depth {
+                                app.browse_state.select(Some(j));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Edit the selected command, reusing the existing editor template flow.
+        KeyCode::Char('e') if ctrl => {
+            if let Some(idx) = browse_selected_entry_index(app) {
+                let entry = app.entries[idx].clone();
+
+                disable_raw_mode()?;
+                execute!(stdout(), LeaveAlternateScreen, Show)?;
+
+                fs::write(get_editor_temp_path(), entry_to_template(&entry))?;
+                let _ = open_editor(get_editor_temp_path());
+                let updated_entry = parse_template(&entry.id, app)?;
+                app.entries[idx] = updated_entry;
+                app.dirty = true;
+                fs::remove_file(get_editor_temp_path())?;
+
+                enable_raw_mode()?;
+                execute!(stdout(), EnterAlternateScreen, Hide)?;
+                terminal.clear()?;
+            }
+        }
+        KeyCode::Char('d') if ctrl => {
+            if let Some(idx) = browse_selected_entry_index(app) {
+                let removed_id = app.entries[idx].id.clone();
+                app.entries.remove(idx);
+                app.rebuild_entry_index();
+
+                for chain in &mut app.chains {
+                    chain.steps.retain(|step_id| step_id != &removed_id);
+                }
+                app.chains.retain(|c| c.steps.len() >= 2);
+                app.dirty = true;
+
+                let len = browse_rows(app).len();
+                if len == 0 {
+                    app.browse_state.select(None);
+                } else {
+                    let cur = app.browse_state.selected().unwrap_or(0);
+                    app.browse_state.select(Some(cur.min(len - 1)));
+                }
+            }
+        }
+        KeyCode::Char('a') if ctrl => {
+            let mut entry = Entry::new();
+            let mut rng = rand::rng();
+            entry.id = format!("{:08x}", rng.random::<u32>());
+
+            disable_raw_mode()?;
+            execute!(stdout(), LeaveAlternateScreen, Show)?;
+
+            fs::write(get_editor_temp_path(), entry_to_template(&entry))?;
+            open_editor(get_editor_temp_path()).expect("Failed to execute editor");
+            let updated_entry = parse_template(&entry.id, app)?;
+            fs::remove_file(get_editor_temp_path())?;
+
+            app.entries.push(updated_entry);
+            app.rebuild_entry_index();
+            app.dirty = true;
+
+            enable_raw_mode()?;
+            execute!(stdout(), EnterAlternateScreen, Hide)?;
+            terminal.clear()?;
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+fn build_tree(entries: &[Entry]) -> Vec<TreeNode> {
+    let mut roots: Vec<TreeNode> = Vec::new();
+
+    for (i, entry) in entries.iter().enumerate() {
+        let mut level = &mut roots;
+
+        let source_filename = entry
+            .source_file
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        let mut path = vec![source_filename];
+        path.extend(entry.heading_path.iter().cloned());
+
+        for name in &path {
+            let index = match level.iter().position(|node| node.text == *name) {
+                Some(i) => i,
+                None => {
+                    level.push(TreeNode::folder(name.clone()));
+                    level.len() - 1
+                }
+            };
+            level = &mut level[index].children;
+        }
+        level.push(TreeNode::leaf(entry.title.clone(), i));
+    }
+    roots
+}
+fn render_folder_view(frame: &mut Frame, area: Rect, app: &mut App) {
+    let cols =
+        Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)]).split(area);
+
+    let rows = browse_rows(app);
+
+    // Keep the selection in range as rows appear/disappear on expand/collapse.
+    if rows.is_empty() {
+        app.browse_state.select(None);
+    } else {
+        let sel = app.browse_state.selected().unwrap_or(0).min(rows.len() - 1);
+        app.browse_state.select(Some(sel));
+    }
+
+    let items: Vec<ListItem> = rows
+        .iter()
+        .map(|r| {
+            let indent = "  ".repeat(r.depth);
+            if r.is_folder {
+                let marker = if r.expanded { "▾" } else { "▸" };
+                ListItem::new(Line::from(vec![
+                    Span::raw(indent),
+                    Span::styled(
+                        format!("{} {}", marker, r.text),
+                        Style::default()
+                            .fg(C_FG_BRIGHT)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(format!("  ({})", r.count), Style::default().fg(C_DIM)),
+                ]))
+            } else {
+                ListItem::new(Line::from(vec![
+                    Span::raw(indent),
+                    Span::styled("  ", Style::default().fg(C_DIM)),
+                    Span::styled(r.text.clone(), Style::default().fg(C_TITLE)),
+                ]))
+            }
+        })
+        .collect();
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title_bottom(format!(" BROWSE  {} entries ", app.entries.len()))
+        .border_style(Style::default().fg(C_BORDER));
+
+    let list = List::new(items).block(block).highlight_style(
+        Style::default()
+            .bg(C_HIGHLIGHT_BG)
+            .add_modifier(Modifier::BOLD),
+    );
+    frame.render_stateful_widget(list, cols[0], &mut app.browse_state);
+
+    let entry = app
+        .browse_state
+        .selected()
+        .and_then(|i| rows.get(i))
+        .and_then(|r| r.entry_index)
+        .and_then(|idx| app.entries.get(idx));
+
+    render_browse_detail(frame, cols[1], entry);
+}
+
+fn render_browse_detail(frame: &mut Frame, area: Rect, entry: Option<&Entry>) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(C_BORDER))
+        .title(" COMMAND ")
+        .title_alignment(Alignment::Center);
+
+    let Some(e) = entry else {
+        let p = Paragraph::new(vec![Line::from(""), Line::from("Select a command")])
+            .style(Style::default().fg(C_DIM))
+            .alignment(Alignment::Center)
+            .block(block);
+        frame.render_widget(p, area);
+        return;
+    };
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            e.title.clone(),
+            Style::default()
+                .fg(C_FG_BRIGHT)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            e.heading_path.join(" › "),
+            Style::default().fg(C_DIM),
+        )),
+        Line::from(""),
+    ];
+    for l in e.cmd.lines() {
+        lines.push(Line::from(Span::styled(
+            format!("$ {}", l),
+            Style::default().fg(C_ACCENT),
+        )));
+    }
+    lines.push(Line::from(""));
+    for l in e.description.lines() {
+        lines.push(Line::from(Span::styled(
+            l.to_string(),
+            Style::default().fg(C_DESC),
+        )));
+    }
+
+    let p = Paragraph::new(lines).wrap(Wrap { trim: false }).block(block);
+    frame.render_widget(p, area);
+}
 fn render_top_tabs(frame: &mut Frame, area: Rect, app: &App) {
-    let tabs = Tabs::new(vec!["Search", "Methodology"])
+    let tabs = Tabs::new(vec!["Search", "Browse"])
         .select(app.top_tab)
         .style(Style::default().fg(C_DIM))
         .highlight_style(
@@ -538,7 +885,7 @@ fn render_top_tabs(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_search_input(frame: &mut Frame, area: Rect, app: &App) {
-    let mode_title = Line::from(vec![
+    let mut mode_spans = vec![
         Span::raw(" "),
         Span::styled(
             format!(" {} ", app.mode.to_string()),
@@ -547,8 +894,21 @@ fn render_search_input(frame: &mut Frame, area: Rect, app: &App) {
                 .fg(C_ACCENT_BG)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(" "),
-    ]);
+    ];
+
+    // Show an active file: filter as a badge next to the mode badge.
+    if let (Some(filter), _) = parse_query(&app.query) {
+        mode_spans.push(Span::raw(" "));
+        mode_spans.push(Span::styled(
+            format!(" file:{} ", filter),
+            Style::default()
+                .bg(C_DIM)
+                .fg(C_FG_BRIGHT)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    mode_spans.push(Span::raw(" "));
+    let mode_title = Line::from(mode_spans);
 
     let mut block = Block::default()
         .title_top(mode_title)
@@ -609,85 +969,123 @@ fn render_main(frame: &mut Frame, area: Rect, app: &mut App) {
     render_chain(frame, right_rows[1], current_chain, &entry_id);
 }
 
+/// Split a raw query into an optional `file:<stem>` filter and the remaining
+/// fuzzy query. Only the first `file:` token is honored; the rest is the query.
+pub fn parse_query(raw: &str) -> (Option<String>, String) {
+    let mut file_filter: Option<String> = None;
+    let mut rest: Vec<&str> = Vec::new();
+
+    for tok in raw.split_whitespace() {
+        let lower = tok.to_lowercase();
+        if let Some(value) = lower.strip_prefix("file:") {
+            if file_filter.is_none() && !value.is_empty() {
+                // Preserve the original-case value ("file:" is 5 ASCII bytes).
+                file_filter = Some(tok[5..].to_string());
+                continue;
+            }
+        }
+        rest.push(tok);
+    }
+
+    (file_filter, rest.join(" "))
+}
+
+/// Whether an entry's source-file stem contains the (lowercased) filter.
+fn entry_matches_file(entry: &Entry, filter_lc: &Option<String>) -> bool {
+    match filter_lc {
+        None => true,
+        Some(f) => entry
+            .source_file
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_lowercase().contains(f))
+            .unwrap_or(false),
+    }
+}
+
 fn search(app: &mut App, reset_selection: bool) {
     app.current_chain_index = 0;
     let previous_selection = app.list_state.selected();
 
-    if app.query.trim().is_empty() {
-        app.results = (0..app.entries.len()).collect();
-        return;
-    }
+    let (file_filter, raw_query) = parse_query(&app.query);
+    let filter_lc = file_filter.as_ref().map(|s| s.to_lowercase());
+    let query = raw_query.trim();
 
-    let mut matcher = nucleo::Matcher::new(Config::DEFAULT);
-    let pattern = Pattern::parse(&app.query, CaseMatching::Ignore, Normalization::Smart);
-    let query_lower = app.query.to_lowercase();
+    if query.is_empty() {
+        // No fuzzy query: list every entry that passes the file filter.
+        app.results = (0..app.entries.len())
+            .filter(|&i| entry_matches_file(&app.entries[i], &filter_lc))
+            .collect();
+    } else {
+        let mut matcher = nucleo::Matcher::new(Config::DEFAULT);
+        let pattern = Pattern::parse(query, CaseMatching::Ignore, Normalization::Smart);
+        let query_lower = query.to_lowercase();
 
-    let substr_bonus = |text: &str| -> u32 {
-        if text.to_lowercase().contains(&query_lower) {
-            128
-        } else {
-            0
+        let has_substr = |text: &str| text.to_lowercase().contains(&query_lower);
+        let title_bonus = |t: &str| if has_substr(t) { 512 } else { 0 };
+        let cmd_bonus = |t: &str| if has_substr(t) { 256 } else { 0 };
+        let heading_bonus = |t: &str| if has_substr(t) { 128 } else { 0 };
+
+        let mut scored: Vec<(usize, u32)> = Vec::new();
+
+        for (i, entry) in app.entries.iter().enumerate() {
+            if !entry_matches_file(entry, &filter_lc) {
+                continue;
+            }
+            match app.mode {
+                SearchMode::CMD => {
+                    let mut buf = Vec::new();
+                    let haystack = nucleo::Utf32Str::new(entry.cmd.as_str(), &mut buf);
+                    if let Some(score) = pattern.score(haystack, &mut matcher) {
+                        scored.push((i, score.saturating_add(cmd_bonus(&entry.cmd))));
+                    }
+                }
+                SearchMode::TITLE => {
+                    let mut buf = Vec::new();
+                    let haystack = nucleo::Utf32Str::new(entry.title.as_str(), &mut buf);
+                    if let Some(score) = pattern.score(haystack, &mut matcher) {
+                        scored.push((i, score.saturating_add(title_bonus(&entry.title))));
+                    }
+                }
+                SearchMode::HEADING => {
+                    let temp_string = entry.heading_path.join(" > ");
+                    let mut buf = Vec::new();
+                    let haystack = nucleo::Utf32Str::new(&temp_string, &mut buf);
+                    if let Some(score) = pattern.score(haystack, &mut matcher) {
+                        scored.push((i, score.saturating_add(heading_bonus(&temp_string))));
+                    }
+                }
+                SearchMode::ALL => {
+                    let heading_str = entry.heading_path.join(" > ");
+
+                    let mut h_buf = Vec::new();
+                    let h_hay = nucleo::Utf32Str::new(&heading_str, &mut h_buf);
+                    let h_score = pattern.score(h_hay, &mut matcher).unwrap_or(0);
+
+                    let mut t_buf = Vec::new();
+                    let t_hay = nucleo::Utf32Str::new(entry.title.as_str(), &mut t_buf);
+                    let t_score = pattern.score(t_hay, &mut matcher).unwrap_or(0);
+
+                    let mut c_buf = Vec::new();
+                    let c_hay = nucleo::Utf32Str::new(entry.cmd.as_str(), &mut c_buf);
+                    let c_score = pattern.score(c_hay, &mut matcher).unwrap_or(0);
+
+                    let combined = (h_score.saturating_mul(2))
+                        .saturating_add(t_score.saturating_mul(3))
+                        .saturating_add(c_score);
+
+                    if combined > 0 {
+                        let bonus = heading_bonus(&heading_str)
+                            .max(title_bonus(&entry.title))
+                            .max(cmd_bonus(&entry.cmd));
+                        scored.push((i, combined.saturating_add(bonus)));
+                    }
+                }
+            }
         }
-    };
 
-    let mut scored: Vec<(usize, u32)> = Vec::new();
-
-    for (i, entry) in app.entries.iter().enumerate() {
-        match app.mode {
-            SearchMode::CMD => {
-                let mut buf = Vec::new();
-                let haystack = nucleo::Utf32Str::new(entry.cmd.as_str(), &mut buf);
-                if let Some(score) = pattern.score(haystack, &mut matcher) {
-                    scored.push((i, score.saturating_add(substr_bonus(&entry.cmd))));
-                }
-            }
-            SearchMode::TITLE => {
-                let mut buf = Vec::new();
-                let haystack = nucleo::Utf32Str::new(entry.title.as_str(), &mut buf);
-                if let Some(score) = pattern.score(haystack, &mut matcher) {
-                    scored.push((i, score.saturating_add(substr_bonus(&entry.title))));
-                }
-            }
-            SearchMode::HEADING => {
-                let temp_string = entry.heading_path.join(" > ");
-                let mut buf = Vec::new();
-                let haystack = nucleo::Utf32Str::new(&temp_string, &mut buf);
-                if let Some(score) = pattern.score(haystack, &mut matcher) {
-                    scored.push((i, score.saturating_add(substr_bonus(&temp_string))));
-                }
-            }
-            SearchMode::ALL => {
-                let heading_str = entry.heading_path.join(" > ");
-
-                let mut h_buf = Vec::new();
-                let h_hay = nucleo::Utf32Str::new(&heading_str, &mut h_buf);
-                let h_score = pattern.score(h_hay, &mut matcher).unwrap_or(0);
-
-                let mut t_buf = Vec::new();
-                let t_hay = nucleo::Utf32Str::new(entry.title.as_str(), &mut t_buf);
-                let t_score = pattern.score(t_hay, &mut matcher).unwrap_or(0);
-
-                let mut c_buf = Vec::new();
-                let c_hay = nucleo::Utf32Str::new(entry.cmd.as_str(), &mut c_buf);
-                let c_score = pattern.score(c_hay, &mut matcher).unwrap_or(0);
-
-                let combined = (h_score.saturating_mul(3))
-                    .saturating_add(t_score.saturating_mul(2))
-                    .saturating_add(c_score);
-
-                if combined > 0 {
-                    let bonus = substr_bonus(&heading_str)
-                        .max(substr_bonus(&entry.title))
-                        .max(substr_bonus(&entry.cmd));
-                    scored.push((i, combined.saturating_add(bonus)));
-                }
-            }
-        }
+        scored.sort_by(|a, b| b.1.cmp(&a.1));
+        app.results = scored.into_iter().map(|(i, _)| i).collect();
     }
-
-    scored.sort_by(|a, b| b.1.cmp(&a.1));
-
-    app.results = scored.into_iter().map(|(i, _)| i).collect();
 
     if app.results.is_empty() {
         app.list_state.select(None);
