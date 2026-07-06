@@ -24,17 +24,6 @@ pub fn get_prev_search_path() -> &'static str {
     })
 }
 
-static PREV_BROWSE_PATH: OnceLock<String> = OnceLock::new();
-
-pub fn get_prev_browse_path() -> &'static str {
-    PREV_BROWSE_PATH.get_or_init(|| {
-        #[cfg(target_os = "windows")]
-        return std::env::var("TEMP").unwrap_or("C:\\Windows\\Temp".into()) + "\\prev_browse.txt";
-
-        #[cfg(not(target_os = "windows"))]
-        return "/tmp/prev_browse.txt".to_string();
-    })
-}
 pub struct TreeNode {
     pub text: String,
     pub children: Vec<TreeNode>,
@@ -141,22 +130,11 @@ pub enum SearchMode {
 pub struct App {
     pub top_tab: usize,
     pub entries: Vec<Entry>,
+    pub folder_tree: Vec<TreeNode>,
     pub browse_state: ListState,
-    /// Incremental filter text for the Browse tab.
-    pub browse_query: String,
-    /// Folders the user has collapsed *while filtering* (reset when the filter
-    /// text changes). Filtered folders are expanded by default.
-    pub browse_collapsed: HashSet<String>,
-    /// File-name filter options: `"All"` at index 0, then each source-file stem.
-    pub file_filters: Vec<String>,
-    /// Index into `file_filters` of the active file filter (0 = All). Shared by
-    /// both the Search and Browse tabs, cycled with Ctrl+F.
-    pub file_filter: usize,
     pub query: String,
     pub mode: SearchMode,
     pub list_state: ListState,
-    /// Expanded folder keys in the Browse tab (folder path joined by NUL).
-    pub expanded: HashSet<String>,
     pub results: Vec<usize>,
     pub cursor_index: usize,
     pub chains: Vec<Chain>,
@@ -180,53 +158,6 @@ impl App {
         if !entries.is_empty() {
             list_state.select(Some(0));
         }
-        // Restore persisted Browse view + filter:
-        //   line 0: top_tab, line 1: selected row, line 2: filter query,
-        //   line 3+: expanded folder keys (one per line).
-        let browse_saved = fs::read_to_string(get_prev_browse_path()).unwrap_or_default();
-        let mut browse_lines = browse_saved.lines();
-        let saved_top_tab = browse_lines
-            .next()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(0)
-            .min(1);
-        let saved_browse_sel = browse_lines.next().and_then(|s| s.parse::<usize>().ok());
-        let saved_browse_query = browse_lines.next().unwrap_or("").to_owned();
-        let saved_expanded: HashSet<String> = browse_lines
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_owned())
-            .collect();
-
-        let mut browse_state = ListState::default();
-        if !entries.is_empty() {
-            browse_state.select(Some(saved_browse_sel.unwrap_or(0)));
-        }
-
-        // File-filter options: "All" plus each distinct source-file stem.
-        let mut stems: Vec<String> = entries
-            .iter()
-            .filter_map(|e| {
-                e.source_file
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().into_owned())
-            })
-            .collect();
-        stems.sort();
-        stems.dedup();
-        let mut file_filters = vec!["All".to_string()];
-        file_filters.extend(stems);
-
-        let saved_file = fs::read_to_string(get_prev_search_path())
-            .unwrap_or_default()
-            .lines()
-            .nth(2)
-            .unwrap_or("")
-            .to_owned();
-        let file_filter = file_filters
-            .iter()
-            .position(|f| f == &saved_file)
-            .unwrap_or(0);
-
         let entry_index = entries
             .iter()
             .enumerate()
@@ -234,6 +165,7 @@ impl App {
             .collect();
         Self {
             entries,
+            browse_state: ListState::default(),
             query: fs::read_to_string(get_prev_search_path())
                 .unwrap_or(String::new())
                 .lines()
@@ -251,15 +183,10 @@ impl App {
                 "TITLE" => SearchMode::TITLE,
                 _ => SearchMode::ALL,
             },
-            top_tab: saved_top_tab,
+            top_tab: 0,
             list_state,
-            expanded: saved_expanded,
-            browse_state,
-            browse_query: saved_browse_query,
-            browse_collapsed: HashSet::new(),
-            file_filters,
-            file_filter,
             results: vec![],
+            folder_tree: vec![],
             cursor_index: fs::read_to_string(get_prev_search_path())
                 .unwrap_or(String::new())
                 .lines()
@@ -422,58 +349,10 @@ impl App {
             .collect()
     }
 
-    /// The active file-filter name, or `None` when set to "All".
-    pub fn file_filter_name(&self) -> Option<&str> {
-        if self.file_filter == 0 {
-            None
-        } else {
-            self.file_filters.get(self.file_filter).map(|s| s.as_str())
-        }
-    }
-
-    /// Advance the file filter to the next option, wrapping around.
-    pub fn cycle_file_filter(&mut self) {
-        if !self.file_filters.is_empty() {
-            self.file_filter = (self.file_filter + 1) % self.file_filters.len();
-        }
-    }
-
-    /// Move the file filter to the previous option, wrapping around.
-    pub fn cycle_file_filter_rev(&mut self) {
-        let n = self.file_filters.len();
-        if n != 0 {
-            self.file_filter = (self.file_filter + n - 1) % n;
-        }
-    }
-
     pub fn save_prev_search(&self) {
-        let file = self
-            .file_filters
-            .get(self.file_filter)
-            .map(|s| s.as_str())
-            .unwrap_or("All");
         let _ = fs::write(
             get_prev_search_path(),
-            format!("{}\n{}\n{}", self.query, self.mode, file),
-        );
-    }
-
-    pub fn save_prev_browse(&self) {
-        let sel = self
-            .browse_state
-            .selected()
-            .map(|i| i.to_string())
-            .unwrap_or_default();
-        let expanded: Vec<&str> = self.expanded.iter().map(|s| s.as_str()).collect();
-        let _ = fs::write(
-            get_prev_browse_path(),
-            format!(
-                "{}\n{}\n{}\n{}",
-                self.top_tab,
-                sel,
-                self.browse_query,
-                expanded.join("\n")
-            ),
+            format!("{}\n{}", self.query, self.mode),
         );
     }
 }
@@ -538,7 +417,6 @@ fn main() -> Result<()> {
         app.write_chains_to_json()?;
     }
     app.save_prev_search();
-    app.save_prev_browse();
 
     Ok(())
 }
