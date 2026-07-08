@@ -144,6 +144,8 @@ pub struct App {
     pub browse_state: ListState,
     /// Incremental filter text for the Browse tab.
     pub browse_query: String,
+    /// Which field(s) the Browse filter matches against (cycled with Tab).
+    pub browse_mode: SearchMode,
     /// Folders the user has collapsed *while filtering* (reset when the filter
     /// text changes). Filtered folders are expanded by default.
     pub browse_collapsed: HashSet<String>,
@@ -182,7 +184,7 @@ impl App {
         }
         // Restore persisted Browse view + filter:
         //   line 0: top_tab, line 1: selected row, line 2: filter query,
-        //   line 3+: expanded folder keys (one per line).
+        //   line 3: filter mode, line 4+: expanded folder keys (one per line).
         let browse_saved = fs::read_to_string(get_prev_browse_path()).unwrap_or_default();
         let mut browse_lines = browse_saved.lines();
         let saved_top_tab = browse_lines
@@ -192,6 +194,12 @@ impl App {
             .min(1);
         let saved_browse_sel = browse_lines.next().and_then(|s| s.parse::<usize>().ok());
         let saved_browse_query = browse_lines.next().unwrap_or("").to_owned();
+        let saved_browse_mode = match browse_lines.next().unwrap_or("ALL") {
+            "CMD" => SearchMode::CMD,
+            "HEADING" => SearchMode::HEADING,
+            "TITLE" => SearchMode::TITLE,
+            _ => SearchMode::ALL,
+        };
         let saved_expanded: HashSet<String> = browse_lines
             .filter(|s| !s.is_empty())
             .map(|s| s.to_owned())
@@ -256,6 +264,7 @@ impl App {
             expanded: saved_expanded,
             browse_state,
             browse_query: saved_browse_query,
+            browse_mode: saved_browse_mode,
             browse_collapsed: HashSet::new(),
             file_filters,
             file_filter,
@@ -468,10 +477,11 @@ impl App {
         let _ = fs::write(
             get_prev_browse_path(),
             format!(
-                "{}\n{}\n{}\n{}",
+                "{}\n{}\n{}\n{}\n{}",
                 self.top_tab,
                 sel,
                 self.browse_query,
+                self.browse_mode,
                 expanded.join("\n")
             ),
         );

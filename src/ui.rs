@@ -604,7 +604,15 @@ fn browse_match_set(app: &App) -> HashSet<usize> {
             if !entry_in_file(e, file_ref) {
                 return None;
             }
-            let hay = format!("{} {}", e.title, e.heading_path.join(" ")).to_lowercase();
+            // Match against the field(s) selected by the browse filter mode.
+            let hay = match app.browse_mode {
+                SearchMode::TITLE => e.title.to_lowercase(),
+                SearchMode::HEADING => e.heading_path.join(" ").to_lowercase(),
+                SearchMode::CMD => e.cmd.to_lowercase(),
+                SearchMode::ALL => {
+                    format!("{} {} {}", e.title, e.heading_path.join(" "), e.cmd).to_lowercase()
+                }
+            };
             if terms.iter().all(|t| hay.contains(t)) {
                 Some(i)
             } else {
@@ -933,6 +941,28 @@ fn handle_browse_key(app: &mut App, terminal: &mut DefaultTerminal, key: KeyEven
             app.browse_collapsed.clear();
             app.browse_state.select(Some(0));
         }
+        // Cycle the filter field mode (TITLE / HEADING / CMD / ALL), like the
+        // regular search's Tab. Shift+Tab cycles in reverse.
+        KeyCode::Tab => {
+            app.browse_mode = match app.browse_mode {
+                SearchMode::CMD => SearchMode::HEADING,
+                SearchMode::HEADING => SearchMode::TITLE,
+                SearchMode::TITLE => SearchMode::ALL,
+                SearchMode::ALL => SearchMode::CMD,
+            };
+            app.browse_collapsed.clear();
+            app.browse_state.select(Some(0));
+        }
+        KeyCode::BackTab => {
+            app.browse_mode = match app.browse_mode {
+                SearchMode::HEADING => SearchMode::CMD,
+                SearchMode::TITLE => SearchMode::HEADING,
+                SearchMode::ALL => SearchMode::TITLE,
+                SearchMode::CMD => SearchMode::ALL,
+            };
+            app.browse_collapsed.clear();
+            app.browse_state.select(Some(0));
+        }
         // Incremental filter typing. Editing the filter resets transient
         // collapse state so new matches are revealed.
         KeyCode::Char('u') if ctrl => {
@@ -993,7 +1023,7 @@ fn render_browse_filter(frame: &mut Frame, area: Rect, app: &App) {
     let title = Line::from(vec![
         Span::raw(" "),
         Span::styled(
-            " FILTER ",
+            format!(" FILTER: {} ", app.browse_mode),
             Style::default()
                 .bg(C_ACCENT)
                 .fg(C_ACCENT_BG)
