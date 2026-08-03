@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     ffi::OsStr,
     fs::{self, OpenOptions},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::OnceLock,
 };
 use strum::Display;
@@ -10,7 +10,10 @@ use strum::Display;
 use color_eyre::{Result, eyre::eyre};
 use ratatui::widgets::ListState;
 use serde::{Deserialize, Serialize};
+mod methodology;
 mod ui;
+
+use methodology::MethodNode;
 
 static PREV_SEARCH_PATH: OnceLock<String> = OnceLock::new();
 
@@ -33,6 +36,18 @@ pub fn get_prev_browse_path() -> &'static str {
 
         #[cfg(not(target_os = "windows"))]
         return "/tmp/prev_browse.txt".to_string();
+    })
+}
+
+static PREV_METHOD_PATH: OnceLock<String> = OnceLock::new();
+
+pub fn get_prev_method_path() -> &'static str {
+    PREV_METHOD_PATH.get_or_init(|| {
+        #[cfg(target_os = "windows")]
+        return std::env::var("TEMP").unwrap_or("C:\\Windows\\Temp".into()) + "\\prev_method.txt";
+
+        #[cfg(not(target_os = "windows"))]
+        return "/tmp/prev_method.txt".to_string();
     })
 }
 pub struct TreeNode {
@@ -138,6 +153,14 @@ pub enum SearchMode {
     ALL,
 }
 
+/// One methodology document, loaded from a JSONs/methodology/*.md file. Fully
+/// independent of the others — its own sections, cards, and inline check state.
+pub struct MethodDoc {
+    pub name: String,
+    pub path: PathBuf,
+    pub tree: Vec<MethodNode>,
+}
+
 pub struct App {
     pub top_tab: usize,
     pub entries: Vec<Entry>,
@@ -159,6 +182,29 @@ pub struct App {
     pub list_state: ListState,
     /// Expanded folder keys in the Browse tab (folder path joined by NUL).
     pub expanded: HashSet<String>,
+    /// Loaded methodology documents (one per JSONs/methodology/*.md). Each is a
+    /// fully independent checklist; checked state lives inline in its markdown.
+    pub method_docs: Vec<MethodDoc>,
+    /// Active document (index into `method_docs`), switched with Tab.
+    pub method_doc: usize,
+    /// Active section sub-tab (0-based index into the doc's `sections`).
+    pub method_section: usize,
+    /// Selected attack card in the left list of the active section.
+    pub method_card: usize,
+    /// Selection in the right-hand detail checklist tree.
+    pub method_tree_state: ListState,
+    /// Which pane has focus: false = cards list, true = detail tree.
+    pub method_focus: bool,
+    /// Jump-to-technique search query (activated with `/`).
+    pub method_query: String,
+    /// Whether the jump palette is currently active.
+    pub method_jump_active: bool,
+    /// Selected candidate in the jump palette.
+    pub method_jump_sel: usize,
+    /// Whether a "reset all checks" confirmation is pending (y/n).
+    pub method_pending_reset: bool,
+    /// Keys ("doc/section/card/idx-path") of collapsed methodology headings.
+    pub method_collapsed: HashSet<String>,
     pub results: Vec<usize>,
     pub cursor_index: usize,
     pub chains: Vec<Chain>,
@@ -177,6 +223,7 @@ impl App {
         chains: Vec<Chain>,
         cmds_dir: PathBuf,
         chains_dir: PathBuf,
+        method_docs: Vec<MethodDoc>,
     ) -> Self {
         let mut list_state = ListState::default();
         if !entries.is_empty() {
@@ -191,7 +238,49 @@ impl App {
             .next()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(0)
-            .min(1);
+            .min(2);
+
+        // Restore persisted Methodology state:
+        //   line 0: active doc, line 1: section, line 2: card, line 3: tree
+        //   selection, then `C<key>` collapsed-heading keys. (Checked state is
+        //   inline in each doc's markdown.)
+        let method_saved = fs::read_to_string(get_prev_method_path()).unwrap_or_default();
+        let mut method_lines = method_saved.lines();
+        let saved_method_doc = method_lines
+            .next()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0);
+        let saved_method_section = method_lines
+            .next()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0);
+        let saved_method_card = method_lines
+            .next()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0);
+        let saved_method_tree_sel = method_lines.next().and_then(|s| s.parse::<usize>().ok());
+        let mut method_collapsed: HashSet<String> = HashSet::new();
+        for line in method_lines {
+            if let Some(k) = line.strip_prefix('C') {
+                method_collapsed.insert(k.to_owned());
+            }
+        }
+        let method_doc = if method_docs.is_empty() {
+            0
+        } else {
+            saved_method_doc.min(method_docs.len() - 1)
+        };
+        let section_count = method_docs
+            .get(method_doc)
+            .map(|d| methodology::sections(&d.tree).len())
+            .unwrap_or(0);
+        let method_section = if section_count == 0 {
+            0
+        } else {
+            saved_method_section.min(section_count - 1)
+        };
+        let mut method_tree_state = ListState::default();
+        method_tree_state.select(saved_method_tree_sel.or(Some(0)));
         let saved_browse_sel = browse_lines.next().and_then(|s| s.parse::<usize>().ok());
         let saved_browse_query = browse_lines.next().unwrap_or("").to_owned();
         let saved_browse_mode = match browse_lines.next().unwrap_or("ALL") {
@@ -262,6 +351,17 @@ impl App {
             top_tab: saved_top_tab,
             list_state,
             expanded: saved_expanded,
+            method_docs,
+            method_doc,
+            method_section,
+            method_card: saved_method_card,
+            method_tree_state,
+            method_focus: false,
+            method_query: String::new(),
+            method_jump_active: false,
+            method_jump_sel: 0,
+            method_pending_reset: false,
+            method_collapsed,
             browse_state,
             browse_query: saved_browse_query,
             browse_mode: saved_browse_mode,
@@ -486,6 +586,48 @@ impl App {
             ),
         );
     }
+
+    pub fn save_prev_method(&self) {
+        let tree_sel = self
+            .method_tree_state
+            .selected()
+            .map(|i| i.to_string())
+            .unwrap_or_default();
+        // line 0: active doc, line 1: section, line 2: card, line 3: tree
+        // selection, then `C<key>` collapsed-heading keys.
+        let mut out = format!(
+            "{}\n{}\n{}\n{}\n",
+            self.method_doc, self.method_section, self.method_card, tree_sel
+        );
+        for k in &self.method_collapsed {
+            out.push('C');
+            out.push_str(k);
+            out.push('\n');
+        }
+        let _ = fs::write(get_prev_method_path(), out);
+    }
+
+    /// The active methodology document's parsed tree (empty if none loaded).
+    pub fn method_tree(&self) -> &[MethodNode] {
+        self.method_docs
+            .get(self.method_doc)
+            .map(|d| d.tree.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// The active document's source markdown path.
+    pub fn method_path(&self) -> Option<&Path> {
+        self.method_docs.get(self.method_doc).map(|d| d.path.as_path())
+    }
+
+    /// Re-parse the active document from disk (after a checkbox flip or edit).
+    pub fn method_reload(&mut self) {
+        if let Some(d) = self.method_docs.get_mut(self.method_doc) {
+            if let Ok(md) = fs::read_to_string(&d.path) {
+                d.tree = methodology::parse(&md);
+            }
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -539,7 +681,39 @@ fn main() -> Result<()> {
     let valid_ids: HashSet<String> = entries.iter().map(|e| e.id.clone()).collect();
     chains.retain(|chain| chain.steps.iter().any(|id| valid_ids.contains(id)));
 
-    let mut app = App::new(entries, chains, cmds_dir, chains_dir);
+    // Load methodology documents from JSONs/methodology/*.md (each a separate,
+    // switchable checklist). Falls back to a legacy single JSONs/methodology.md.
+    let mut method_docs: Vec<MethodDoc> = Vec::new();
+    let method_dir = root.join("JSONs/methodology");
+    if method_dir.is_dir() {
+        let mut files: Vec<PathBuf> = fs::read_dir(&method_dir)?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension() == Some(OsStr::new("md")))
+            .collect();
+        files.sort();
+        for path in files {
+            if let Ok(md) = fs::read_to_string(&path) {
+                let name = path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_uppercase())
+                    .unwrap_or_default();
+                method_docs.push(MethodDoc {
+                    name,
+                    path,
+                    tree: methodology::parse(&md),
+                });
+            }
+        }
+    } else if let Ok(md) = fs::read_to_string(root.join("JSONs/methodology.md")) {
+        method_docs.push(MethodDoc {
+            name: "METHODOLOGY".to_string(),
+            path: root.join("JSONs/methodology.md"),
+            tree: methodology::parse(&md),
+        });
+    }
+
+    let mut app = App::new(entries, chains, cmds_dir, chains_dir, method_docs);
 
     ratatui::run(|terminal| ui::run_event_loop(terminal, &mut app))?;
 
@@ -549,6 +723,7 @@ fn main() -> Result<()> {
     }
     app.save_prev_search();
     app.save_prev_browse();
+    app.save_prev_method();
 
     Ok(())
 }

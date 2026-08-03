@@ -6,6 +6,7 @@ use std::fs;
 use std::io::stdout;
 use std::path::{Path, PathBuf};
 
+use crate::methodology::{MethodKind, MethodNode};
 use crate::{App, Chain, Entry, SearchMode, TreeNode};
 use color_eyre::Result;
 use color_eyre::eyre::eyre;
@@ -20,7 +21,7 @@ use nucleo::pattern::{CaseMatching, Normalization, Pattern};
 use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Tabs};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tabs};
 use ratatui::{DefaultTerminal, Frame};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -288,16 +289,27 @@ fn handle_key_event(app: &mut App, terminal: &mut DefaultTerminal) -> Result<boo
         if key.kind != KeyEventKind::Press {
             return Ok(false);
         }
-        // The Browse tab has its own key handling. Esc (quit) and `[`/`]` (tab
-        // switching) still fall through to the shared match below.
-        if app.top_tab == 1
-            && key.code != KeyCode::Esc
+        // The Browse and Methodology tabs have their own key handling. Esc (quit)
+        // and `[`/`]` (tab switching) still fall through to the shared match below.
+        if key.code != KeyCode::Esc
             && !matches!(key.code, KeyCode::Char('[') | KeyCode::Char(']'))
         {
-            return handle_browse_key(app, terminal, key);
+            if app.top_tab == 1 {
+                return handle_browse_key(app, terminal, key);
+            } else if app.top_tab == 2 {
+                return handle_method_key(app, terminal, key);
+            }
         }
         match key.code {
-            KeyCode::Esc => return Ok(true),
+            // Esc cancels the Methodology jump palette; otherwise it quits.
+            KeyCode::Esc => {
+                if app.top_tab == 2 && app.method_jump_active {
+                    app.method_jump_active = false;
+                    app.method_query.clear();
+                    return Ok(false);
+                }
+                return Ok(true);
+            }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 app.query.clear();
                 app.cursor_index = 0;
@@ -472,10 +484,10 @@ fn handle_key_event(app: &mut App, terminal: &mut DefaultTerminal) -> Result<boo
             }
 
             KeyCode::Char('[') => {
-                app.top_tab = if app.top_tab == 0 { 1 } else { 0 };
+                app.top_tab = (app.top_tab + 2) % 3;
             }
             KeyCode::Char(']') => {
-                app.top_tab = (app.top_tab + 1) % 2;
+                app.top_tab = (app.top_tab + 1) % 3;
             }
 
             KeyCode::Down => {
@@ -545,22 +557,21 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     render_top_tabs(frame, chunks[0], app);
     // chunks[1] is intentional whitespace
 
+    // Browse & Methodology use the combined search-input + main area so their
+    // filter box sits right under the tabs, aligned with the search bar.
+    let combined = Rect {
+        x: chunks[2].x,
+        y: chunks[2].y,
+        width: chunks[2].width,
+        height: chunks[2].height + chunks[3].height,
+    };
     match app.top_tab {
         0 => {
             render_search_input(frame, chunks[2], app);
             render_main(frame, chunks[3], app);
         }
-        _ => {
-            // Use the combined search-input + main area so the FILTER box sits
-            // right under the tabs, aligned with where the search bar renders.
-            let area = Rect {
-                x: chunks[2].x,
-                y: chunks[2].y,
-                width: chunks[2].width,
-                height: chunks[2].height + chunks[3].height,
-            };
-            render_folder_view(frame, area, app);
-        }
+        1 => render_folder_view(frame, combined, app),
+        _ => render_method_view(frame, combined, app),
     }
 }
 
@@ -1176,8 +1187,1032 @@ fn render_browse_detail(frame: &mut Frame, area: Rect, entry: Option<&Entry>) {
         .block(block);
     frame.render_widget(p, area);
 }
+// ---------------------------------------------------------------------------
+// Methodology tab: a collapsible checklist walked during an engagement, parsed
+// from JSONs/methodology.md. Mirrors the Browse-tree machinery.
+// ---------------------------------------------------------------------------
+
+const C_CHECK: Color = Color::Rgb(99, 211, 138);
+
+/// A flattened row of the detail checklist tree for the selected attack card.
+struct MethodRow {
+    depth: usize,
+    key: String,
+    title: String,
+    kind: MethodKind,
+    indent: usize,
+    is_heading: bool,
+    expanded: bool,
+    done: usize,
+    total: usize,
+    checked: bool,
+    src_line: usize,
+}
+
+/// (done, total) check items in `n` and its descendants (counts `n` itself).
+fn node_counts(n: &MethodNode) -> (usize, usize) {
+    let (mut done, mut total) = (0, 0);
+    if n.kind == MethodKind::Check {
+        total += 1;
+        if n.checked {
+            done += 1;
+        }
+    }
+    for c in &n.children {
+        let (d, t) = node_counts(c);
+        done += d;
+        total += t;
+    }
+    (done, total)
+}
+
+fn roots_counts(roots: &[&MethodNode]) -> (usize, usize) {
+    roots.iter().fold((0, 0), |(d, t), r| {
+        let (rd, rt) = node_counts(r);
+        (d + rd, t + rt)
+    })
+}
+
+fn method_overall(app: &App) -> (usize, usize) {
+    app.method_tree().iter().fold((0, 0), |(d, t), n| {
+        let (nd, nt) = node_counts(n);
+        (d + nd, t + nt)
+    })
+}
+
+/// The attack cards for a section: an optional leading "General" card holding
+/// loose checks that appear before the first `##`, then one card per `##` group.
+fn card_roots(section: &MethodNode) -> Vec<(String, Vec<&MethodNode>)> {
+    let mut cards: Vec<(String, Vec<&MethodNode>)> = Vec::new();
+    let lead: Vec<&MethodNode> = section
+        .children
+        .iter()
+        .take_while(|c| !c.is_heading())
+        .collect();
+    if !lead.is_empty() {
+        cards.push(("General".to_string(), lead));
+    }
+    for c in section.children.iter().filter(|c| c.is_heading()) {
+        cards.push((c.title.clone(), c.children.iter().collect()));
+    }
+    cards
+}
+
+fn push_method_row(
+    node: &MethodNode,
+    key: String,
+    depth: usize,
+    collapsed: &HashSet<String>,
+    out: &mut Vec<MethodRow>,
+) {
+    let is_heading = node.is_heading();
+    let expanded = !collapsed.contains(&key);
+    let (done, total) = if is_heading {
+        node_counts(node)
+    } else {
+        (0, 0)
+    };
+    out.push(MethodRow {
+        depth,
+        key: key.clone(),
+        title: node.title.clone(),
+        kind: node.kind.clone(),
+        indent: node.indent,
+        is_heading,
+        expanded,
+        done,
+        total,
+        checked: node.kind == MethodKind::Check && node.checked,
+        src_line: node.src_line,
+    });
+    if !node.children.is_empty() && (!is_heading || expanded) {
+        for (i, ch) in node.children.iter().enumerate() {
+            push_method_row(ch, format!("{}/{}", key, i), depth + 1, collapsed, out);
+        }
+    }
+}
+
+/// Flatten the selected card's checklist into rows, keyed `doc/section/card/path`
+/// so collapse state never leaks between documents.
+fn card_rows(
+    roots: &[&MethodNode],
+    di: usize,
+    si: usize,
+    ci: usize,
+    collapsed: &HashSet<String>,
+) -> Vec<MethodRow> {
+    let mut out = Vec::new();
+    for (i, root) in roots.iter().enumerate() {
+        push_method_row(root, format!("{}/{}/{}/{}", di, si, ci, i), 0, collapsed, &mut out);
+    }
+    out
+}
+
+/// Rows for a section+card by index (recomputes the card list).
+fn rows_for(app: &App, si: usize, ci: usize) -> Vec<MethodRow> {
+    let sections = crate::methodology::sections(app.method_tree());
+    let Some(sec) = sections.get(si) else {
+        return Vec::new();
+    };
+    let cards = card_roots(sec);
+    let Some((_, roots)) = cards.get(ci) else {
+        return Vec::new();
+    };
+    card_rows(roots, app.method_doc, si, ci, &app.method_collapsed)
+}
+
+fn method_section_count(app: &App) -> usize {
+    crate::methodology::sections(app.method_tree()).len()
+}
+
+fn method_card_count(app: &App, si: usize) -> usize {
+    crate::methodology::sections(app.method_tree())
+        .get(si)
+        .map(|s| card_roots(s).len())
+        .unwrap_or(0)
+}
+
+/// A jump-palette destination: a card, or a heading within a card.
+struct JumpTarget {
+    si: usize,
+    ci: usize,
+    /// `Some(key)` for a heading row; `None` to just open the card.
+    key: Option<String>,
+    label: String,
+}
+
+/// Strip a leading `N. ` from a section title for cleaner jump labels.
+fn short_section(title: &str) -> String {
+    match title.split_once(". ") {
+        Some((num, rest)) if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) => {
+            rest.to_string()
+        }
+        _ => title.to_string(),
+    }
+}
+
+fn collect_heading_targets(
+    node: &MethodNode,
+    key: String,
+    base_label: &str,
+    si: usize,
+    ci: usize,
+    out: &mut Vec<JumpTarget>,
+) {
+    if node.is_heading() {
+        out.push(JumpTarget {
+            si,
+            ci,
+            key: Some(key.clone()),
+            label: format!("{} › {}", base_label, node.title),
+        });
+    }
+    for (i, ch) in node.children.iter().enumerate() {
+        collect_heading_targets(ch, format!("{}/{}", key, i), base_label, si, ci, out);
+    }
+}
+
+fn jump_targets(app: &App) -> Vec<JumpTarget> {
+    let sections = crate::methodology::sections(app.method_tree());
+    let mut out = Vec::new();
+    for (si, sec) in sections.iter().enumerate() {
+        let sname = short_section(&sec.title);
+        for (ci, (ctitle, roots)) in card_roots(sec).iter().enumerate() {
+            let base = format!("{} › {}", sname, ctitle);
+            out.push(JumpTarget {
+                si,
+                ci,
+                key: None,
+                label: base.clone(),
+            });
+            for (i, root) in roots.iter().enumerate() {
+                collect_heading_targets(
+                    root,
+                    format!("{}/{}/{}/{}", app.method_doc, si, ci, i),
+                    &base,
+                    si,
+                    ci,
+                    &mut out,
+                );
+            }
+        }
+    }
+    out
+}
+
+fn jump_filtered(app: &App) -> Vec<JumpTarget> {
+    let q = app.method_query.to_lowercase();
+    let terms: Vec<&str> = q.split_whitespace().collect();
+    jump_targets(app)
+        .into_iter()
+        .filter(|t| {
+            let l = t.label.to_lowercase();
+            terms.iter().all(|term| l.contains(term))
+        })
+        .collect()
+}
+
+fn method_row_item<'a>(r: &'a MethodRow) -> ListItem<'a> {
+    let indent = " ".repeat(r.depth * 2 + r.indent);
+    match r.kind {
+        MethodKind::Heading(level) => {
+            let marker = if r.expanded { "▾" } else { "▸" };
+            let mut spans = vec![
+                Span::raw(indent),
+                Span::styled(
+                    format!("{} {}", marker, r.title),
+                    Style::default()
+                        .fg(if level <= 3 { C_FG_BRIGHT } else { C_TITLE })
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ];
+            if r.total > 0 {
+                let all = r.done == r.total;
+                spans.push(Span::styled(
+                    format!("  {}/{}", r.done, r.total),
+                    Style::default().fg(if all { C_CHECK } else { C_DIM }),
+                ));
+            }
+            ListItem::new(Line::from(spans))
+        }
+        MethodKind::Check => {
+            let (mark, txt) = if r.checked {
+                (
+                    "☑ ",
+                    Style::default()
+                        .fg(C_DIM)
+                        .add_modifier(Modifier::CROSSED_OUT),
+                )
+            } else {
+                ("☐ ", Style::default().fg(C_FG_BRIGHT))
+            };
+            ListItem::new(Line::from(vec![
+                Span::raw(indent),
+                Span::styled(mark, Style::default().fg(if r.checked { C_CHECK } else { C_DIM })),
+                Span::styled(r.title.clone(), txt),
+            ]))
+        }
+        MethodKind::Note => ListItem::new(Line::from(vec![
+            Span::raw(indent),
+            Span::styled(
+                r.title.clone(),
+                Style::default().fg(C_DIM).add_modifier(Modifier::ITALIC),
+            ),
+        ])),
+    }
+}
+
+fn render_method_bar(frame: &mut Frame, area: Rect, app: &App) {
+    let (done, total) = method_overall(app);
+    let mut title = vec![
+        Span::raw(" "),
+        Span::styled(
+            format!(" {}/{} done ", done, total),
+            Style::default()
+                .bg(C_DIM)
+                .fg(C_FG_BRIGHT)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+    ];
+    // Document tabs (Tab to switch) — one chip per loaded methodology.
+    for (i, d) in app.method_docs.iter().enumerate() {
+        let active = i == app.method_doc;
+        title.push(Span::styled(
+            format!(" {} ", d.name),
+            if active {
+                Style::default()
+                    .bg(C_ACCENT)
+                    .fg(C_ACCENT_BG)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(C_DIM)
+            },
+        ));
+        title.push(Span::raw(" "));
+    }
+    let block = Block::default()
+        .title_top(Line::from(title))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if app.method_jump_active || app.method_pending_reset {
+            C_ACCENT
+        } else {
+            C_BORDER
+        }));
+
+    let line = if app.method_pending_reset {
+        let name = app.method_docs.get(app.method_doc).map(|d| d.name.as_str()).unwrap_or("");
+        Line::from(vec![Span::styled(
+            format!("  Reset ALL checks in {}?  press y to confirm, any key to cancel", name),
+            Style::default().fg(C_CHECK).add_modifier(Modifier::BOLD),
+        )])
+    } else if app.method_jump_active {
+        Line::from(vec![
+            Span::styled(
+                "  jump ",
+                Style::default().fg(C_ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(app.method_query.as_str(), Style::default().fg(C_FG_BRIGHT)),
+        ])
+    } else {
+        Line::from(vec![Span::styled(
+            "  ⌘F doc · Tab/1-9 section · hjkl move · Space check · e/a/d edit · R reset · / jump",
+            Style::default().fg(C_DIM),
+        )])
+    };
+    if app.method_jump_active {
+        frame.set_cursor_position(Position::new(
+            area.x + 1 + 7 + app.method_query.len() as u16,
+            area.y + 1,
+        ));
+    }
+    frame.render_widget(Paragraph::new(line).block(block), area);
+}
+
+/// The row of section number badges + the active section's name and progress.
+fn render_method_sections(frame: &mut Frame, area: Rect, app: &App) {
+    let sections = crate::methodology::sections(app.method_tree());
+    let mut spans = vec![Span::raw(" ")];
+    for i in 0..sections.len() {
+        let active = i == app.method_section;
+        let style = if active {
+            Style::default()
+                .bg(C_ACCENT)
+                .fg(C_ACCENT_BG)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(C_DIM)
+        };
+        spans.push(Span::styled(format!(" {} ", i + 1), style));
+        spans.push(Span::raw(" "));
+    }
+    if let Some(sec) = sections.get(app.method_section) {
+        let (d, t) = node_counts(sec);
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            sec.title.clone(),
+            Style::default().fg(C_FG_BRIGHT).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            format!("  {}/{}", d, t),
+            Style::default().fg(if t > 0 && d == t { C_CHECK } else { C_DIM }),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// The jump palette, drawn in place of the detail pane while active.
+fn render_jump_palette(frame: &mut Frame, area: Rect, app: &App) {
+    let cands = jump_filtered(app);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(C_ACCENT))
+        .title(" JUMP ")
+        .title_alignment(Alignment::Center);
+    if cands.is_empty() {
+        let p = Paragraph::new(vec![Line::from(""), Line::from("No matches")])
+            .style(Style::default().fg(C_DIM))
+            .alignment(Alignment::Center)
+            .block(block);
+        frame.render_widget(p, area);
+        return;
+    }
+    let sel = app.method_jump_sel.min(cands.len() - 1);
+    let items: Vec<ListItem> = cands
+        .iter()
+        .map(|t| {
+            let icon = if t.key.is_some() { "  " } else { "▤ " };
+            ListItem::new(Line::from(vec![
+                Span::styled(icon, Style::default().fg(C_DIM)),
+                Span::styled(t.label.clone(), Style::default().fg(C_FG_BRIGHT)),
+            ]))
+        })
+        .collect();
+    let mut state = ListState::default();
+    state.select(Some(sel));
+    let list = List::new(items).block(block).highlight_style(
+        Style::default()
+            .bg(C_HIGHLIGHT_BG)
+            .add_modifier(Modifier::BOLD),
+    );
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+fn render_method_view(frame: &mut Frame, area: Rect, app: &mut App) {
+    let vparts = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .split(area);
+    render_method_bar(frame, vparts[0], app);
+
+    if crate::methodology::sections(app.method_tree()).is_empty() {
+        let p = Paragraph::new(vec![
+            Line::from(""),
+            Line::from("No methodology loaded."),
+            Line::from(Span::styled(
+                "Add JSONs/methodology.md and restart.",
+                Style::default().fg(C_DIM),
+            )),
+        ])
+        .alignment(Alignment::Center)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(C_BORDER)),
+        );
+        frame.render_widget(p, vparts[2]);
+        return;
+    }
+
+    render_method_sections(frame, vparts[1], app);
+
+    // Compute the active section's cards + selected-card rows as owned data so
+    // the immutable borrow of the tree ends before we mutate `app`.
+    let (si, ci, card_meta, rows): (usize, usize, Vec<(String, usize, usize)>, Vec<MethodRow>) = {
+        let sections = crate::methodology::sections(app.method_tree());
+        let si = app.method_section.min(sections.len() - 1);
+        let sec = sections[si];
+        let cards = card_roots(sec);
+        let ci = if cards.is_empty() {
+            0
+        } else {
+            app.method_card.min(cards.len() - 1)
+        };
+        let card_meta = cards
+            .iter()
+            .map(|(title, roots)| {
+                let (d, t) = roots_counts(roots);
+                (title.clone(), d, t)
+            })
+            .collect();
+        let rows = cards
+            .get(ci)
+            .map(|(_, roots)| card_rows(roots, app.method_doc, si, ci, &app.method_collapsed))
+            .unwrap_or_default();
+        (si, ci, card_meta, rows)
+    };
+    app.method_section = si;
+    app.method_card = ci;
+
+    let cols = Layout::horizontal([Constraint::Percentage(34), Constraint::Percentage(66)])
+        .split(vparts[2]);
+
+    // Left: attack cards.
+    let cards_focused = !app.method_focus && !app.method_jump_active;
+    let items: Vec<ListItem> = card_meta
+        .iter()
+        .map(|(title, d, t)| {
+            let complete = *t > 0 && d == t;
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("▸ {}", title),
+                    Style::default().fg(C_FG_BRIGHT).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("  {}/{}", d, t),
+                    Style::default().fg(if complete { C_CHECK } else { C_DIM }),
+                ),
+            ]))
+        })
+        .collect();
+    let cblock = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if cards_focused { C_ACCENT } else { C_BORDER }))
+        .title(" ATTACKS ")
+        .title_alignment(Alignment::Center);
+    let mut cstate = ListState::default();
+    if !card_meta.is_empty() {
+        cstate.select(Some(ci));
+    }
+    let clist = List::new(items).block(cblock).highlight_style(
+        Style::default()
+            .bg(C_HIGHLIGHT_BG)
+            .add_modifier(Modifier::BOLD),
+    );
+    frame.render_stateful_widget(clist, cols[0], &mut cstate);
+
+    // Right: jump palette, or the detail checklist tree.
+    if app.method_jump_active {
+        render_jump_palette(frame, cols[1], app);
+        return;
+    }
+
+    if rows.is_empty() {
+        app.method_tree_state.select(None);
+    } else {
+        let sel = app
+            .method_tree_state
+            .selected()
+            .unwrap_or(0)
+            .min(rows.len() - 1);
+        app.method_tree_state.select(Some(sel));
+    }
+
+    let tree_focused = app.method_focus;
+    let tblock = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(if tree_focused { C_ACCENT } else { C_BORDER }))
+        .title(format!(
+            " {} ",
+            card_meta.get(ci).map(|(t, _, _)| t.as_str()).unwrap_or("DETAIL")
+        ))
+        .title_alignment(Alignment::Center);
+    if rows.is_empty() {
+        let p = Paragraph::new(vec![
+            Line::from(""),
+            Line::from("No items — 'a' to add, 'e' to edit"),
+        ])
+        .style(Style::default().fg(C_DIM))
+        .alignment(Alignment::Center)
+        .block(tblock);
+        frame.render_widget(p, cols[1]);
+        return;
+    }
+    let titems: Vec<ListItem> = rows.iter().map(method_row_item).collect();
+    let tlist = List::new(titems).block(tblock).highlight_style(
+        Style::default()
+            .bg(C_HIGHLIGHT_BG)
+            .add_modifier(Modifier::BOLD),
+    );
+    frame.render_stateful_widget(tlist, cols[1], &mut app.method_tree_state);
+}
+
+fn handle_method_key(app: &mut App, terminal: &mut DefaultTerminal, key: KeyEvent) -> Result<bool> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+    // Jump palette captures all typing while active.
+    if app.method_jump_active {
+        match key.code {
+            KeyCode::Esc => {
+                app.method_jump_active = false;
+                app.method_query.clear();
+            }
+            KeyCode::Enter => commit_method_jump(app),
+            KeyCode::Up => app.method_jump_sel = app.method_jump_sel.saturating_sub(1),
+            KeyCode::Down => {
+                let n = jump_filtered(app).len();
+                if n > 0 {
+                    app.method_jump_sel = (app.method_jump_sel + 1).min(n - 1);
+                }
+            }
+            KeyCode::Char('u') if ctrl => {
+                app.method_query.clear();
+                app.method_jump_sel = 0;
+            }
+            KeyCode::Backspace => {
+                app.method_query.pop();
+                app.method_jump_sel = 0;
+            }
+            KeyCode::Char(c)
+                if !ctrl && !key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::SUPER) =>
+            {
+                app.method_query.push(c);
+                app.method_jump_sel = 0;
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
+
+    // A pending "reset all" confirmation swallows the next keypress.
+    if app.method_pending_reset {
+        if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+            reset_method_doc(app);
+            app.method_focus = false;
+            app.method_tree_state.select(Some(0));
+        }
+        app.method_pending_reset = false;
+        return Ok(false);
+    }
+
+    match key.code {
+        KeyCode::Char('/') => {
+            app.method_jump_active = true;
+            app.method_query.clear();
+            app.method_jump_sel = 0;
+        }
+        // Switch document (Web ⇄ AD ⇄ …): Super+F / Ctrl+F forward, +Shift reverse.
+        KeyCode::Char('f' | 'F')
+            if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
+        {
+            let n = app.method_docs.len();
+            if n > 0 {
+                let reverse = key.modifiers.contains(KeyModifiers::SHIFT)
+                    || matches!(key.code, KeyCode::Char('F'));
+                let next = if reverse {
+                    (app.method_doc + n - 1) % n
+                } else {
+                    (app.method_doc + 1) % n
+                };
+                switch_method_doc(app, next);
+            }
+        }
+        // Section scrolling: Tab / Shift-Tab, or , / .
+        KeyCode::Tab | KeyCode::Char('.') => {
+            let n = method_section_count(app);
+            if n > 0 {
+                switch_method_section(app, (app.method_section + 1) % n);
+            }
+        }
+        KeyCode::BackTab | KeyCode::Char(',') => {
+            let n = method_section_count(app);
+            if n > 0 {
+                switch_method_section(app, (app.method_section + n - 1) % n);
+            }
+        }
+        // Direct section jump (1-9).
+        KeyCode::Char(c @ '1'..='9') => {
+            let idx = (c as usize) - ('1' as usize);
+            if idx < method_section_count(app) {
+                switch_method_section(app, idx);
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if app.method_focus {
+                let len = rows_for(app, app.method_section, app.method_card).len();
+                if len > 0 {
+                    let i = app
+                        .method_tree_state
+                        .selected()
+                        .map(|i| (i + 1).min(len - 1))
+                        .unwrap_or(0);
+                    app.method_tree_state.select(Some(i));
+                }
+            } else {
+                let len = method_card_count(app, app.method_section);
+                if len > 0 {
+                    app.method_card = (app.method_card + 1).min(len - 1);
+                    app.method_tree_state.select(Some(0));
+                }
+            }
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if app.method_focus {
+                let i = app
+                    .method_tree_state
+                    .selected()
+                    .map(|i| i.saturating_sub(1))
+                    .unwrap_or(0);
+                app.method_tree_state.select(Some(i));
+            } else {
+                app.method_card = app.method_card.saturating_sub(1);
+                app.method_tree_state.select(Some(0));
+            }
+        }
+        // Right / l: focus the tree from the cards, else expand a collapsed heading.
+        KeyCode::Right | KeyCode::Char('l') => {
+            if !app.method_focus {
+                if !rows_for(app, app.method_section, app.method_card).is_empty() {
+                    app.method_focus = true;
+                    app.method_tree_state.select(Some(0));
+                }
+            } else {
+                let rows = rows_for(app, app.method_section, app.method_card);
+                if let Some(r) = app.method_tree_state.selected().and_then(|s| rows.get(s)) {
+                    if r.is_heading && !r.expanded {
+                        app.method_collapsed.remove(&r.key);
+                    }
+                }
+            }
+        }
+        // Left / h: collapse a heading, step to the parent, or fall back to the cards.
+        KeyCode::Left | KeyCode::Char('h') => {
+            if app.method_focus {
+                let rows = rows_for(app, app.method_section, app.method_card);
+                match app.method_tree_state.selected().and_then(|s| rows.get(s)) {
+                    Some(r) if r.is_heading && r.expanded => {
+                        let k = r.key.clone();
+                        app.method_collapsed.insert(k);
+                    }
+                    Some(r) if r.depth > 0 => {
+                        if let Some((parent, _)) = r.key.rsplit_once('/') {
+                            if let Some(pos) = rows.iter().position(|x| x.key == parent) {
+                                app.method_tree_state.select(Some(pos));
+                            }
+                        }
+                    }
+                    // A card-root row (or nothing selected) — back to the cards.
+                    _ => app.method_focus = false,
+                }
+            }
+        }
+        // Enter / Space: focus the tree, toggle a heading, or check an item.
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            if !app.method_focus {
+                if !rows_for(app, app.method_section, app.method_card).is_empty() {
+                    app.method_focus = true;
+                    app.method_tree_state.select(Some(0));
+                }
+            } else {
+                let rows = rows_for(app, app.method_section, app.method_card);
+                if let Some(r) = app.method_tree_state.selected().and_then(|s| rows.get(s)) {
+                    if r.is_heading {
+                        let k = r.key.clone();
+                        toggle_method_collapsed(app, &k);
+                    } else if r.kind == MethodKind::Check {
+                        let (line, want) = (r.src_line, !r.checked);
+                        toggle_method_check(app, line, want);
+                    }
+                }
+            }
+        }
+        KeyCode::Char('e') => edit_method_section(app, terminal, false)?,
+        KeyCode::Char('a') => edit_method_section(app, terminal, true)?,
+        // Delete: the whole technique from the cards pane, else a tree item.
+        KeyCode::Char('d') => {
+            if app.method_focus {
+                delete_method_row(app);
+            } else {
+                delete_method_card(app);
+            }
+        }
+        // Reset all checks in the active document (asks y/n).
+        KeyCode::Char('R') => app.method_pending_reset = true,
+        _ => {}
+    }
+    Ok(false)
+}
+
+fn switch_method_section(app: &mut App, idx: usize) {
+    app.method_section = idx;
+    app.method_card = 0;
+    app.method_focus = false;
+    app.method_tree_state.select(Some(0));
+}
+
+fn switch_method_doc(app: &mut App, idx: usize) {
+    app.method_doc = idx;
+    app.method_section = 0;
+    app.method_card = 0;
+    app.method_focus = false;
+    app.method_jump_active = false;
+    app.method_query.clear();
+    app.method_tree_state.select(Some(0));
+}
+
+fn toggle_method_collapsed(app: &mut App, key: &str) {
+    if app.method_collapsed.contains(key) {
+        app.method_collapsed.remove(key);
+    } else {
+        app.method_collapsed.insert(key.to_string());
+    }
+}
+
+/// Flip a checkbox: rewrite the `- [ ]`/`- [x]` marker on its source line, then
+/// re-parse so the in-memory tree matches the file.
+fn toggle_method_check(app: &mut App, src_line: usize, checked: bool) {
+    let Some(path) = app.method_path().map(|p| p.to_path_buf()) else {
+        return;
+    };
+    if flip_check_line(&path, src_line, checked).is_ok() {
+        app.method_reload();
+    }
+}
+
+fn flip_check_line(path: &Path, line_idx: usize, checked: bool) -> std::io::Result<()> {
+    let content = fs::read_to_string(path)?;
+    let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+    if let Some(l) = lines.get_mut(line_idx) {
+        let target = if checked { "[x]" } else { "[ ]" };
+        for m in ["[ ]", "[x]", "[X]"] {
+            if let Some(pos) = l.find(m) {
+                l.replace_range(pos..pos + 3, target);
+                break;
+            }
+        }
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    fs::write(path, out)
+}
+
+/// Uncheck every `- [x]` in the active document, then re-parse.
+fn reset_method_doc(app: &mut App) {
+    let Some(path) = app.method_path().map(|p| p.to_path_buf()) else {
+        return;
+    };
+    if let Ok(content) = fs::read_to_string(&path) {
+        let out: String = content
+            .lines()
+            .map(|l| l.replacen("- [x]", "- [ ]", 1).replacen("- [X]", "- [ ]", 1))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let _ = fs::write(&path, out + "\n");
+        app.method_reload();
+    }
+}
+
+/// Delete the selected tree row: a leaf check/note (single line), or a heading
+/// that has no remaining checklist items (an emptied sub-technique — its line +
+/// following blank). Non-empty headings are left to the `$EDITOR` flow.
+fn delete_method_row(app: &mut App) {
+    let rows = rows_for(app, app.method_section, app.method_card);
+    let Some(sel) = app.method_tree_state.selected() else {
+        return;
+    };
+    let Some(r) = rows.get(sel) else { return };
+    // A heading is deletable only when empty (no descendant rows).
+    let has_children = rows.get(sel + 1).is_some_and(|n| n.depth > r.depth);
+    if has_children {
+        return;
+    }
+    let Some(path) = app.method_path().map(|p| p.to_path_buf()) else {
+        return;
+    };
+    if delete_file_line(&path, r.src_line).is_ok() {
+        app.method_reload();
+        let len = rows_for(app, app.method_section, app.method_card).len();
+        if len == 0 {
+            app.method_tree_state.select(None);
+        } else {
+            let cur = app.method_tree_state.selected().unwrap_or(0).min(len - 1);
+            app.method_tree_state.select(Some(cur));
+        }
+    }
+}
+
+/// Delete the entire selected attack card (its `## heading` block up to the next
+/// heading). The synthetic "General" card is skipped.
+fn delete_method_card(app: &mut App) {
+    let Some((start, end)) = card_block_range(app, app.method_section, app.method_card) else {
+        return;
+    };
+    let Some(path) = app.method_path().map(|p| p.to_path_buf()) else {
+        return;
+    };
+    if let Ok(content) = fs::read_to_string(&path) {
+        let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+        if start < lines.len() {
+            let end = end.min(lines.len());
+            lines.drain(start..end);
+            let _ = fs::write(&path, lines.join("\n") + "\n");
+            app.method_reload();
+            let n = method_card_count(app, app.method_section);
+            app.method_card = if n == 0 { 0 } else { app.method_card.min(n - 1) };
+            app.method_tree_state.select(Some(0));
+        }
+    }
+}
+
+/// File line range `[start, end)` of the selected card's markdown block. Returns
+/// `None` for the synthetic "General" card (it has no `##` heading to delete).
+fn card_block_range(app: &App, si: usize, ci: usize) -> Option<(usize, usize)> {
+    let sections = crate::methodology::sections(app.method_tree());
+    let sec = sections.get(si)?;
+    let has_general = sec.children.first().is_some_and(|c| !c.is_heading());
+    if has_general && ci == 0 {
+        return None;
+    }
+    let heading_idx = if has_general { ci - 1 } else { ci };
+    let heading = sec.children.iter().filter(|c| c.is_heading()).nth(heading_idx)?;
+    let path = app.method_path()?;
+    let content = fs::read_to_string(path).ok()?;
+    let lines: Vec<&str> = content.lines().collect();
+    let start = heading.src_line;
+    let end = next_heading_boundary(&lines, start + 1);
+    Some((start, end))
+}
+
+/// First line index `>= from` that starts a new section/card heading (`# ` or
+/// `## `), else the end of the file.
+fn next_heading_boundary(lines: &[&str], from: usize) -> usize {
+    for (i, l) in lines.iter().enumerate().skip(from) {
+        let t = l.trim_start();
+        if t.starts_with("# ") || t.starts_with("## ") {
+            return i;
+        }
+    }
+    lines.len()
+}
+
+fn delete_file_line(path: &Path, line_idx: usize) -> std::io::Result<()> {
+    let content = fs::read_to_string(path)?;
+    let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+    if line_idx < lines.len() {
+        lines.remove(line_idx);
+        // Swallow a single trailing blank line left behind by a heading delete.
+        if line_idx < lines.len() && lines[line_idx].trim().is_empty() {
+            lines.remove(line_idx);
+        }
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    fs::write(path, out)
+}
+
+/// Jump to a selected palette destination: switch section/card, expand the
+/// target heading's ancestors, and select its row.
+fn commit_method_jump(app: &mut App) {
+    let cands = jump_filtered(app);
+    let target = cands.get(app.method_jump_sel).map(|t| (t.si, t.ci, t.key.clone()));
+    app.method_jump_active = false;
+    app.method_query.clear();
+    let Some((si, ci, key)) = target else { return };
+    app.method_section = si;
+    app.method_card = ci;
+    app.method_focus = true;
+    if let Some(key) = key {
+        let mut acc = String::new();
+        for part in key.split('/') {
+            if !acc.is_empty() {
+                acc.push('/');
+            }
+            acc.push_str(part);
+            app.method_collapsed.remove(&acc);
+        }
+        let rows = rows_for(app, si, ci);
+        let pos = rows.iter().position(|r| r.key == key).unwrap_or(0);
+        app.method_tree_state.select(Some(pos));
+    } else {
+        app.method_tree_state.select(Some(0));
+    }
+}
+
+/// Edit the active section's markdown in `$EDITOR` (covers add/edit/delete of
+/// techniques and items). With `add`, a fresh `## New Technique` card scaffold
+/// is inserted before the editor opens. On save the slice is spliced back and
+/// the tree re-parsed.
+fn edit_method_section(app: &mut App, terminal: &mut DefaultTerminal, add: bool) -> Result<()> {
+    let (start, end_opt) = {
+        let sections = crate::methodology::sections(app.method_tree());
+        let Some(sec) = sections.get(app.method_section) else {
+            return Ok(());
+        };
+        (
+            sec.src_line,
+            sections.get(app.method_section + 1).map(|s| s.src_line),
+        )
+    };
+
+    let Some(path) = app.method_path().map(|p| p.to_path_buf()) else {
+        return Ok(());
+    };
+    let content = fs::read_to_string(&path)?;
+    let all: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+    if start >= all.len() {
+        return Ok(());
+    }
+    let end = end_opt.unwrap_or(all.len()).min(all.len());
+    let mut buf: Vec<String> = all[start..end].to_vec();
+
+    if add {
+        // Insert the scaffold after the section's last real content line.
+        let mut ins = buf.len();
+        while ins > 0 {
+            let l = buf[ins - 1].trim();
+            if l.is_empty() || l.chars().all(|c| c == '-') {
+                ins -= 1;
+            } else {
+                break;
+            }
+        }
+        for (k, s) in ["", "## New Technique", "", "- [ ] "].iter().enumerate() {
+            buf.insert(ins + k, s.to_string());
+        }
+    }
+
+    disable_raw_mode()?;
+    execute!(stdout(), LeaveAlternateScreen, Show)?;
+    fs::write(get_editor_temp_path(), format!("{}\n", buf.join("\n")))?;
+    let _ = open_editor(get_editor_temp_path());
+    let edited = fs::read_to_string(get_editor_temp_path())?;
+    fs::remove_file(get_editor_temp_path())?;
+    enable_raw_mode()?;
+    execute!(stdout(), EnterAlternateScreen, Hide)?;
+    terminal.clear()?;
+
+    let mut new_lines: Vec<String> = Vec::with_capacity(all.len());
+    new_lines.extend_from_slice(&all[..start]);
+    new_lines.extend(edited.lines().map(|s| s.to_string()));
+    new_lines.extend_from_slice(&all[end..]);
+    let mut out = new_lines.join("\n");
+    out.push('\n');
+    fs::write(&path, out)?;
+
+    app.method_reload();
+    // Reclamp selections against the new tree.
+    let nsec = method_section_count(app);
+    if nsec > 0 {
+        app.method_section = app.method_section.min(nsec - 1);
+    }
+    let ncards = method_card_count(app, app.method_section);
+    if ncards > 0 {
+        app.method_card = app.method_card.min(ncards - 1);
+    }
+    let len = rows_for(app, app.method_section, app.method_card).len();
+    if len == 0 {
+        app.method_tree_state.select(None);
+    } else {
+        let cur = app.method_tree_state.selected().unwrap_or(0).min(len - 1);
+        app.method_tree_state.select(Some(cur));
+    }
+    Ok(())
+}
+
 fn render_top_tabs(frame: &mut Frame, area: Rect, app: &App) {
-    let tabs = Tabs::new(vec!["Search", "Browse"])
+    let tabs = Tabs::new(vec!["Search", "Browse", "Methodology"])
         .select(app.top_tab)
         .style(Style::default().fg(C_DIM))
         .highlight_style(
