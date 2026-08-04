@@ -203,6 +203,8 @@ pub struct App {
     pub method_jump_sel: usize,
     /// Whether a "reset all checks" confirmation is pending (y/n).
     pub method_pending_reset: bool,
+    /// Whether floating comments (Note rows) are shown (toggled with `c`).
+    pub method_show_comments: bool,
     /// Keys ("doc/section/card/idx-path") of collapsed methodology headings.
     pub method_collapsed: HashSet<String>,
     pub results: Vec<usize>,
@@ -260,9 +262,15 @@ impl App {
             .unwrap_or(0);
         let saved_method_tree_sel = method_lines.next().and_then(|s| s.parse::<usize>().ok());
         let mut method_collapsed: HashSet<String> = HashSet::new();
+        let mut method_focus = false;
+        let mut method_show_comments = true;
         for line in method_lines {
             if let Some(k) = line.strip_prefix('C') {
                 method_collapsed.insert(k.to_owned());
+            } else if let Some(f) = line.strip_prefix('F') {
+                method_focus = f == "1";
+            } else if let Some(v) = line.strip_prefix('V') {
+                method_show_comments = v != "0";
             }
         }
         let method_doc = if method_docs.is_empty() {
@@ -356,11 +364,12 @@ impl App {
             method_section,
             method_card: saved_method_card,
             method_tree_state,
-            method_focus: false,
+            method_focus,
             method_query: String::new(),
             method_jump_active: false,
             method_jump_sel: 0,
             method_pending_reset: false,
+            method_show_comments,
             method_collapsed,
             browse_state,
             browse_query: saved_browse_query,
@@ -594,10 +603,15 @@ impl App {
             .map(|i| i.to_string())
             .unwrap_or_default();
         // line 0: active doc, line 1: section, line 2: card, line 3: tree
-        // selection, then `C<key>` collapsed-heading keys.
+        // selection; then `F0`/`F1` (pane focus) and `C<key>` collapsed keys.
         let mut out = format!(
-            "{}\n{}\n{}\n{}\n",
-            self.method_doc, self.method_section, self.method_card, tree_sel
+            "{}\n{}\n{}\n{}\nF{}\nV{}\n",
+            self.method_doc,
+            self.method_section,
+            self.method_card,
+            tree_sel,
+            if self.method_focus { 1 } else { 0 },
+            if self.method_show_comments { 1 } else { 0 }
         );
         for k in &self.method_collapsed {
             out.push('C');

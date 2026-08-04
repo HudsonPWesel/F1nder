@@ -11,7 +11,10 @@ use std::sync::OnceLock;
 #[derive(Debug, Clone, PartialEq)]
 pub enum MethodKind {
     Heading(u8),
+    /// A checklist item: `- [ ]`/`- [x]`, or a bare `- text` sub-bullet (which
+    /// is treated as an unchecked todo).
     Check,
+    /// Floating prose or a `> blockquote` — a standalone comment.
     Note,
 }
 
@@ -108,10 +111,22 @@ fn parse_line(src_line: usize, raw: &str) -> Option<Line> {
             });
         }
     }
-    // plain bullet / blockquote / prose -> note
+    // A bare `- text` dash bullet under an entry is an unchecked todo.
+    if let Some(rest) = stripped.strip_prefix("- ") {
+        return Some(Line {
+            heading: None,
+            kind: MethodKind::Check,
+            indent,
+            checked: false,
+            src_line,
+            text: clean(rest),
+            refs: collect_refs(rest),
+            anchor: None,
+        });
+    }
+    // A `> blockquote` or plain prose line is a floating comment.
     let body = stripped
-        .strip_prefix("- ")
-        .or_else(|| stripped.strip_prefix("> "))
+        .strip_prefix("> ")
         .or_else(|| stripped.strip_prefix('>'))
         .unwrap_or(stripped);
     Some(Line {
@@ -233,4 +248,5 @@ mod tests {
         assert_eq!(secs[0].title.trim_start_matches("I. "), "External Recon");
     }
 }
+
 

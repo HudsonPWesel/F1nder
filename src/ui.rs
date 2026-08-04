@@ -284,6 +284,28 @@ fn open_editor(path: &str) -> std::io::Result<std::process::ExitStatus> {
     }
 }
 
+/// Open `$EDITOR` with the cursor on `line` (1-based). The `+N` flag is honored
+/// by nvim/vim/nano/emacs; falls back gracefully if the editor ignores it.
+fn open_editor_at(path: &str, line: usize) -> std::io::Result<std::process::ExitStatus> {
+    let line = line.max(1);
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("nvim")
+            .arg(format!("+{}", line))
+            .arg(path)
+            .status()
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let editor = std::env::var("EDITOR").unwrap_or_else(|_| "nvim".to_string());
+        Command::new("sh")
+            .arg("-c")
+            .arg(format!("{} +{} {}", editor, line, path))
+            .status()
+    }
+}
+
 fn handle_key_event(app: &mut App, terminal: &mut DefaultTerminal) -> Result<bool> {
     if let Event::Key(key) = event::read()? {
         if key.kind != KeyEventKind::Press {
@@ -1263,8 +1285,13 @@ fn push_method_row(
     key: String,
     depth: usize,
     collapsed: &HashSet<String>,
+    show_comments: bool,
     out: &mut Vec<MethodRow>,
 ) {
+    // Optionally hide floating comments (Note rows); checks/bullets stay.
+    if node.kind == MethodKind::Note && !show_comments {
+        return;
+    }
     let is_heading = node.is_heading();
     let expanded = !collapsed.contains(&key);
     let (done, total) = if is_heading {
@@ -1287,7 +1314,7 @@ fn push_method_row(
     });
     if !node.children.is_empty() && (!is_heading || expanded) {
         for (i, ch) in node.children.iter().enumerate() {
-            push_method_row(ch, format!("{}/{}", key, i), depth + 1, collapsed, out);
+            push_method_row(ch, format!("{}/{}", key, i), depth + 1, collapsed, show_comments, out);
         }
     }
 }
@@ -1300,10 +1327,18 @@ fn card_rows(
     si: usize,
     ci: usize,
     collapsed: &HashSet<String>,
+    show_comments: bool,
 ) -> Vec<MethodRow> {
     let mut out = Vec::new();
     for (i, root) in roots.iter().enumerate() {
-        push_method_row(root, format!("{}/{}/{}/{}", di, si, ci, i), 0, collapsed, &mut out);
+        push_method_row(
+            root,
+            format!("{}/{}/{}/{}", di, si, ci, i),
+            0,
+            collapsed,
+            show_comments,
+            &mut out,
+        );
     }
     out
 }
@@ -1318,7 +1353,14 @@ fn rows_for(app: &App, si: usize, ci: usize) -> Vec<MethodRow> {
     let Some((_, roots)) = cards.get(ci) else {
         return Vec::new();
     };
-    card_rows(roots, app.method_doc, si, ci, &app.method_collapsed)
+    card_rows(
+        roots,
+        app.method_doc,
+        si,
+        ci,
+        &app.method_collapsed,
+        app.method_show_comments,
+    )
 }
 
 fn method_section_count(app: &App) -> usize {
@@ -1412,13 +1454,40 @@ fn jump_filtered(app: &App) -> Vec<JumpTarget> {
         .collect()
 }
 
-fn method_row_item<'a>(r: &'a MethodRow) -> ListItem<'a> {
-    let indent = " ".repeat(r.depth * 2 + r.indent);
+/// Greedy word-wrap `text` to `width` columns (>=1). Words longer than `width`
+/// are emitted on their own line rather than split mid-word.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut out: Vec<String> = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        if line.is_empty() {
+            line.push_str(word);
+        } else if line.chars().count() + 1 + word.chars().count() <= width {
+            line.push(' ');
+            line.push_str(word);
+        } else {
+            out.push(std::mem::take(&mut line));
+            line.push_str(word);
+        }
+    }
+    if !line.is_empty() {
+        out.push(line);
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
+fn method_row_item<'a>(r: &'a MethodRow, inner_width: u16) -> ListItem<'a> {
+    let indent = r.depth * 2 + r.indent;
+    let pad = " ".repeat(indent);
     match r.kind {
         MethodKind::Heading(level) => {
             let marker = if r.expanded { "▾" } else { "▸" };
             let mut spans = vec![
-                Span::raw(indent),
+                Span::raw(pad),
                 Span::styled(
                     format!("{} {}", marker, r.title),
                     Style::default()
@@ -1436,29 +1505,56 @@ fn method_row_item<'a>(r: &'a MethodRow) -> ListItem<'a> {
             ListItem::new(Line::from(spans))
         }
         MethodKind::Check => {
-            let (mark, txt) = if r.checked {
+            let (mark, style) = if r.checked {
                 (
                     "☑ ",
-                    Style::default()
-                        .fg(C_DIM)
-                        .add_modifier(Modifier::CROSSED_OUT),
+                    Style::default().fg(C_DIM).add_modifier(Modifier::CROSSED_OUT),
                 )
             } else {
                 ("☐ ", Style::default().fg(C_FG_BRIGHT))
             };
-            ListItem::new(Line::from(vec![
-                Span::raw(indent),
-                Span::styled(mark, Style::default().fg(if r.checked { C_CHECK } else { C_DIM })),
-                Span::styled(r.title.clone(), txt),
-            ]))
+            let mark_style = Style::default().fg(if r.checked { C_CHECK } else { C_DIM });
+            // Marker is 2 cols; wrap the text and hang-indent continuations.
+            let text_width = (inner_width as usize).saturating_sub(indent + 2);
+            let wrapped = wrap_text(&r.title, text_width);
+            let cont_pad = " ".repeat(indent + 2);
+            let lines: Vec<Line> = wrapped
+                .iter()
+                .enumerate()
+                .map(|(i, seg)| {
+                    if i == 0 {
+                        Line::from(vec![
+                            Span::raw(pad.clone()),
+                            Span::styled(mark, mark_style),
+                            Span::styled(seg.clone(), style),
+                        ])
+                    } else {
+                        Line::from(vec![
+                            Span::raw(cont_pad.clone()),
+                            Span::styled(seg.clone(), style),
+                        ])
+                    }
+                })
+                .collect();
+            ListItem::new(lines)
         }
-        MethodKind::Note => ListItem::new(Line::from(vec![
-            Span::raw(indent),
-            Span::styled(
-                r.title.clone(),
-                Style::default().fg(C_DIM).add_modifier(Modifier::ITALIC),
-            ),
-        ])),
+        MethodKind::Note => {
+            // A floating comment: dim italic prose, no marker, wrapped.
+            let style = Style::default().fg(C_DIM).add_modifier(Modifier::ITALIC);
+            let text_width = (inner_width as usize).saturating_sub(indent);
+            let wrapped = wrap_text(&r.title, text_width);
+            let cont_pad = " ".repeat(indent);
+            let lines: Vec<Line> = wrapped
+                .iter()
+                .map(|seg| {
+                    Line::from(vec![
+                        Span::raw(cont_pad.clone()),
+                        Span::styled(seg.clone(), style),
+                    ])
+                })
+                .collect();
+            ListItem::new(lines)
+        }
     }
 }
 
@@ -1516,7 +1612,10 @@ fn render_method_bar(frame: &mut Frame, area: Rect, app: &App) {
         ])
     } else {
         Line::from(vec![Span::styled(
-            "  ⌘F doc · Tab/1-9 section · hjkl move · Space check · e/a/d edit · R reset · / jump",
+            format!(
+                "  ⌘F doc · Tab/1-9 section · hjkl move · Space check · e/a/d edit · R reset · c comments {} · / jump",
+                if app.method_show_comments { "on" } else { "off" }
+            ),
             Style::default().fg(C_DIM),
         )])
     };
@@ -1649,7 +1748,16 @@ fn render_method_view(frame: &mut Frame, area: Rect, app: &mut App) {
             .collect();
         let rows = cards
             .get(ci)
-            .map(|(_, roots)| card_rows(roots, app.method_doc, si, ci, &app.method_collapsed))
+            .map(|(_, roots)| {
+                card_rows(
+                    roots,
+                    app.method_doc,
+                    si,
+                    ci,
+                    &app.method_collapsed,
+                    app.method_show_comments,
+                )
+            })
             .unwrap_or_default();
         (si, ci, card_meta, rows)
     };
@@ -1730,7 +1838,8 @@ fn render_method_view(frame: &mut Frame, area: Rect, app: &mut App) {
         frame.render_widget(p, cols[1]);
         return;
     }
-    let titems: Vec<ListItem> = rows.iter().map(method_row_item).collect();
+    let inner_width = cols[1].width.saturating_sub(2);
+    let titems: Vec<ListItem> = rows.iter().map(|r| method_row_item(r, inner_width)).collect();
     let tlist = List::new(titems).block(tblock).highlight_style(
         Style::default()
             .bg(C_HIGHLIGHT_BG)
@@ -1930,6 +2039,17 @@ fn handle_method_key(app: &mut App, terminal: &mut DefaultTerminal, key: KeyEven
         }
         // Reset all checks in the active document (asks y/n).
         KeyCode::Char('R') => app.method_pending_reset = true,
+        // Toggle visibility of floating comments.
+        KeyCode::Char('c') => {
+            app.method_show_comments = !app.method_show_comments;
+            // Keep the tree selection in range after rows appear/disappear.
+            let len = rows_for(app, app.method_section, app.method_card).len();
+            if len == 0 {
+                app.method_tree_state.select(None);
+            } else if let Some(s) = app.method_tree_state.selected() {
+                app.method_tree_state.select(Some(s.min(len - 1)));
+            }
+        }
         _ => {}
     }
     Ok(false)
@@ -1976,10 +2096,19 @@ fn flip_check_line(path: &Path, line_idx: usize, checked: bool) -> std::io::Resu
     let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
     if let Some(l) = lines.get_mut(line_idx) {
         let target = if checked { "[x]" } else { "[ ]" };
+        let mut swapped = false;
         for m in ["[ ]", "[x]", "[X]"] {
             if let Some(pos) = l.find(m) {
                 l.replace_range(pos..pos + 3, target);
+                swapped = true;
                 break;
+            }
+        }
+        // A bare `- text` bullet has no marker yet — insert one after the dash so
+        // it becomes a real checkbox.
+        if !swapped {
+            if let Some(pos) = l.find("- ") {
+                l.insert_str(pos + 2, &format!("{} ", target));
             }
         }
     }
@@ -2157,6 +2286,19 @@ fn edit_method_section(app: &mut App, terminal: &mut DefaultTerminal, add: bool)
     let end = end_opt.unwrap_or(all.len()).min(all.len());
     let mut buf: Vec<String> = all[start..end].to_vec();
 
+    // 1-based line within `buf` to place the editor cursor on.
+    let mut cursor_line = if app.method_focus {
+        let sel = app.method_tree_state.selected().unwrap_or(0);
+        rows_for(app, app.method_section, app.method_card)
+            .get(sel)
+            .map(|r| r.src_line.saturating_sub(start) + 1)
+            .unwrap_or(1)
+    } else {
+        card_block_range(app, app.method_section, app.method_card)
+            .map(|(s, _)| s.saturating_sub(start) + 1)
+            .unwrap_or(1)
+    };
+
     if add {
         // Insert the scaffold after the section's last real content line.
         let mut ins = buf.len();
@@ -2171,12 +2313,14 @@ fn edit_method_section(app: &mut App, terminal: &mut DefaultTerminal, add: bool)
         for (k, s) in ["", "## New Technique", "", "- [ ] "].iter().enumerate() {
             buf.insert(ins + k, s.to_string());
         }
+        // Land the cursor on the new blank checklist line.
+        cursor_line = ins + 4;
     }
 
     disable_raw_mode()?;
     execute!(stdout(), LeaveAlternateScreen, Show)?;
     fs::write(get_editor_temp_path(), format!("{}\n", buf.join("\n")))?;
-    let _ = open_editor(get_editor_temp_path());
+    let _ = open_editor_at(get_editor_temp_path(), cursor_line);
     let edited = fs::read_to_string(get_editor_temp_path())?;
     fs::remove_file(get_editor_temp_path())?;
     enable_raw_mode()?;
