@@ -161,6 +161,16 @@ pub struct MethodDoc {
     pub tree: Vec<MethodNode>,
 }
 
+/// Saved view position within a single section of a document — the card, the
+/// selected checklist row, and which pane had focus. Keyed per (doc, section)
+/// so every section remembers exactly where you left it.
+#[derive(Clone, Default)]
+pub struct MethodPos {
+    pub card: usize,
+    pub tree_sel: Option<usize>,
+    pub focus: bool,
+}
+
 pub struct App {
     pub top_tab: usize,
     pub entries: Vec<Entry>,
@@ -185,8 +195,14 @@ pub struct App {
     /// Loaded methodology documents (one per JSONs/methodology/*.md). Each is a
     /// fully independent checklist; checked state lives inline in its markdown.
     pub method_docs: Vec<MethodDoc>,
-    /// Active document (index into `method_docs`), switched with Tab.
+    /// Active document (index into `method_docs`), switched with Super+F.
     pub method_doc: usize,
+    /// The section each document was last on (one per `method_docs` entry), so
+    /// returning to a document lands on the right section.
+    pub method_doc_section: Vec<usize>,
+    /// Saved position per (doc, section): card, selected row, pane focus. The
+    /// active (doc, section) is synced from the live fields on switch/save.
+    pub method_pos: HashMap<(usize, usize), MethodPos>,
     /// Active section sub-tab (0-based index into the doc's `sections`).
     pub method_section: usize,
     /// Selected attack card in the left list of the active section.
@@ -205,6 +221,8 @@ pub struct App {
     pub method_pending_reset: bool,
     /// Whether floating comments (Note rows) are shown (toggled with `c`).
     pub method_show_comments: bool,
+    /// Transient: a `g` was pressed and we're waiting for the second `g` (vim gg).
+    pub method_g_pending: bool,
     /// Keys ("doc/section/card/idx-path") of collapsed methodology headings.
     pub method_collapsed: HashSet<String>,
     pub results: Vec<usize>,
@@ -243,34 +261,44 @@ impl App {
             .min(2);
 
         // Restore persisted Methodology state:
-        //   line 0: active doc, line 1: section, line 2: card, line 3: tree
-        //   selection, then `C<key>` collapsed-heading keys. (Checked state is
-        //   inline in each doc's markdown.)
+        //   line 0: active doc; then `S<doc>:<section>` (per-doc active section),
+        //   `P<doc>:<section>:<card>:<sel>:<foc>` (per-section position),
+        //   `C<key>` collapsed headings, `V<0|1>` comment visibility.
+        //   (Checked state is inline in each doc's markdown.)
         let method_saved = fs::read_to_string(get_prev_method_path()).unwrap_or_default();
         let mut method_lines = method_saved.lines();
         let saved_method_doc = method_lines
             .next()
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(0);
-        let saved_method_section = method_lines
-            .next()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(0);
-        let saved_method_card = method_lines
-            .next()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(0);
-        let saved_method_tree_sel = method_lines.next().and_then(|s| s.parse::<usize>().ok());
         let mut method_collapsed: HashSet<String> = HashSet::new();
-        let mut method_focus = false;
         let mut method_show_comments = true;
+        let mut saved_sections: HashMap<usize, usize> = HashMap::new();
+        let mut method_pos: HashMap<(usize, usize), MethodPos> = HashMap::new();
         for line in method_lines {
             if let Some(k) = line.strip_prefix('C') {
                 method_collapsed.insert(k.to_owned());
-            } else if let Some(f) = line.strip_prefix('F') {
-                method_focus = f == "1";
             } else if let Some(v) = line.strip_prefix('V') {
                 method_show_comments = v != "0";
+            } else if let Some(rest) = line.strip_prefix('S') {
+                let mut it = rest.split(':');
+                if let (Some(d), Some(s)) = (
+                    it.next().and_then(|s| s.parse::<usize>().ok()),
+                    it.next().and_then(|s| s.parse::<usize>().ok()),
+                ) {
+                    saved_sections.insert(d, s);
+                }
+            } else if let Some(rest) = line.strip_prefix('P') {
+                let mut it = rest.split(':');
+                if let (Some(d), Some(s)) = (
+                    it.next().and_then(|s| s.parse::<usize>().ok()),
+                    it.next().and_then(|s| s.parse::<usize>().ok()),
+                ) {
+                    let card = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                    let tree_sel = it.next().and_then(|s| s.parse::<usize>().ok());
+                    let focus = it.next() == Some("1");
+                    method_pos.insert((d, s), MethodPos { card, tree_sel, focus });
+                }
             }
         }
         let method_doc = if method_docs.is_empty() {
@@ -278,17 +306,22 @@ impl App {
         } else {
             saved_method_doc.min(method_docs.len() - 1)
         };
-        let section_count = method_docs
-            .get(method_doc)
-            .map(|d| methodology::sections(&d.tree).len())
-            .unwrap_or(0);
-        let method_section = if section_count == 0 {
-            0
-        } else {
-            saved_method_section.min(section_count - 1)
-        };
+        // Per-doc last-active section, clamped to that doc's section count.
+        let method_doc_section: Vec<usize> = method_docs
+            .iter()
+            .enumerate()
+            .map(|(i, d)| {
+                let n = methodology::sections(&d.tree).len();
+                let s = saved_sections.get(&i).copied().unwrap_or(0);
+                if n == 0 { 0 } else { s.min(n - 1) }
+            })
+            .collect();
+        let method_section = method_doc_section.get(method_doc).copied().unwrap_or(0);
+        let active_pos = method_pos.get(&(method_doc, method_section)).cloned().unwrap_or_default();
+        let method_card = active_pos.card;
+        let method_focus = active_pos.focus;
         let mut method_tree_state = ListState::default();
-        method_tree_state.select(saved_method_tree_sel.or(Some(0)));
+        method_tree_state.select(active_pos.tree_sel.or(Some(0)));
         let saved_browse_sel = browse_lines.next().and_then(|s| s.parse::<usize>().ok());
         let saved_browse_query = browse_lines.next().unwrap_or("").to_owned();
         let saved_browse_mode = match browse_lines.next().unwrap_or("ALL") {
@@ -361,8 +394,10 @@ impl App {
             expanded: saved_expanded,
             method_docs,
             method_doc,
+            method_doc_section,
+            method_pos,
             method_section,
-            method_card: saved_method_card,
+            method_card,
             method_tree_state,
             method_focus,
             method_query: String::new(),
@@ -370,6 +405,7 @@ impl App {
             method_jump_sel: 0,
             method_pending_reset: false,
             method_show_comments,
+            method_g_pending: false,
             method_collapsed,
             browse_state,
             browse_query: saved_browse_query,
@@ -597,22 +633,33 @@ impl App {
     }
 
     pub fn save_prev_method(&self) {
-        let tree_sel = self
-            .method_tree_state
-            .selected()
-            .map(|i| i.to_string())
-            .unwrap_or_default();
-        // line 0: active doc, line 1: section, line 2: card, line 3: tree
-        // selection; then `F0`/`F1` (pane focus) and `C<key>` collapsed keys.
-        let mut out = format!(
-            "{}\n{}\n{}\n{}\nF{}\nV{}\n",
-            self.method_doc,
-            self.method_section,
-            self.method_card,
-            tree_sel,
-            if self.method_focus { 1 } else { 0 },
-            if self.method_show_comments { 1 } else { 0 }
+        // line 0: active doc; then `V<0|1>`, `S<doc>:<section>` per-doc active
+        // section, `P<doc>:<section>:<card>:<sel>:<foc>` per-section positions,
+        // and `C<key>` collapsed-heading keys. The active (doc, section) reflects
+        // the live fields.
+        let mut out = format!("{}\nV{}\n", self.method_doc, if self.method_show_comments { 1 } else { 0 });
+        for i in 0..self.method_docs.len() {
+            let sec = if i == self.method_doc {
+                self.method_section
+            } else {
+                self.method_doc_section.get(i).copied().unwrap_or(0)
+            };
+            out.push_str(&format!("S{}:{}\n", i, sec));
+        }
+        // Positions, with the active (doc, section) overridden by live state.
+        let mut pos = self.method_pos.clone();
+        pos.insert(
+            (self.method_doc, self.method_section),
+            MethodPos {
+                card: self.method_card,
+                tree_sel: self.method_tree_state.selected(),
+                focus: self.method_focus,
+            },
         );
+        for ((d, s), p) in &pos {
+            let sel = p.tree_sel.map(|n| n.to_string()).unwrap_or_default();
+            out.push_str(&format!("P{}:{}:{}:{}:{}\n", d, s, p.card, sel, if p.focus { 1 } else { 0 }));
+        }
         for k in &self.method_collapsed {
             out.push('C');
             out.push_str(k);

@@ -7,7 +7,7 @@ use std::io::stdout;
 use std::path::{Path, PathBuf};
 
 use crate::methodology::{MethodKind, MethodNode};
-use crate::{App, Chain, Entry, SearchMode, TreeNode};
+use crate::{App, Chain, Entry, MethodPos, SearchMode, TreeNode};
 use color_eyre::Result;
 use color_eyre::eyre::eyre;
 use crossterm::cursor::{Hide, Show};
@@ -31,7 +31,8 @@ const C_DIM: Color = Color::Rgb(100, 110, 130); // dim text / breadcrumbs
 const C_FG_BRIGHT: Color = Color::Rgb(220, 228, 245); // bright/primary text
 const C_ACCENT: Color = Color::Rgb(92, 196, 255); // cyan accent (tabs, mode badge)
 const C_ACCENT_BG: Color = Color::Rgb(14, 24, 38); // dark bg for accent badge text
-const C_HIGHLIGHT_BG: Color = Color::Rgb(20, 30, 40); // list selection highlight
+const C_HIGHLIGHT_BG: Color = Color::Rgb(20, 30, 40); // list selection highlight (focused pane)
+const C_HIGHLIGHT_DIM: Color = Color::Rgb(12, 17, 24); // selection highlight for the unfocused pane
 const C_TITLE: Color = Color::Rgb(175, 185, 209); // description / title text
 const C_DESC: Color = Color::Rgb(140, 150, 170); // description body text
 
@@ -507,9 +508,11 @@ fn handle_key_event(app: &mut App, terminal: &mut DefaultTerminal) -> Result<boo
 
             KeyCode::Char('[') => {
                 app.top_tab = (app.top_tab + 2) % 3;
+                app.save_prev_method();
             }
             KeyCode::Char(']') => {
                 app.top_tab = (app.top_tab + 1) % 3;
+                app.save_prev_method();
             }
 
             KeyCode::Down => {
@@ -1613,7 +1616,7 @@ fn render_method_bar(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         Line::from(vec![Span::styled(
             format!(
-                "  ⌘F doc · Tab/1-9 section · hjkl move · Space check · e/a/d edit · R reset · c comments {} · / jump",
+                "  ⌘F doc · Tab/1-9 section · hjkl move · gg/G ends · Space check · e/a/d edit · R reset · c comments {} · / jump",
                 if app.method_show_comments { "on" } else { "off" }
             ),
             Style::default().fg(C_DIM),
@@ -1794,11 +1797,11 @@ fn render_method_view(frame: &mut Frame, area: Rect, app: &mut App) {
     if !card_meta.is_empty() {
         cstate.select(Some(ci));
     }
-    let clist = List::new(items).block(cblock).highlight_style(
-        Style::default()
-            .bg(C_HIGHLIGHT_BG)
-            .add_modifier(Modifier::BOLD),
-    );
+    let clist = List::new(items).block(cblock).highlight_style(if cards_focused {
+        Style::default().bg(C_HIGHLIGHT_BG).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().bg(C_HIGHLIGHT_DIM)
+    });
     frame.render_stateful_widget(clist, cols[0], &mut cstate);
 
     // Right: jump palette, or the detail checklist tree.
@@ -1840,11 +1843,11 @@ fn render_method_view(frame: &mut Frame, area: Rect, app: &mut App) {
     }
     let inner_width = cols[1].width.saturating_sub(2);
     let titems: Vec<ListItem> = rows.iter().map(|r| method_row_item(r, inner_width)).collect();
-    let tlist = List::new(titems).block(tblock).highlight_style(
-        Style::default()
-            .bg(C_HIGHLIGHT_BG)
-            .add_modifier(Modifier::BOLD),
-    );
+    let tlist = List::new(titems).block(tblock).highlight_style(if tree_focused {
+        Style::default().bg(C_HIGHLIGHT_BG).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().bg(C_HIGHLIGHT_DIM)
+    });
     frame.render_stateful_widget(tlist, cols[1], &mut app.method_tree_state);
 }
 
@@ -1896,11 +1899,45 @@ fn handle_method_key(app: &mut App, terminal: &mut DefaultTerminal, key: KeyEven
         return Ok(false);
     }
 
+    // Track vim `gg`: any key other than a follow-up `g` clears the pending state.
+    let g_pending = app.method_g_pending;
+    app.method_g_pending = false;
+
     match key.code {
         KeyCode::Char('/') => {
             app.method_jump_active = true;
             app.method_query.clear();
             app.method_jump_sel = 0;
+        }
+        // gg → jump to top of the focused pane.
+        KeyCode::Char('g') => {
+            if g_pending {
+                if app.method_focus {
+                    if !rows_for(app, app.method_section, app.method_card).is_empty() {
+                        app.method_tree_state.select(Some(0));
+                    }
+                } else {
+                    app.method_card = 0;
+                    app.method_tree_state.select(Some(0));
+                }
+            } else {
+                app.method_g_pending = true;
+            }
+        }
+        // G → jump to bottom of the focused pane.
+        KeyCode::Char('G') => {
+            if app.method_focus {
+                let len = rows_for(app, app.method_section, app.method_card).len();
+                if len > 0 {
+                    app.method_tree_state.select(Some(len - 1));
+                }
+            } else {
+                let n = method_card_count(app, app.method_section);
+                if n > 0 {
+                    app.method_card = n - 1;
+                    app.method_tree_state.select(Some(0));
+                }
+            }
         }
         // Switch document (Web ⇄ AD ⇄ …): Super+F / Ctrl+F forward, +Shift reverse.
         KeyCode::Char('f' | 'F')
@@ -1973,10 +2010,7 @@ fn handle_method_key(app: &mut App, terminal: &mut DefaultTerminal, key: KeyEven
         // Right / l: focus the tree from the cards, else expand a collapsed heading.
         KeyCode::Right | KeyCode::Char('l') => {
             if !app.method_focus {
-                if !rows_for(app, app.method_section, app.method_card).is_empty() {
-                    app.method_focus = true;
-                    app.method_tree_state.select(Some(0));
-                }
+                focus_method_tree(app);
             } else {
                 let rows = rows_for(app, app.method_section, app.method_card);
                 if let Some(r) = app.method_tree_state.selected().and_then(|s| rows.get(s)) {
@@ -2010,10 +2044,7 @@ fn handle_method_key(app: &mut App, terminal: &mut DefaultTerminal, key: KeyEven
         // Enter / Space: focus the tree, toggle a heading, or check an item.
         KeyCode::Enter | KeyCode::Char(' ') => {
             if !app.method_focus {
-                if !rows_for(app, app.method_section, app.method_card).is_empty() {
-                    app.method_focus = true;
-                    app.method_tree_state.select(Some(0));
-                }
+                focus_method_tree(app);
             } else {
                 let rows = rows_for(app, app.method_section, app.method_card);
                 if let Some(r) = app.method_tree_state.selected().and_then(|s| rows.get(s)) {
@@ -2055,21 +2086,93 @@ fn handle_method_key(app: &mut App, terminal: &mut DefaultTerminal, key: KeyEven
     Ok(false)
 }
 
-fn switch_method_section(app: &mut App, idx: usize) {
-    app.method_section = idx;
-    app.method_card = 0;
-    app.method_focus = false;
-    app.method_tree_state.select(Some(0));
+/// Save the live position of the current (doc, section) into `method_pos` and
+/// record it as the document's active section.
+fn stash_method_pos(app: &mut App) {
+    app.method_pos.insert(
+        (app.method_doc, app.method_section),
+        MethodPos {
+            card: app.method_card,
+            tree_sel: app.method_tree_state.selected(),
+            focus: app.method_focus,
+        },
+    );
+    if let Some(s) = app.method_doc_section.get_mut(app.method_doc) {
+        *s = app.method_section;
+    }
 }
 
+/// Clamp the live section/card/row against the active doc's actual shape.
+fn clamp_method_live(app: &mut App) {
+    let nsec = method_section_count(app);
+    app.method_section = if nsec == 0 { 0 } else { app.method_section.min(nsec - 1) };
+    let ncards = method_card_count(app, app.method_section);
+    app.method_card = if ncards == 0 { 0 } else { app.method_card.min(ncards - 1) };
+    let len = rows_for(app, app.method_section, app.method_card).len();
+    if len == 0 {
+        app.method_tree_state.select(None);
+        app.method_focus = false;
+    } else {
+        let s = app.method_tree_state.selected().unwrap_or(0).min(len - 1);
+        app.method_tree_state.select(Some(s));
+    }
+}
+
+/// Move focus into the detail tree, keeping the current row selection (clamped)
+/// rather than snapping back to the top.
+fn focus_method_tree(app: &mut App) {
+    let len = rows_for(app, app.method_section, app.method_card).len();
+    if len == 0 {
+        return;
+    }
+    app.method_focus = true;
+    let sel = app.method_tree_state.selected().unwrap_or(0).min(len - 1);
+    app.method_tree_state.select(Some(sel));
+}
+
+fn switch_method_section(app: &mut App, idx: usize) {
+    if idx == app.method_section {
+        return;
+    }
+    // Remember where we were in the section we're leaving.
+    stash_method_pos(app);
+    let carry_focus = app.method_focus;
+    app.method_section = idx;
+    if let Some(p) = app.method_pos.get(&(app.method_doc, idx)).cloned() {
+        // Revisiting: restore this section's card, row, and pane.
+        app.method_card = p.card;
+        app.method_focus = p.focus;
+        app.method_tree_state.select(p.tree_sel.or(Some(0)));
+    } else {
+        // First visit: top of the list, but keep the current pane so you stay in flow.
+        app.method_card = 0;
+        app.method_tree_state.select(Some(0));
+        app.method_focus = carry_focus;
+    }
+    if let Some(s) = app.method_doc_section.get_mut(app.method_doc) {
+        *s = idx;
+    }
+    clamp_method_live(app);
+}
+
+/// Switch documents, remembering the position of the one we're leaving and
+/// restoring the last section + position of the one we're entering.
 fn switch_method_doc(app: &mut App, idx: usize) {
+    if idx == app.method_doc {
+        return;
+    }
+    stash_method_pos(app);
     app.method_doc = idx;
-    app.method_section = 0;
-    app.method_card = 0;
-    app.method_focus = false;
     app.method_jump_active = false;
     app.method_query.clear();
-    app.method_tree_state.select(Some(0));
+
+    let section = app.method_doc_section.get(idx).copied().unwrap_or(0);
+    app.method_section = section;
+    let p = app.method_pos.get(&(idx, section)).cloned().unwrap_or_default();
+    app.method_card = p.card;
+    app.method_focus = p.focus;
+    app.method_tree_state.select(p.tree_sel.or(Some(0)));
+    clamp_method_live(app);
 }
 
 fn toggle_method_collapsed(app: &mut App, key: &str) {
@@ -2239,9 +2342,14 @@ fn commit_method_jump(app: &mut App) {
     app.method_jump_active = false;
     app.method_query.clear();
     let Some((si, ci, key)) = target else { return };
+    // Remember where we were before jumping away.
+    stash_method_pos(app);
     app.method_section = si;
     app.method_card = ci;
     app.method_focus = true;
+    if let Some(s) = app.method_doc_section.get_mut(app.method_doc) {
+        *s = si;
+    }
     if let Some(key) = key {
         let mut acc = String::new();
         for part in key.split('/') {
