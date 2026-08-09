@@ -11,10 +11,14 @@ use crate::{App, Chain, Entry, MethodPos, SearchMode, TreeNode};
 use color_eyre::Result;
 use color_eyre::eyre::eyre;
 use crossterm::cursor::{Hide, Show};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    supports_keyboard_enhancement,
 };
 use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -76,14 +80,45 @@ enum Section {
     SourceFile,
 }
 
-pub fn run_event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
-    search(app, false);
-    loop {
-        terminal.draw(|frame| render(frame, app))?;
-        if handle_key_event(app, terminal)? {
-            break Ok(());
-        }
+/// Whether the terminal speaks the kitty keyboard protocol. Queried once and
+/// cached — the query round-trips an escape sequence, so we don't repeat it.
+fn kbd_enhancement_supported() -> bool {
+    static SUPPORTED: OnceLock<bool> = OnceLock::new();
+    *SUPPORTED.get_or_init(|| supports_keyboard_enhancement().unwrap_or(false))
+}
+
+/// Push the "disambiguate escape codes" flag so Ctrl+J arrives as a distinct
+/// key instead of collapsing onto Enter (both are raw byte LF in legacy mode).
+/// No-op where the protocol is unsupported. The flag stack is per-screen, so
+/// this must be re-pushed after every alternate-screen re-entry ($EDITOR).
+pub fn push_kbd_enhancement() {
+    if kbd_enhancement_supported() {
+        let _ = execute!(
+            stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        );
     }
+}
+
+fn pop_kbd_enhancement() {
+    if kbd_enhancement_supported() {
+        let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
+    }
+}
+
+pub fn run_event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
+    push_kbd_enhancement();
+    search(app, false);
+    let result = loop {
+        terminal.draw(|frame| render(frame, app))?;
+        match handle_key_event(app, terminal) {
+            Ok(true) => break Ok(()),
+            Ok(false) => {}
+            Err(e) => break Err(e),
+        }
+    };
+    pop_kbd_enhancement();
+    result
 }
 
 fn copy_to_clipboard(text: &str) -> bool {
@@ -461,6 +496,7 @@ fn handle_key_event(app: &mut App, terminal: &mut DefaultTerminal) -> Result<boo
                 // Re-enable raw mode and re-enter alternate screen
                 enable_raw_mode()?;
                 execute!(stdout(), EnterAlternateScreen, Hide)?;
+                push_kbd_enhancement();
                 terminal.clear()?;
             }
             // Chain-edit toggle: Super+C (or Ctrl+C) — moved off 'n' so Super+N is
@@ -515,6 +551,7 @@ fn handle_key_event(app: &mut App, terminal: &mut DefaultTerminal) -> Result<boo
                     // Re-enable raw mode and re-enter alternate screen
                     enable_raw_mode()?;
                     execute!(stdout(), EnterAlternateScreen, Hide)?;
+                    push_kbd_enhancement();
                     terminal.clear()?;
                 }
             }
@@ -644,6 +681,16 @@ fn handle_key_event(app: &mut App, terminal: &mut DefaultTerminal) -> Result<boo
                     app.cursor_index += 1;
                 }
             }
+            // Ctrl+J accepts the inline ghost-text completion.
+            KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if !app.search_nav {
+                    if let Some(sfx) = complete_suffix(&app.vocab, last_token(&app.query)) {
+                        app.query.push_str(&sfx);
+                        app.cursor_index = app.query.len();
+                        search(app, true);
+                    }
+                }
+            }
             KeyCode::Backspace => {
                 if app.cursor_index > 0 {
                     app.cursor_index -= 1;
@@ -704,8 +751,8 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 /// A dim key-hint strip in the reserved bottom row, with the app name pinned right.
 fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     let hint = match app.top_tab {
-        0 => "↑↓ move · Enter copy · Tab mode · ⌘F file · ⌘S favorite · ⌘N nav",
-        1 => "↑↓ move · h/l fold · Enter copy · ⌘F file · ⌘N nav",
+        0 => "↑↓ move · ^J complete · Enter copy · Tab mode · ⌘F file · ⌘S favorite · ⌘N nav",
+        1 => "↑↓ move · ^J complete · h/l fold · Enter copy · ⌘F file · ⌘N nav",
         _ => "Tab section · ⌘F doc · hjkl move · Space check · / jump",
     };
     let brand = "F1nder";
@@ -782,69 +829,175 @@ fn browse_match_set(app: &App) -> HashSet<usize> {
         .collect()
 }
 
-/// Walk the tree, emitting only rows whose ancestor folders are all expanded.
-/// A folder's key is its path (ancestor texts joined by NUL) so it stays stable
-/// across rebuilds. When `prune` is set, only matching leaves and their ancestor
-/// folders are shown. `auto_expand` (true only for a text filter) force-expands
-/// surviving folders unless explicitly collapsed; otherwise the normal
-/// `expanded` set is honored so file-only filtering stays browsable.
+/// Walk the tree, emitting the visible Browse rows. A row appears only when all
+/// its ancestor folders are expanded. A row's `key` is its real path (heading
+/// segments joined by NUL) so expand/collapse state and `$EDITOR` renames stay
+/// stable; the merge+hoist below only changes the displayed `text` and `depth`.
+/// When `prune` is set, only matching leaves and their ancestors show;
+/// `auto_expand` (a text filter) force-expands survivors unless explicitly
+/// collapsed, otherwise the persistent `expanded` set is honored.
+///
+/// merge+hoist de-clutters the deep, narrow taxonomies in the data:
+///   * hoist — a folder whose only surviving child is a command shows that
+///     command in the folder's place (no one-item wrapper folders);
+///   * merge — a pass-through folder (its only surviving child is another
+///     folder) folds into a combined `A / B` breadcrumb row keyed on the deepest
+///     node, so single-command chains collapse to just the command.
+struct FlattenCtx<'a> {
+    expanded: &'a HashSet<String>,
+    collapsed: &'a HashSet<String>,
+    prune: Option<&'a HashSet<usize>>,
+    auto_expand: bool,
+}
+
+/// Does this node survive the active filter? (Always true when unfiltered.)
+fn node_survives(node: &TreeNode, prune: Option<&HashSet<usize>>) -> bool {
+    match prune {
+        None => true,
+        Some(m) => match node.entry_index {
+            Some(i) => m.contains(&i),
+            None => count_matches(node, Some(m)) > 0,
+        },
+    }
+}
+
+/// The children of `node` that survive the active filter, in order.
+fn surviving_children<'a>(node: &'a TreeNode, prune: Option<&HashSet<usize>>) -> Vec<&'a TreeNode> {
+    node.children
+        .iter()
+        .filter(|c| node_survives(c, prune))
+        .collect()
+}
+
+/// A folder key is the parent's key with `name` appended (NUL-joined).
+fn join_key(prefix: &str, name: &str) -> String {
+    if prefix.is_empty() {
+        name.to_string()
+    } else {
+        format!("{}\u{0}{}", prefix, name)
+    }
+}
+
+fn is_key_expanded(ctx: &FlattenCtx, key: &str) -> bool {
+    if ctx.auto_expand {
+        !ctx.collapsed.contains(key)
+    } else {
+        ctx.expanded.contains(key)
+    }
+}
+
 fn flatten(
-    nodes: &[TreeNode],
-    depth: usize,
-    prefix: &str,
+    roots: &[TreeNode],
     expanded: &HashSet<String>,
     collapsed: &HashSet<String>,
     prune: Option<&HashSet<usize>>,
     auto_expand: bool,
     out: &mut Vec<BrowseRow>,
 ) {
-    for node in nodes {
-        let is_folder = node.entry_index.is_none();
-
-        if let Some(m) = prune {
-            let keep = match node.entry_index {
-                Some(i) => m.contains(&i),
-                None => count_matches(node, Some(m)) > 0,
-            };
-            if !keep {
-                continue;
-            }
+    let ctx = FlattenCtx {
+        expanded,
+        collapsed,
+        prune,
+        auto_expand,
+    };
+    for root in roots {
+        if node_survives(root, prune) {
+            emit_node(root, 0, "", &ctx, out);
         }
+    }
+}
 
-        let key = if prefix.is_empty() {
-            node.text.clone()
-        } else {
-            format!("{}\u{0}{}", prefix, node.text)
-        };
-        let is_expanded = if auto_expand {
-            !collapsed.contains(&key)
-        } else {
-            expanded.contains(&key)
-        };
+/// Emit one node (and its visible descendants). `depth` is the *display* depth;
+/// `prefix` is the parent's real NUL-joined key.
+fn emit_node(node: &TreeNode, depth: usize, prefix: &str, ctx: &FlattenCtx, out: &mut Vec<BrowseRow>) {
+    // Command leaf — emitted as-is.
+    if node.entry_index.is_some() {
         out.push(BrowseRow {
             depth,
             text: node.text.clone(),
-            key: key.clone(),
+            key: join_key(prefix, &node.text),
             entry_index: node.entry_index,
-            is_folder,
-            expanded: is_expanded,
-            count: if is_folder {
-                count_matches(node, prune)
-            } else {
-                1
-            },
+            is_folder: false,
+            expanded: false,
+            count: 1,
         });
-        if is_folder && is_expanded {
-            flatten(
-                &node.children,
-                depth + 1,
-                &key,
-                expanded,
-                collapsed,
-                prune,
-                auto_expand,
-                out,
-            );
+        return;
+    }
+
+    // Root (file-stem) folder: never hoist/merge; show a friendly label.
+    if depth == 0 {
+        let key = node.text.clone();
+        let is_expanded = is_key_expanded(ctx, &key);
+        out.push(BrowseRow {
+            depth,
+            text: root_label(&node.text),
+            key: key.clone(),
+            entry_index: None,
+            is_folder: true,
+            expanded: is_expanded,
+            count: count_matches(node, ctx.prune),
+        });
+        if is_expanded {
+            for child in surviving_children(node, ctx.prune) {
+                emit_node(child, depth + 1, &key, ctx, out);
+            }
+        }
+        return;
+    }
+
+    // Deeper folder: fold a single-sub-folder pass-through chain into `A / B`.
+    let mut label = node.text.clone();
+    let mut key = join_key(prefix, &node.text);
+    let mut cur = node;
+    loop {
+        let only = {
+            let surv = surviving_children(cur, ctx.prune);
+            if surv.len() == 1 && surv[0].entry_index.is_none() {
+                Some(surv[0])
+            } else {
+                None
+            }
+        };
+        match only {
+            Some(child) => {
+                label = format!("{} / {}", label, child.text);
+                key = join_key(&key, &child.text);
+                cur = child;
+            }
+            None => break,
+        }
+    }
+
+    let surv = surviving_children(cur, ctx.prune);
+    // Hoist: a folder wrapping a single command shows the command itself.
+    if surv.len() == 1 && surv[0].entry_index.is_some() {
+        let leaf = surv[0];
+        out.push(BrowseRow {
+            depth,
+            text: leaf.text.clone(),
+            key: join_key(&key, &leaf.text),
+            entry_index: leaf.entry_index,
+            is_folder: false,
+            expanded: false,
+            count: 1,
+        });
+        return;
+    }
+
+    // Branching folder — emit the (possibly merged) folder row, then recurse.
+    let is_expanded = is_key_expanded(ctx, &key);
+    out.push(BrowseRow {
+        depth,
+        text: label,
+        key: key.clone(),
+        entry_index: None,
+        is_folder: true,
+        expanded: is_expanded,
+        count: count_matches(cur, ctx.prune),
+    });
+    if is_expanded {
+        for child in surv {
+            emit_node(child, depth + 1, &key, ctx, out);
         }
     }
 }
@@ -866,8 +1019,6 @@ fn browse_rows(app: &App) -> Vec<BrowseRow> {
     let mut out = Vec::new();
     flatten(
         &roots,
-        0,
-        "",
         &app.expanded,
         &app.browse_collapsed,
         prune.as_ref(),
@@ -1009,6 +1160,18 @@ fn handle_browse_key(app: &mut App, terminal: &mut DefaultTerminal, key: KeyEven
         // h/l fold and unfold folders in nav mode (mirror Left/Right).
         KeyCode::Char('l') if app.browse_nav && plain => browse_toggle_folder(app),
         KeyCode::Char('h') if app.browse_nav && plain => browse_collapse_or_parent(app),
+        // Ctrl+J accepts the inline ghost-text completion while typing.
+        KeyCode::Char('j')
+            if ctrl
+                && !app.browse_nav
+                && complete_suffix(&app.vocab, last_token(&app.browse_query)).is_some() =>
+        {
+            if let Some(sfx) = complete_suffix(&app.vocab, last_token(&app.browse_query)) {
+                app.browse_query.push_str(&sfx);
+                app.browse_collapsed.clear();
+                app.browse_state.select(Some(0));
+            }
+        }
         // Enter/Right: toggle a folder, or copy + exit on a command.
         KeyCode::Enter | KeyCode::Right => {
             let filtering = !app.browse_query.trim().is_empty();
@@ -1057,6 +1220,7 @@ fn handle_browse_key(app: &mut App, terminal: &mut DefaultTerminal, key: KeyEven
 
                         enable_raw_mode()?;
                         execute!(stdout(), EnterAlternateScreen, Hide)?;
+                        push_kbd_enhancement();
                         terminal.clear()?;
 
                         if !new_name.is_empty() && new_name != text {
@@ -1079,6 +1243,7 @@ fn handle_browse_key(app: &mut App, terminal: &mut DefaultTerminal, key: KeyEven
 
                     enable_raw_mode()?;
                     execute!(stdout(), EnterAlternateScreen, Hide)?;
+                    push_kbd_enhancement();
                     terminal.clear()?;
                 }
             }
@@ -1123,6 +1288,7 @@ fn handle_browse_key(app: &mut App, terminal: &mut DefaultTerminal, key: KeyEven
 
             enable_raw_mode()?;
             execute!(stdout(), EnterAlternateScreen, Hide)?;
+            push_kbd_enhancement();
             terminal.clear()?;
         }
         // File filter: Ctrl+F or Super+F forward; add Shift (or 'F') for reverse.
@@ -1213,7 +1379,344 @@ fn build_tree(entries: &[Entry]) -> Vec<TreeNode> {
         }
         level.push(TreeNode::leaf(entry.title.clone(), i));
     }
+    sort_tree(&mut roots, None);
     roots
+}
+
+/// Stable-sort every folder level into methodology (chronological testing) order.
+/// `stem` is the source-file stem governing the current level's order map (None at
+/// the file-stem root). Folders not in the map keep insertion order (they sort
+/// after mapped folders); leaves always trail folders, keeping their own order.
+fn sort_tree(nodes: &mut [TreeNode], stem: Option<&str>) {
+    match stem {
+        None => nodes.sort_by_key(|n| root_rank(&n.text)),
+        Some(st) => nodes.sort_by_key(|n| match n.entry_index {
+            Some(_) => i32::MAX,
+            None => folder_rank(st, &n.text),
+        }),
+    }
+    for n in nodes.iter_mut() {
+        match stem {
+            None => {
+                let child_stem = n.text.clone();
+                sort_tree(&mut n.children, Some(&child_stem));
+            }
+            Some(st) => sort_tree(&mut n.children, Some(st)),
+        }
+    }
+}
+
+/// Order of the top-level command sets (file stems): recon-heavy first, then AD,
+/// web, cloud, wireless, misc.
+fn root_rank(stem: &str) -> i32 {
+    const ORDER: &[&str] = &[
+        "CPTS-CMDs",
+        "CAPE-CMDs",
+        "CWES-CMDs",
+        "CWEE-CMDs",
+        "OAOTC-CMDs",
+        "CWPE-CMDs",
+        "DEPTH-CMDs",
+    ];
+    ORDER
+        .iter()
+        .position(|s| *s == stem)
+        .map(|i| i as i32)
+        .unwrap_or(i32::MAX)
+}
+
+/// Friendly display label for a file-stem root folder (data/key unchanged).
+fn root_label(stem: &str) -> String {
+    match stem {
+        "CAPE-CMDs" => "Active Directory  (CAPE)",
+        "CPTS-CMDs" => "Penetration Testing  (CPTS)",
+        "CWEE-CMDs" => "Web — Expert  (CWEE)",
+        "CWES-CMDs" => "Web — Standard  (CWES)",
+        "CWPE-CMDs" => "Wireless  (CWPE)",
+        "OAOTC-CMDs" => "Azure / Cloud  (OAOTC)",
+        "DEPTH-CMDs" => "Depth  (DEPTH)",
+        other => other,
+    }
+    .to_string()
+}
+
+/// Rank of a heading folder within its file, from the curated methodology order.
+/// Unlisted names return `i32::MAX` (kept in insertion order, after ranked ones).
+/// The same map is applied at every depth, so names at any level order correctly.
+fn folder_rank(stem: &str, name: &str) -> i32 {
+    let order: &[&str] = match stem {
+        "CAPE-CMDs" => CAPE_ORDER,
+        "CPTS-CMDs" => CPTS_ORDER,
+        "CWEE-CMDs" => CWEE_ORDER,
+        "CWES-CMDs" => CWES_ORDER,
+        "CWPE-CMDs" => CWPE_ORDER,
+        "OAOTC-CMDs" => OAOTC_ORDER,
+        "DEPTH-CMDs" => DEPTH_ORDER,
+        _ => &[],
+    };
+    order
+        .iter()
+        .position(|s| *s == name)
+        .map(|i| i as i32)
+        .unwrap_or(i32::MAX)
+}
+
+// Curated folder orders per command set, aligned to JSONs/methodology/*.md.
+// Names not present in a file are harmless; unmatched folders fall to the end.
+
+/// CAPE ← ad.md phase order (Recon → Enum → Foothold → ADCS → Relay → DACL →
+/// Delegation → MSSQL → Exchange → SCCM → Cred Theft → Lateral → Trusts → Post).
+const CAPE_ORDER: &[&str] = &[
+    "Getting Started",
+    "Setting Up",
+    "Active Directory",
+    "Initial Access",
+    "Network Scanning",
+    "AD Enumeration",
+    "NetExec (nxc)",
+    "nxc",
+    "Rusthound-CE",
+    "Remote Services",
+    "Remote Management Tools",
+    "Spoofing",
+    "ADCS Attacks",
+    "NTLM Relay Attacks",
+    "Advanced NTLM Relay Attacks",
+    "DACL Attacks",
+    "Roasting Attacks",
+    "Unconstrained Delegation",
+    "Constrained Delegation",
+    "Ticket Abuse",
+    "Kerberos Authentication",
+    "MSSQL Server",
+    "Abusing SQL Server Links",
+    "Microsoft Exchange",
+    "SCCM",
+    "Group Policy",
+    "Attribute Modification",
+    "Credential Theft",
+    "Command Execution",
+    "Execute Commands",
+    "Getting a Remote Shell",
+    "Lateral Movement",
+    "Tunneling & Pivoting & Lateral Movement",
+    "Server Message Block (SMB)",
+    "Inter Forest Attacks",
+    "Cross Forest Attacks",
+    "Privilege Escalation",
+    "Post Exploitation",
+    "Establishing Persistence",
+    "Antivirus Evasion",
+    "C2 Frameworks",
+    "Sliver C2",
+    "Shell Utilities",
+    "String Manipulation",
+    "Miscellaneous",
+];
+
+/// OAOTC ← azure.md. Everything lives under the single `Azure` h0, so the h1
+/// subsection names are ordered here too (applied at every depth).
+const OAOTC_ORDER: &[&str] = &[
+    "Initial Enumeration",
+    "Cloud Enumeration",
+    "Azure",
+    "Authentication",
+    "OAuth",
+    "AD Enumeration",
+    "Resource Enumeration",
+    "Post-Authentication",
+    "Managed Identity",
+    "Credential Theft",
+    "Blob Storage",
+    "Post Exploitation",
+    "Persistence",
+];
+
+/// CWEE ← web.md (Enum → Server-Side → Client-Side → Transport → AuthN/Z).
+const CWEE_ORDER: &[&str] = &[
+    "Getting Started",
+    "Intro To Whitebox Pentesting",
+    "Web Enumeration",
+    "SQL Injection",
+    "LDAP Injection",
+    "XPath Injection",
+    "NoSQL Injection",
+    "Exploiting PHP Deserialization",
+    "HTML Injection in PDF Generators",
+    "DNS Rebinding",
+    "XSS",
+    "Web Cache Poisoning",
+    "CRLF Injection",
+    "CSRF Exploitation",
+    "Prototype Pollution",
+    "HTTP Request Smuggling",
+    "Host Header Attacks",
+    "JWTs",
+    "OAuth",
+    "SAML",
+    "Session Puzzling",
+];
+
+/// CWES ← web.md (Enum → Server-Side → Client-Side → AuthN/Z → API).
+const CWES_ORDER: &[&str] = &[
+    "Web Enumeration",
+    "Web Fuzzing",
+    "WordPress",
+    "SQL Injection",
+    "NoSQL Injection",
+    "XXE Injection",
+    "XSLT Injection",
+    "Server-Side Includes",
+    "SSTI",
+    "SSRF",
+    "Path Traversal",
+    "File Upload Attacks",
+    "XSS",
+    "Obfuscation & Deobfuscation",
+    "Session Attacks",
+    "Authentication Attacks",
+    "Password Attacks",
+    "Host Header Attacks",
+    "API Attacks",
+    "Attacking GraphQL",
+];
+
+/// CWPE (wireless): setup → fundamentals → WEP → WPA personal → WPA enterprise → WPS.
+const CWPE_ORDER: &[&str] = &[
+    "Getting Started",
+    "Setup",
+    "Interfaces and Modes",
+    "802.11 Fundamentals",
+    "Aircrack-ng Essentials",
+    "Basic Control Bypasses",
+    "WEP Encryption",
+    "WEP Attacks",
+    "Cracking WEP",
+    "WPA/WPA2 Personal Networks",
+    "Cracking WPA",
+    "WPA/WPA2 Enterprise Networks",
+    "WPA Enterprise Attacks",
+    "Certificates",
+    "Certificate Configuration",
+    "WPS Attacks",
+];
+
+/// CPTS is multi-domain: bucket External/recon → services & web → web attacks →
+/// initial access/creds → AD → post-exploitation (best-effort).
+const CPTS_ORDER: &[&str] = &[
+    "Getting Started",
+    "WHOIS",
+    "OSINT",
+    "Infrastructure Enumeration",
+    "Network Scanning",
+    "Enumeration Tools",
+    "Web Enumeration",
+    "Web Fuzzing",
+    "Initial Enumeration",
+    "Host Enumeration",
+    "Linux Enumeration",
+    "Attacking Common Services",
+    "Attacking Common Applications",
+    "WordPress",
+    "Joomla",
+    "Drupal",
+    "Tomcat",
+    "ColdFusion",
+    "GitLab",
+    "Jenkins",
+    "Splunk",
+    "PRTG",
+    "OS Ticket",
+    "IIS Tilde",
+    "SQL Injection",
+    "Database Enumeration",
+    "UNION Injection",
+    "ERROR-Based Injection",
+    "Blind Injection — Boolean Based",
+    "Blind Injection — Error Based",
+    "Blind Injection — Error Based (Oracle)",
+    "Blind Injection — Time Delays",
+    "Reading Files",
+    "Writing Files",
+    "DNS Lookups & Data Exfiltration",
+    "Command Injection",
+    "File Inclusion",
+    "File Upload Attacks",
+    "XSS",
+    "XXE Injection",
+    "IDOR",
+    "HTTP Attacks",
+    "WAF Bypass",
+    "Initial Access",
+    "Password Attacks",
+    "Attacking The OS",
+    "Living Off the Land",
+    "Shells",
+    "Metasploit",
+    "Meterpreter (It’s its own monster)",
+    "Msf Handler",
+    "MSFVenom Payloads",
+    "Plugins & Mixins",
+    "AD Enumeration",
+    "AD Attacks",
+    "Kerberoasting",
+    "LDAP",
+    "Trust Attacks",
+    "Privilege Escalation",
+    "Credential Theft",
+    "Lateral Movement",
+    "Pivoting and Tunneling",
+    "Pivoting",
+    "File Transfers",
+    "Post Exploitation",
+];
+
+/// DEPTH (misc/internal): recon → creds → tooling.
+const DEPTH_ORDER: &[&str] = &[
+    "Initial Enumeration",
+    "Password Attacks",
+    "Armory",
+    "VirtualBox",
+];
+
+/// The last whitespace-delimited token of `s` — the word autocomplete extends.
+fn last_token(s: &str) -> &str {
+    s.rsplit(char::is_whitespace).next().unwrap_or("")
+}
+
+/// The dim ghost-text completion for `token`, drawn from a frequency-ranked word
+/// list. Returns the suffix to append (never the whole word), or None when the
+/// token is too short or no longer word starts with it.
+fn complete_suffix(words: &[String], token: &str) -> Option<String> {
+    if token.len() < 2 {
+        return None;
+    }
+    let tl = token.to_lowercase();
+    words
+        .iter()
+        .find(|w| w.len() > tl.len() && w.starts_with(&tl))
+        .map(|w| w[tl.len()..].to_string())
+}
+
+/// Frequency-ranked words from the methodology jump targets, for the jump
+/// palette's inline autocomplete.
+fn jump_vocab(app: &App) -> Vec<String> {
+    use std::collections::HashMap;
+    let mut counts: HashMap<String, u32> = HashMap::new();
+    for t in jump_targets(app) {
+        for w in t.label.split(|c: char| !c.is_alphanumeric()) {
+            if w.len() >= 2 {
+                *counts.entry(w.to_lowercase()).or_insert(0) += 1;
+            }
+        }
+    }
+    let mut words: Vec<(String, u32)> = counts.into_iter().collect();
+    words.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then(a.0.len().cmp(&b.0.len()))
+            .then(a.0.cmp(&b.0))
+    });
+    words.into_iter().map(|(w, _)| w).collect()
 }
 fn render_browse_filter(frame: &mut Frame, area: Rect, app: &App) {
     let mut title = Line::from(vec![
@@ -1253,10 +1756,17 @@ fn render_browse_filter(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(C_DIM),
         )])
     } else {
-        Line::from(vec![
+        let mut spans = vec![
             Span::raw("  "),
             Span::styled(app.browse_query.as_str(), Style::default().fg(C_FG_BRIGHT)),
-        ])
+        ];
+        // Inline ghost-text completion (Browse filter is append-only).
+        if !app.browse_nav {
+            if let Some(sfx) = complete_suffix(&app.vocab, last_token(&app.browse_query)) {
+                spans.push(Span::styled(sfx, Style::default().fg(C_GUIDE)));
+            }
+        }
+        Line::from(spans)
     };
 
     if !app.browse_nav {
@@ -1860,6 +2370,12 @@ fn render_method_bar(frame: &mut Frame, area: Rect, app: &App) {
             spans.push(Span::raw(" "));
         }
         spans.push(Span::styled(app.method_query.as_str(), Style::default().fg(C_FG_BRIGHT)));
+        // Inline ghost-text completion (jump query is append-only).
+        if !app.method_jump_nav {
+            if let Some(sfx) = complete_suffix(&jump_vocab(app), last_token(&app.method_query)) {
+                spans.push(Span::styled(sfx, Style::default().fg(C_GUIDE)));
+            }
+        }
         Line::from(spans)
     } else {
         Line::from(vec![Span::styled(
@@ -2149,6 +2665,13 @@ fn handle_method_key(app: &mut App, terminal: &mut DefaultTerminal, key: KeyEven
             KeyCode::Backspace if !app.method_jump_nav => {
                 app.method_query.pop();
                 app.method_jump_sel = 0;
+            }
+            // Ctrl+J accepts the inline ghost-text completion.
+            KeyCode::Char('j') if ctrl && !app.method_jump_nav => {
+                if let Some(sfx) = complete_suffix(&jump_vocab(app), last_token(&app.method_query)) {
+                    app.method_query.push_str(&sfx);
+                    app.method_jump_sel = 0;
+                }
             }
             KeyCode::Char(c) if !app.method_jump_nav && plain => {
                 app.method_query.push(c);
@@ -2764,6 +3287,7 @@ fn edit_method_section(app: &mut App, terminal: &mut DefaultTerminal, add: bool)
     fs::remove_file(get_editor_temp_path())?;
     enable_raw_mode()?;
     execute!(stdout(), EnterAlternateScreen, Hide)?;
+    push_kbd_enhancement();
     terminal.clear()?;
 
     let mut new_lines: Vec<String> = Vec::with_capacity(all.len());
@@ -2904,10 +3428,17 @@ fn render_search_input(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(C_DIM),
         )])
     } else {
-        Line::from(vec![
+        let mut spans = vec![
             Span::raw("  "),
             Span::styled(app.query.as_str(), Style::default().fg(C_FG_BRIGHT)),
-        ])
+        ];
+        // Inline ghost-text completion, only while typing at the end of the query.
+        if !app.search_nav && app.cursor_index == app.query.len() {
+            if let Some(sfx) = complete_suffix(&app.vocab, last_token(&app.query)) {
+                spans.push(Span::styled(sfx, Style::default().fg(C_GUIDE)));
+            }
+        }
+        Line::from(spans)
     };
 
     let input = Paragraph::new(line).block(block);

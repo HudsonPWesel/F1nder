@@ -98,6 +98,42 @@ impl Entry {
     }
 }
 
+/// Build the autocomplete vocabulary: every word (len ≥ 2) from entry titles,
+/// heading paths, and command tool names, ranked by frequency then brevity so a
+/// typed prefix completes to the most common matching term. Tool names are
+/// up-weighted since they're the most useful thing to complete.
+fn build_vocab(entries: &[Entry]) -> Vec<String> {
+    use std::collections::HashMap;
+    let mut counts: HashMap<String, u32> = HashMap::new();
+    let add = |text: &str, weight: u32, counts: &mut HashMap<String, u32>| {
+        for w in text.split(|c: char| !c.is_alphanumeric()) {
+            if w.len() >= 2 {
+                *counts.entry(w.to_lowercase()).or_insert(0) += weight;
+            }
+        }
+    };
+    for e in entries {
+        add(&e.title, 1, &mut counts);
+        for h in &e.heading_path {
+            add(h, 1, &mut counts);
+        }
+        // The binary name (first token, path stripped) is prime completion fodder.
+        if let Some(first) = e.cmd.split_whitespace().next() {
+            let tool = first.rsplit('/').next().unwrap_or(first);
+            if tool.len() >= 2 && tool.chars().all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.')) {
+                *counts.entry(tool.to_lowercase()).or_insert(0) += 3;
+            }
+        }
+    }
+    let mut words: Vec<(String, u32)> = counts.into_iter().collect();
+    words.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then(a.0.len().cmp(&b.0.len()))
+            .then(a.0.cmp(&b.0))
+    });
+    words.into_iter().map(|(w, _)| w).collect()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Chain {
     pub id: String,
@@ -237,6 +273,9 @@ pub struct App {
     /// Keys ("doc/section/card/idx-path") of collapsed methodology headings.
     pub method_collapsed: HashSet<String>,
     pub results: Vec<usize>,
+    /// Frequency-ranked word list (titles, headings, tool names) for inline
+    /// autocomplete on the Search and Browse inputs.
+    pub vocab: Vec<String>,
     pub cursor_index: usize,
     pub chains: Vec<Chain>,
     pub entry_index: HashMap<String, usize>,
@@ -381,8 +420,10 @@ impl App {
             .enumerate()
             .map(|(i, e)| (e.id.clone(), i))
             .collect();
+        let vocab = build_vocab(&entries);
         Self {
             entries,
+            vocab,
             query: fs::read_to_string(get_prev_search_path())
                 .unwrap_or(String::new())
                 .lines()
