@@ -20,7 +20,7 @@ use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, BorderType, Borders, List, ListItem, ListState, Padding, Paragraph, Tabs,
+    Block, BorderType, Borders, List, ListItem, ListState, Padding, Paragraph,
 };
 use ratatui::{DefaultTerminal, Frame};
 use std::process::Command;
@@ -39,13 +39,14 @@ const C_HIGHLIGHT_DIM: Color = Color::Rgb(22, 30, 43); // selected row (unfocuse
 const C_TITLE: Color = Color::Rgb(182, 193, 216); // tier-2: body / subtitle text
 const C_DESC: Color = Color::Rgb(154, 164, 186); // description body text
 const C_STAR: Color = Color::Rgb(242, 202, 96); // favorite star (warm gold)
+const C_CHIP_BG: Color = Color::Rgb(24, 42, 62); // muted accent chip (soft, not loud cyan)
 
 // Nerd Font glyphs (JetBrainsMono Nerd Font Mono renders each as one cell; we
 // pad with a trailing space for a 2-column marker aligned like the old symbols).
 const IC_SEARCH: &str = "\u{f002}"; //
 const IC_BROWSE: &str = "\u{f03a}"; //
 const IC_METHOD: &str = "\u{f0ae}"; //
-const IC_STAR: &str = "\u{f005}"; //
+const IC_STAR: &str = "\u{2726}"; // ✦ (favorite marker, recolored gold)
 const IC_FOLDER: &str = "\u{f07b}"; //
 const IC_FOLDER_OPEN: &str = "\u{f07c}"; //
 const IC_CMD: &str = "\u{f120}"; //
@@ -1218,19 +1219,17 @@ fn render_browse_filter(frame: &mut Frame, area: Rect, app: &App) {
     let mut title = Line::from(vec![
         Span::raw(" "),
         Span::styled(
-            format!(" FILTER: {} ", app.browse_mode),
+            format!(" {} ", app.browse_mode),
             Style::default()
-                .bg(C_ACCENT)
-                .fg(C_ACCENT_BG)
+                .bg(C_CHIP_BG)
+                .fg(C_ACCENT)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(" "),
+        Span::raw("  "),
+        Span::styled(format!(" {} ", IC_FOLDER), Style::default().fg(C_DIM)),
         Span::styled(
-            format!(" file:{} ", app.file_filter_name().unwrap_or("ALL")),
-            Style::default()
-                .bg(C_DIM)
-                .fg(C_FG_BRIGHT)
-                .add_modifier(Modifier::BOLD),
+            format!("{} ", app.file_filter_name().unwrap_or("all")),
+            Style::default().fg(C_TITLE),
         ),
         Span::raw(" "),
     ]);
@@ -1318,7 +1317,7 @@ fn render_folder_view(frame: &mut Frame, area: Rect, app: &mut App) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .padding(Padding::horizontal(1))
+        .padding(Padding::new(2, 2, 1, 0))
         .title_bottom(Line::from(vec![Span::styled(
             format!(" {} entries ", app.entries.len()),
             Style::default().fg(C_DIM),
@@ -1347,7 +1346,7 @@ fn render_browse_detail(frame: &mut Frame, area: Rect, entry: Option<&Entry>) {
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(C_BORDER))
-        .padding(Padding::horizontal(1))
+        .padding(Padding::new(2, 2, 1, 0))
         .title(" COMMAND ")
         .title_alignment(Alignment::Center);
 
@@ -1823,8 +1822,8 @@ fn render_method_bar(frame: &mut Frame, area: Rect, app: &App) {
             format!(" {} ", d.name),
             if active {
                 Style::default()
-                    .bg(C_ACCENT)
-                    .fg(C_ACCENT_BG)
+                    .bg(C_CHIP_BG)
+                    .fg(C_ACCENT)
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(C_DIM)
@@ -1888,8 +1887,8 @@ fn render_method_sections(frame: &mut Frame, area: Rect, app: &App) {
         let active = i == app.method_section;
         let style = if active {
             Style::default()
-                .bg(C_ACCENT)
-                .fg(C_ACCENT_BG)
+                .bg(C_CHIP_BG)
+                .fg(C_ACCENT)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(C_DIM)
@@ -2046,6 +2045,7 @@ fn render_method_view(frame: &mut Frame, area: Rect, app: &mut App) {
     let cblock = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
+        .padding(Padding::new(1, 1, 1, 0))
         .border_style(Style::default().fg(if cards_focused { C_ACCENT } else { C_BORDER }))
         .title(" ATTACKS ")
         .title_alignment(Alignment::Center);
@@ -2081,6 +2081,7 @@ fn render_method_view(frame: &mut Frame, area: Rect, app: &mut App) {
     let tblock = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
+        .padding(Padding::new(1, 1, 1, 0))
         .border_style(Style::default().fg(if tree_focused { C_ACCENT } else { C_BORDER }))
         .title(format!(
             " {} ",
@@ -2098,7 +2099,7 @@ fn render_method_view(frame: &mut Frame, area: Rect, app: &mut App) {
         frame.render_widget(p, cols[1]);
         return;
     }
-    let inner_width = cols[1].width.saturating_sub(2);
+    let inner_width = cols[1].width.saturating_sub(4);
     let titems: Vec<ListItem> = rows.iter().map(|r| method_row_item(r, inner_width)).collect();
     let tlist = List::new(titems).block(tblock).highlight_style(if tree_focused {
         Style::default().bg(C_HIGHLIGHT_BG).add_modifier(Modifier::BOLD)
@@ -2794,23 +2795,61 @@ fn edit_method_section(app: &mut App, terminal: &mut DefaultTerminal, add: bool)
 }
 
 fn render_top_tabs(frame: &mut Frame, area: Rect, app: &App) {
-    let tabs = Tabs::new(vec![
-        format!("{}  Search", IC_SEARCH),
-        format!("{}  Browse", IC_BROWSE),
-        format!("{}  Methodology", IC_METHOD),
-    ])
-    .select(app.top_tab)
-    .style(Style::default().fg(C_DIM))
-    .highlight_style(
-        Style::default()
-            .bg(C_ACCENT)
-            .fg(C_ACCENT_BG)
-            .add_modifier(Modifier::BOLD),
-    )
-    .divider(Span::styled("·", Style::default().fg(C_GUIDE)))
-    .padding("  ", "  ");
+    let tabs = [
+        (IC_SEARCH, "Search"),
+        (IC_BROWSE, "Browse"),
+        (IC_METHOD, "Methodology"),
+    ];
+    const LEAD: usize = 2; // left inset
+    const GAP: usize = 5; // space between tabs
 
-    frame.render_widget(tabs, area);
+    // Row 0: the tab labels. Active tab = bright accent + bold; others dim.
+    // We track each tab's [col, width] so the underline lands exactly under it.
+    let mut spans: Vec<Span> = vec![Span::raw(" ".repeat(LEAD))];
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    let mut col = LEAD;
+    for (i, (icon, label)) in tabs.iter().enumerate() {
+        let active = i == app.top_tab;
+        let text = format!("{}  {}", icon, label);
+        let w = text.chars().count();
+        let style = if active {
+            Style::default()
+                .fg(C_ACCENT)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(C_DIM)
+        };
+        spans.push(Span::styled(text, style));
+        ranges.push((col, w));
+        col += w;
+        if i + 1 < tabs.len() {
+            spans.push(Span::styled(
+                format!("{}·{}", " ".repeat(GAP / 2), " ".repeat(GAP - GAP / 2 - 1)),
+                Style::default().fg(C_GUIDE),
+            ));
+            col += GAP;
+        }
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), Rect { height: 1, ..area });
+
+    // Row 1: a heavy accent underline sitting under just the active tab.
+    if area.height > 1 {
+        if let Some(&(start, w)) = ranges.get(app.top_tab) {
+            let underline = Line::from(vec![
+                Span::raw(" ".repeat(start)),
+                Span::styled("━".repeat(w), Style::default().fg(C_ACCENT)),
+            ]);
+            frame.render_widget(
+                Paragraph::new(underline),
+                Rect {
+                    x: area.x,
+                    y: area.y + 1,
+                    width: area.width,
+                    height: 1,
+                },
+            );
+        }
+    }
 }
 
 fn render_search_input(frame: &mut Frame, area: Rect, app: &App) {
@@ -2819,20 +2858,21 @@ fn render_search_input(frame: &mut Frame, area: Rect, app: &App) {
         Span::styled(
             format!(" {} ", app.mode.to_string()),
             Style::default()
-                .bg(C_ACCENT)
-                .fg(C_ACCENT_BG)
+                .bg(C_CHIP_BG)
+                .fg(C_ACCENT)
                 .add_modifier(Modifier::BOLD),
         ),
     ];
 
-    // Show the file filter as a badge next to the mode badge (Ctrl+F cycles it).
-    mode_spans.push(Span::raw(" "));
+    // Show the file filter as a subtle folder chip next to the mode badge (Ctrl+F cycles it).
+    mode_spans.push(Span::raw("  "));
     mode_spans.push(Span::styled(
-        format!(" file:{} ", app.file_filter_name().unwrap_or("ALL")),
-        Style::default()
-            .bg(C_DIM)
-            .fg(C_FG_BRIGHT)
-            .add_modifier(Modifier::BOLD),
+        format!(" {} ", IC_FOLDER),
+        Style::default().fg(C_DIM),
+    ));
+    mode_spans.push(Span::styled(
+        format!("{} ", app.file_filter_name().unwrap_or("all")),
+        Style::default().fg(C_TITLE),
     ));
     mode_spans.push(Span::raw(" "));
     // NAV badge when the results list has focus (j/k navigate, typing is off).
@@ -3081,15 +3121,15 @@ fn render_results(frame: &mut Frame, area: Rect, app: &mut App) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .padding(Padding::horizontal(1))
+        .padding(Padding::new(2, 2, 1, 0))
         .title_bottom(Line::from(vec![Span::styled(
             format!(" {} results ", app.results.len()),
             Style::default().fg(C_DIM),
         )]))
         .border_style(Style::default().fg(C_BORDER));
 
-    // Inner width = area minus the two border columns and the 1-col padding each side.
-    let inner_width = area.width.saturating_sub(4) as usize;
+    // Inner width = area minus the two border columns and the 2-col padding each side.
+    let inner_width = area.width.saturating_sub(6) as usize;
     let cmd_width = inner_width.saturating_sub(4);
 
     let items: Vec<ListItem> = app
@@ -3198,7 +3238,7 @@ fn render_chain(frame: &mut Frame, area: Rect, chain_entries: &[&Entry], selecte
         Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .padding(Padding::horizontal(1))
+            .padding(Padding::new(2, 2, 1, 0))
             .title_top(" ATTACK CHAIN ")
             .title_alignment(Alignment::Center)
             .border_style(Style::default().fg(C_BORDER)),
@@ -3247,7 +3287,7 @@ fn render_detail(frame: &mut Frame, area: Rect, app: &App) {
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(C_BORDER))
-            .padding(Padding::horizontal(1))
+            .padding(Padding::new(2, 2, 1, 0))
             .title(" DESCRIPTION ")
             .title_alignment(Alignment::Center),
     );
