@@ -35,6 +35,43 @@ impl MethodNode {
     pub fn is_heading(&self) -> bool {
         matches!(self.kind, MethodKind::Heading(_))
     }
+
+    fn has_check_descendant(&self) -> bool {
+        self.children
+            .iter()
+            .any(|c| c.kind == MethodKind::Check || c.has_check_descendant())
+    }
+
+    /// A `Check` with no `Check` descendant — a real, directly-checkable todo
+    /// (it may still have `Note` children). Parent checks are derived, not counted.
+    pub fn is_leaf_check(&self) -> bool {
+        self.kind == MethodKind::Check && !self.has_check_descendant()
+    }
+
+    /// `(done, total)` counting only leaf checks in this subtree, so a parent and
+    /// its children are never double-counted.
+    pub fn leaf_counts(&self) -> (usize, usize) {
+        let (mut done, mut total) = (0, 0);
+        if self.is_leaf_check() {
+            total += 1;
+            if self.checked {
+                done += 1;
+            }
+        }
+        for c in &self.children {
+            let (d, t) = c.leaf_counts();
+            done += d;
+            total += t;
+        }
+        (done, total)
+    }
+
+    /// Whether every leaf check in this subtree is checked (used for a parent's
+    /// derived checked state). Vacuously true when there are no leaf checks.
+    pub fn all_leaves_checked(&self) -> bool {
+        let (done, total) = self.leaf_counts();
+        total > 0 && done == total
+    }
 }
 
 struct Line {
@@ -154,13 +191,59 @@ fn node_from_line(l: &Line) -> MethodNode {
     }
 }
 
+/// Build a nested tree from a run of non-heading lines, nesting each item under
+/// the nearest preceding item with a smaller indent (a stack keyed by indent).
+fn build_items(items: &[&Line]) -> Vec<MethodNode> {
+    let mut nodes: Vec<MethodNode> = items
+        .iter()
+        .map(|l| {
+            let mut n = node_from_line(l);
+            n.indent = 0; // depth carries the hierarchy now
+            n.anchor = None;
+            n
+        })
+        .collect();
+    // parent[i] = index of i's parent, or None for a root.
+    let mut parent: Vec<Option<usize>> = vec![None; nodes.len()];
+    let mut stack: Vec<usize> = Vec::new(); // indices with strictly increasing indent
+    for i in 0..items.len() {
+        let ind = items[i].indent;
+        while let Some(&top) = stack.last() {
+            if items[top].indent >= ind {
+                stack.pop();
+            } else {
+                break;
+            }
+        }
+        parent[i] = stack.last().copied();
+        stack.push(i);
+    }
+    // Assemble children lists in order (reverse walk + insert(0, ..)).
+    let mut opt: Vec<Option<MethodNode>> = nodes.drain(..).map(Some).collect();
+    let mut roots: Vec<MethodNode> = Vec::new();
+    for i in (0..opt.len()).rev() {
+        let node = opt[i].take().unwrap();
+        match parent[i] {
+            Some(p) => opt[p].as_mut().unwrap().children.insert(0, node),
+            None => roots.insert(0, node),
+        }
+    }
+    roots
+}
+
 fn build_block(lines: &[Line], pos: &mut usize, parent_level: u8) -> Vec<MethodNode> {
     let mut out = Vec::new();
+    let mut body: Vec<&Line> = Vec::new();
     while *pos < lines.len() {
         match lines[*pos].heading {
             Some(hl) => {
                 if hl <= parent_level {
                     break;
+                }
+                // Flush any buffered body items before this sub-heading.
+                if !body.is_empty() {
+                    out.extend(build_items(&body));
+                    body.clear();
                 }
                 let mut node = node_from_line(&lines[*pos]);
                 node.indent = 0;
@@ -169,12 +252,13 @@ fn build_block(lines: &[Line], pos: &mut usize, parent_level: u8) -> Vec<MethodN
                 out.push(node);
             }
             None => {
-                let mut node = node_from_line(&lines[*pos]);
-                node.anchor = None;
-                out.push(node);
+                body.push(&lines[*pos]);
                 *pos += 1;
             }
         }
+    }
+    if !body.is_empty() {
+        out.extend(build_items(&body));
     }
     out
 }
@@ -196,11 +280,16 @@ fn section_re() -> &'static Regex {
     R.get_or_init(|| Regex::new(r"^(?:\d+|[IVXLCDM]+)\.").unwrap())
 }
 
-/// The top-level engagement sections — the numbered `# ...` headings that become
-/// the Methodology sub-tabs. The document title and Table of Contents are skipped.
+/// The top-level engagement sections that become the Methodology sub-tabs: any
+/// top-level heading that is numbered (`# 4.` / `# XII.`) **or** contains at
+/// least one checklist item. A document title / Table of Contents has no
+/// checkboxes and isn't numbered, so it's skipped.
 pub fn sections(tree: &[MethodNode]) -> Vec<&MethodNode> {
     tree.iter()
-        .filter(|n| n.is_heading() && section_re().is_match(n.title.trim_start()))
+        .filter(|n| {
+            n.is_heading()
+                && (section_re().is_match(n.title.trim_start()) || n.leaf_counts().1 > 0)
+        })
         .collect()
 }
 
@@ -220,6 +309,18 @@ mod tests {
         }
     }
 
+    fn find<'a>(nodes: &'a [MethodNode], title: &str) -> Option<&'a MethodNode> {
+        for n in nodes {
+            if n.title == title {
+                return Some(n);
+            }
+            if let Some(f) = find(&n.children, title) {
+                return Some(f);
+            }
+        }
+        None
+    }
+
     #[test]
     fn parses_web_doc() {
         let md = std::fs::read_to_string("JSONs/methodology/web.md").unwrap();
@@ -235,6 +336,25 @@ mod tests {
             server.children.iter().any(|c| c.title == "SQL Injection"),
             "SQL Injection card should exist under section 4"
         );
+
+        // Indented items nest into a real tree.
+        let rfi = find(&tree, "RFI").expect("RFI item");
+        assert!(
+            rfi.children.iter().any(|c| c.title.starts_with("RCE via malicious")),
+            "RFI should own the RCE child"
+        );
+        assert!(
+            rfi.children.iter().any(|c| c.title == "Enum localhost ports"),
+            "RFI should own 'Enum localhost ports'"
+        );
+        let rce = find(&rfi.children, "RCE via malicious script we host (include function must have execute)")
+            .or_else(|| rfi.children.iter().find(|c| c.title.starts_with("RCE via malicious")))
+            .expect("RCE node");
+        for leaf in ["HTTP", "FTP", "SMB"] {
+            assert!(rce.children.iter().any(|c| c.title == leaf), "RCE should own {leaf}");
+        }
+        assert!(!rfi.is_leaf_check(), "RFI is a parent check");
+        assert!(rce.children.iter().all(|c| c.is_leaf_check()), "HTTP/FTP/SMB are leaves");
     }
 
     #[test]
@@ -247,6 +367,31 @@ mod tests {
         assert_eq!(secs.len(), 16, "expected 16 AD sections");
         assert_eq!(secs[0].title.trim_start_matches("I. "), "External Recon");
     }
+
+    #[test]
+    fn parses_azure_and_external_docs() {
+        let az = parse(&std::fs::read_to_string("JSONs/methodology/azure.md").unwrap());
+        let az_secs = sections(&az);
+        let names: Vec<&str> = az_secs.iter().map(|s| s.title.as_str()).collect();
+        eprintln!("azure sections: {names:?}");
+        // The numbered I..IV sections are tabs; empty non-numbered headers (WKL,
+        // and "Authenticated Enum" once its checks are removed) are skipped.
+        assert!(az_secs.len() >= 4, "expected the numbered Azure sections");
+        assert!(names.iter().any(|n| n.starts_with("I. ")), "section I present");
+        assert!(!names.contains(&"WKL"), "empty non-numbered WKL is skipped");
+
+        let ex = parse(&std::fs::read_to_string("JSONs/methodology/external.md").unwrap());
+        let ex_secs = sections(&ex);
+        eprintln!("external sections={}", ex_secs.len());
+        // User-edited doc — assert it parses into several numbered sections rather
+        // than a brittle exact count.
+        assert!(ex_secs.len() >= 4, "expected several external sections, got {}", ex_secs.len());
+        assert!(
+            ex_secs.iter().all(|s| section_re().is_match(s.title.trim_start())),
+            "all external sections should be numbered"
+        );
+    }
 }
+
 
 

@@ -16,8 +16,6 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use nucleo::Config;
-use nucleo::pattern::{CaseMatching, Normalization, Pattern};
 use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -265,6 +263,13 @@ fn parse_template(entry_id: &str, app: &App) -> Result<Entry> {
             .map(|s| s.trim().to_string())
             .collect(),
         source_file: PathBuf::from(source_file.trim()),
+        // Preserve the star across an in-place edit (new entries default false).
+        favorite: app
+            .entry_index
+            .get(entry_id)
+            .and_then(|&i| app.entries.get(i))
+            .map(|e| e.favorite)
+            .unwrap_or(false),
     };
     Ok(new_entry)
 }
@@ -307,6 +312,31 @@ fn open_editor_at(path: &str, line: usize) -> std::io::Result<std::process::Exit
     }
 }
 
+/// Move the Search results selection down (clamped to the last row).
+fn search_sel_down(app: &mut App) {
+    let len = app.results.len();
+    if len == 0 {
+        return;
+    }
+    let i = app
+        .list_state
+        .selected()
+        .map(|i| (i + 1).min(len - 1))
+        .unwrap_or(0);
+    app.list_state.select(Some(i));
+    app.current_chain_index = 0;
+}
+
+/// Move the Search results selection up (clamped to the first row).
+fn search_sel_up(app: &mut App) {
+    if let Some(i) = app.list_state.selected() {
+        app.list_state.select(Some(i.saturating_sub(1)));
+    } else if !app.results.is_empty() {
+        app.list_state.select(Some(0));
+    }
+    app.current_chain_index = 0;
+}
+
 fn handle_key_event(app: &mut App, terminal: &mut DefaultTerminal) -> Result<bool> {
     if let Event::Key(key) = event::read()? {
         if key.kind != KeyEventKind::Press {
@@ -324,11 +354,25 @@ fn handle_key_event(app: &mut App, terminal: &mut DefaultTerminal) -> Result<boo
             }
         }
         match key.code {
-            // Esc cancels the Methodology jump palette; otherwise it quits.
+            // Esc first backs out of any list-nav focus; otherwise it cancels the
+            // jump palette, or quits.
             KeyCode::Esc => {
+                if app.top_tab == 0 && app.search_nav {
+                    app.search_nav = false;
+                    return Ok(false);
+                }
+                if app.top_tab == 1 && app.browse_nav {
+                    app.browse_nav = false;
+                    return Ok(false);
+                }
                 if app.top_tab == 2 && app.method_jump_active {
+                    if app.method_jump_nav {
+                        app.method_jump_nav = false;
+                        return Ok(false);
+                    }
                     app.method_jump_active = false;
                     app.method_query.clear();
+                    app.method_jump_nav = false;
                     return Ok(false);
                 }
                 return Ok(true);
@@ -398,7 +442,11 @@ fn handle_key_event(app: &mut App, terminal: &mut DefaultTerminal) -> Result<boo
                 execute!(stdout(), EnterAlternateScreen, Hide)?;
                 terminal.clear()?;
             }
-            KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // Chain-edit toggle: Super+C (or Ctrl+C) — moved off 'n' so Super+N is
+            // free for list-nav.
+            KeyCode::Char('c')
+                if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
+            {
                 if !app.is_chain_edit_mode {
                     if let Some(entry) = app.selected_entry() {
                         app.prev_selected_entry_id = entry.id.clone();
@@ -408,6 +456,20 @@ fn handle_key_event(app: &mut App, terminal: &mut DefaultTerminal) -> Result<boo
                 app.query.clear();
                 app.cursor_index = 0;
                 search(app, false);
+            }
+            // Super+S (or Ctrl+S): toggle the selected command as a favorite.
+            KeyCode::Char('s')
+                if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
+            {
+                if let Some(idx) = app.selected_entry_index() {
+                    app.entries[idx].favorite = !app.entries[idx].favorite;
+                    app.dirty = true;
+                    search(app, false);
+                    // Follow the toggled entry to its new (reordered) position.
+                    if let Some(pos) = app.results.iter().position(|&r| r == idx) {
+                        app.list_state.select(Some(pos));
+                    }
+                }
             }
             KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if let Some(entry) = app.selected_entry() {
@@ -508,36 +570,50 @@ fn handle_key_event(app: &mut App, terminal: &mut DefaultTerminal) -> Result<boo
 
             KeyCode::Char('[') => {
                 app.top_tab = (app.top_tab + 2) % 3;
+                app.search_nav = false;
+                app.browse_nav = false;
                 app.save_prev_method();
             }
             KeyCode::Char(']') => {
                 app.top_tab = (app.top_tab + 1) % 3;
+                app.search_nav = false;
+                app.browse_nav = false;
                 app.save_prev_method();
             }
 
-            KeyCode::Down => {
-                let len = app.results.len();
-                if len > 0 {
-                    let i = app
-                        .list_state
-                        .selected()
-                        .map(|i| if i == len - 1 { len - 1 } else { i + 1 })
-                        .unwrap_or(0);
-                    app.list_state.select(Some(i));
+            // Arrows always move the selection (in both typing and nav modes).
+            KeyCode::Down => search_sel_down(app),
+            KeyCode::Up => search_sel_up(app),
+            // Super+N (or Ctrl+N) toggles list-nav (j/k navigate, typing off).
+            // Esc also exits.
+            KeyCode::Char('n')
+                if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
+            {
+                if app.search_nav {
+                    app.search_nav = false;
+                } else if !app.results.is_empty() {
+                    app.search_nav = true;
+                    if app.list_state.selected().is_none() {
+                        app.list_state.select(Some(0));
+                    }
                 }
-                app.current_chain_index = 0;
             }
-            KeyCode::Up => {
-                let len = app.results.len();
-                if len > 0 {
-                    let i = app
-                        .list_state
-                        .selected()
-                        .map(|i| if i == 0 { 0 } else { i - 1 })
-                        .unwrap_or(0);
-                    app.list_state.select(Some(i));
-                }
-                app.current_chain_index = 0;
+            // j/k navigate the results while in list-nav mode.
+            KeyCode::Char('j')
+                if app.search_nav
+                    && !key.modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                    ) =>
+            {
+                search_sel_down(app);
+            }
+            KeyCode::Char('k')
+                if app.search_nav
+                    && !key.modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                    ) =>
+            {
+                search_sel_up(app);
             }
             KeyCode::Left => {
                 app.cursor_index = app.cursor_index.saturating_sub(1);
@@ -554,10 +630,12 @@ fn handle_key_event(app: &mut App, terminal: &mut DefaultTerminal) -> Result<boo
                     search(app, true);
                 }
             }
+            // Typing filters — but not while list-nav has focus.
             KeyCode::Char(c)
-                if !key.modifiers.intersects(
-                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
-                ) =>
+                if !app.search_nav
+                    && !key.modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                    ) =>
             {
                 app.query.insert(app.cursor_index, c);
                 app.cursor_index += 1;
@@ -801,31 +879,90 @@ fn rename_heading(app: &mut App, key: &str, new_name: &str) {
     }
 }
 
+/// Move the Browse selection down (clamped).
+fn browse_sel_down(app: &mut App) {
+    let len = browse_rows(app).len();
+    if len == 0 {
+        return;
+    }
+    let i = app
+        .browse_state
+        .selected()
+        .map(|i| (i + 1).min(len - 1))
+        .unwrap_or(0);
+    app.browse_state.select(Some(i));
+}
+
+/// Move the Browse selection up (clamped to the first row).
+fn browse_sel_up(app: &mut App) {
+    if let Some(i) = app.browse_state.selected() {
+        app.browse_state.select(Some(i.saturating_sub(1)));
+    } else if !browse_rows(app).is_empty() {
+        app.browse_state.select(Some(0));
+    }
+}
+
+/// Toggle the selected folder's expansion (no-op on a command leaf) — the `l`
+/// / Right action.
+fn browse_toggle_folder(app: &mut App) {
+    let filtering = !app.browse_query.trim().is_empty();
+    let rows = browse_rows(app);
+    if let Some(row) = app.browse_state.selected().and_then(|s| rows.get(s)) {
+        if row.is_folder {
+            let key = row.key.clone();
+            let expanded_now = row.expanded;
+            set_folder_expanded(app, &key, !expanded_now, filtering);
+        }
+    }
+}
+
+/// Collapse an expanded folder, else jump to the parent row — the `h` / Left action.
+fn browse_collapse_or_parent(app: &mut App) {
+    let filtering = !app.browse_query.trim().is_empty();
+    let rows = browse_rows(app);
+    if let Some(sel) = app.browse_state.selected() {
+        if let Some(row) = rows.get(sel) {
+            if row.is_folder && row.expanded {
+                let key = row.key.clone();
+                set_folder_expanded(app, &key, false, filtering);
+            } else {
+                let depth = row.depth;
+                for j in (0..sel).rev() {
+                    if rows[j].depth < depth {
+                        app.browse_state.select(Some(j));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn handle_browse_key(app: &mut App, terminal: &mut DefaultTerminal, key: KeyEvent) -> Result<bool> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let plain = !ctrl && !key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::SUPER);
     match key.code {
-        KeyCode::Down => {
-            let len = browse_rows(app).len();
-            if len > 0 {
-                let i = app
-                    .browse_state
-                    .selected()
-                    .map(|i| (i + 1).min(len - 1))
-                    .unwrap_or(0);
-                app.browse_state.select(Some(i));
+        // Arrows always move the selection (both typing and nav modes).
+        KeyCode::Down => browse_sel_down(app),
+        KeyCode::Up => browse_sel_up(app),
+        // Super+N (or Ctrl+N) toggles list-nav (j/k navigate, typing off).
+        KeyCode::Char('n')
+            if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
+        {
+            if app.browse_nav {
+                app.browse_nav = false;
+            } else if !browse_rows(app).is_empty() {
+                app.browse_nav = true;
+                if app.browse_state.selected().is_none() {
+                    app.browse_state.select(Some(0));
+                }
             }
         }
-        KeyCode::Up => {
-            let len = browse_rows(app).len();
-            if len > 0 {
-                let i = app
-                    .browse_state
-                    .selected()
-                    .map(|i| i.saturating_sub(1))
-                    .unwrap_or(0);
-                app.browse_state.select(Some(i));
-            }
-        }
+        KeyCode::Char('j') if app.browse_nav && plain => browse_sel_down(app),
+        KeyCode::Char('k') if app.browse_nav && plain => browse_sel_up(app),
+        // h/l fold and unfold folders in nav mode (mirror Left/Right).
+        KeyCode::Char('l') if app.browse_nav && plain => browse_toggle_folder(app),
+        KeyCode::Char('h') if app.browse_nav && plain => browse_collapse_or_parent(app),
         // Enter/Right: toggle a folder, or copy + exit on a command.
         KeyCode::Enter | KeyCode::Right => {
             let filtering = !app.browse_query.trim().is_empty();
@@ -844,26 +981,7 @@ fn handle_browse_key(app: &mut App, terminal: &mut DefaultTerminal, key: KeyEven
             }
         }
         // Left: collapse an expanded folder, else jump to the parent row.
-        KeyCode::Left => {
-            let filtering = !app.browse_query.trim().is_empty();
-            let rows = browse_rows(app);
-            if let Some(sel) = app.browse_state.selected() {
-                if let Some(row) = rows.get(sel) {
-                    if row.is_folder && row.expanded {
-                        let key = row.key.clone();
-                        set_folder_expanded(app, &key, false, filtering);
-                    } else {
-                        let depth = row.depth;
-                        for j in (0..sel).rev() {
-                            if rows[j].depth < depth {
-                                app.browse_state.select(Some(j));
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        KeyCode::Left => browse_collapse_or_parent(app),
         // Edit the selected command, reusing the existing editor template flow.
         // Ctrl+E: edit the selected command, or rename the selected heading folder.
         KeyCode::Char('e') if ctrl => {
@@ -1006,17 +1124,13 @@ fn handle_browse_key(app: &mut App, terminal: &mut DefaultTerminal, key: KeyEven
             app.browse_collapsed.clear();
             app.browse_state.select(Some(0));
         }
-        KeyCode::Backspace => {
+        KeyCode::Backspace if !app.browse_nav => {
             app.browse_query.pop();
             app.browse_collapsed.clear();
             app.browse_state.select(Some(0));
         }
-        KeyCode::Char(c)
-            if !ctrl
-                && !key
-                    .modifiers
-                    .intersects(KeyModifiers::ALT | KeyModifiers::SUPER) =>
-        {
+        // Typing filters — but not while list-nav has focus.
+        KeyCode::Char(c) if !app.browse_nav && plain => {
             app.browse_query.push(c);
             app.browse_collapsed.clear();
             app.browse_state.select(Some(0));
@@ -1056,7 +1170,7 @@ fn build_tree(entries: &[Entry]) -> Vec<TreeNode> {
     roots
 }
 fn render_browse_filter(frame: &mut Frame, area: Rect, app: &App) {
-    let title = Line::from(vec![
+    let mut title = Line::from(vec![
         Span::raw(" "),
         Span::styled(
             format!(" FILTER: {} ", app.browse_mode),
@@ -1075,10 +1189,18 @@ fn render_browse_filter(frame: &mut Frame, area: Rect, app: &App) {
         ),
         Span::raw(" "),
     ]);
+    // NAV badge when the tree has focus (j/k navigate, typing is off).
+    if app.browse_nav {
+        title.spans.push(Span::styled(
+            " NAV ",
+            Style::default().bg(C_CHECK).fg(C_ACCENT_BG).add_modifier(Modifier::BOLD),
+        ));
+        title.spans.push(Span::raw(" "));
+    }
     let block = Block::default()
         .title_top(title)
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(C_BORDER));
+        .border_style(Style::default().fg(if app.browse_nav { C_ACCENT } else { C_BORDER }));
 
     let line = if app.browse_query.is_empty() {
         Line::from(vec![Span::styled(
@@ -1092,10 +1214,12 @@ fn render_browse_filter(frame: &mut Frame, area: Rect, app: &App) {
         ])
     };
 
-    frame.set_cursor_position(Position::new(
-        area.x + 1 + 2 + app.browse_query.len() as u16,
-        area.y + 1,
-    ));
+    if !app.browse_nav {
+        frame.set_cursor_position(Position::new(
+            area.x + 1 + 2 + app.browse_query.len() as u16,
+            area.y + 1,
+        ));
+    }
     frame.render_widget(Paragraph::new(line).block(block), area);
 }
 
@@ -1225,42 +1349,33 @@ struct MethodRow {
     key: String,
     title: String,
     kind: MethodKind,
-    indent: usize,
     is_heading: bool,
+    /// Has at least one visible child (so it can fold / shows a ▾▸ marker).
+    has_children: bool,
+    /// A directly-checkable leaf check (no check descendant).
+    is_leaf: bool,
     expanded: bool,
+    /// Last among its visible siblings (drives └─ vs ├─).
+    is_last: bool,
+    /// For each ancestor level ≥1: does that ancestor have a following sibling
+    /// (draw a continuing `│`) — used to render the tree connector guides.
+    guides: Vec<bool>,
     done: usize,
     total: usize,
     checked: bool,
     src_line: usize,
 }
 
-/// (done, total) check items in `n` and its descendants (counts `n` itself).
-fn node_counts(n: &MethodNode) -> (usize, usize) {
-    let (mut done, mut total) = (0, 0);
-    if n.kind == MethodKind::Check {
-        total += 1;
-        if n.checked {
-            done += 1;
-        }
-    }
-    for c in &n.children {
-        let (d, t) = node_counts(c);
-        done += d;
-        total += t;
-    }
-    (done, total)
-}
-
 fn roots_counts(roots: &[&MethodNode]) -> (usize, usize) {
     roots.iter().fold((0, 0), |(d, t), r| {
-        let (rd, rt) = node_counts(r);
+        let (rd, rt) = r.leaf_counts();
         (d + rd, t + rt)
     })
 }
 
 fn method_overall(app: &App) -> (usize, usize) {
     app.method_tree().iter().fold((0, 0), |(d, t), n| {
-        let (nd, nt) = node_counts(n);
+        let (nd, nt) = n.leaf_counts();
         (d + nd, t + nt)
     })
 }
@@ -1283,10 +1398,13 @@ fn card_roots(section: &MethodNode) -> Vec<(String, Vec<&MethodNode>)> {
     cards
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_method_row(
     node: &MethodNode,
     key: String,
     depth: usize,
+    guides: &[bool],
+    is_last: bool,
     collapsed: &HashSet<String>,
     show_comments: bool,
     out: &mut Vec<MethodRow>,
@@ -1296,28 +1414,62 @@ fn push_method_row(
         return;
     }
     let is_heading = node.is_heading();
-    let expanded = !collapsed.contains(&key);
-    let (done, total) = if is_heading {
-        node_counts(node)
-    } else {
-        (0, 0)
+    // Visible children (with original indices, so keys stay stable when comments
+    // are toggled). A note-only parent with comments hidden reads as a leaf.
+    let visible: Vec<(usize, &MethodNode)> = node
+        .children
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| show_comments || c.kind != MethodKind::Note)
+        .collect();
+    let has_children = !visible.is_empty();
+    let expanded = has_children && !collapsed.contains(&key);
+    let (done, total) = node.leaf_counts();
+    let checked = match node.kind {
+        MethodKind::Check => {
+            if node.is_leaf_check() {
+                node.checked
+            } else {
+                node.all_leaves_checked()
+            }
+        }
+        _ => false,
     };
     out.push(MethodRow {
         depth,
         key: key.clone(),
         title: node.title.clone(),
         kind: node.kind.clone(),
-        indent: node.indent,
         is_heading,
+        has_children,
+        is_leaf: node.is_leaf_check(),
         expanded,
+        is_last,
+        guides: guides.to_vec(),
         done,
         total,
-        checked: node.kind == MethodKind::Check && node.checked,
+        checked,
         src_line: node.src_line,
     });
-    if !node.children.is_empty() && (!is_heading || expanded) {
-        for (i, ch) in node.children.iter().enumerate() {
-            push_method_row(ch, format!("{}/{}", key, i), depth + 1, collapsed, show_comments, out);
+    if expanded {
+        let n = visible.len();
+        for (vi, (oi, ch)) in visible.iter().enumerate() {
+            // Roots (depth 0) draw no vertical bar; deeper levels append this
+            // node's "has a following sibling" flag for its children.
+            let mut cg = guides.to_vec();
+            if depth >= 1 {
+                cg.push(!is_last);
+            }
+            push_method_row(
+                ch,
+                format!("{}/{}", key, oi),
+                depth + 1,
+                &cg,
+                vi == n - 1,
+                collapsed,
+                show_comments,
+                out,
+            );
         }
     }
 }
@@ -1333,11 +1485,14 @@ fn card_rows(
     show_comments: bool,
 ) -> Vec<MethodRow> {
     let mut out = Vec::new();
+    let n = roots.len();
     for (i, root) in roots.iter().enumerate() {
         push_method_row(
             root,
             format!("{}/{}/{}/{}", di, si, ci, i),
             0,
+            &[],
+            i == n - 1,
             collapsed,
             show_comments,
             &mut out,
@@ -1484,81 +1639,112 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
 }
 
 fn method_row_item<'a>(r: &'a MethodRow, inner_width: u16) -> ListItem<'a> {
-    let indent = r.depth * 2 + r.indent;
-    let pad = " ".repeat(indent);
-    match r.kind {
-        MethodKind::Heading(level) => {
-            let marker = if r.expanded { "▾" } else { "▸" };
-            let mut spans = vec![
-                Span::raw(pad),
-                Span::styled(
-                    format!("{} {}", marker, r.title),
-                    Style::default()
-                        .fg(if level <= 3 { C_FG_BRIGHT } else { C_TITLE })
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ];
-            if r.total > 0 {
-                let all = r.done == r.total;
-                spans.push(Span::styled(
-                    format!("  {}/{}", r.done, r.total),
-                    Style::default().fg(if all { C_CHECK } else { C_DIM }),
-                ));
+    let guide_style = Style::default().fg(C_DIM);
+
+    // Tree connector prefix. Depth 0 (card roots) draw no guides.
+    let mut gpre = String::new();
+    let mut cont = String::new();
+    if r.depth >= 1 {
+        for &bar in &r.guides {
+            gpre.push_str(if bar { "│ " } else { "  " });
+            cont.push_str(if bar { "│ " } else { "  " });
+        }
+        gpre.push_str(if r.is_last { "└─" } else { "├─" });
+        cont.push_str("  ");
+    }
+    let gwidth = gpre.chars().count();
+    let child_bar = r.has_children && r.expanded;
+
+    // Fold marker for any parent (heading or parent item).
+    let fold: &str = if r.has_children {
+        if r.expanded { "▾ " } else { "▸ " }
+    } else {
+        ""
+    };
+    let fold_w = fold.chars().count();
+
+    // Per-kind marker, text style, and optional rollup badge.
+    let (marker, marker_style, text_style, badge): (String, Style, Style, Option<(String, Style)>) =
+        match r.kind {
+            MethodKind::Heading(level) => (
+                String::new(),
+                guide_style,
+                Style::default()
+                    .fg(if level <= 3 { C_FG_BRIGHT } else { C_TITLE })
+                    .add_modifier(Modifier::BOLD),
+                (r.total > 0).then(|| {
+                    (
+                        format!("  {}/{}", r.done, r.total),
+                        Style::default().fg(if r.done == r.total { C_CHECK } else { C_DIM }),
+                    )
+                }),
+            ),
+            MethodKind::Check => {
+                let (m, ts) = if r.checked {
+                    (
+                        "☑ ".to_string(),
+                        Style::default().fg(C_DIM).add_modifier(Modifier::CROSSED_OUT),
+                    )
+                } else {
+                    ("☐ ".to_string(), Style::default().fg(C_FG_BRIGHT))
+                };
+                let ms = Style::default().fg(if r.checked { C_CHECK } else { C_DIM });
+                // Parent items show a rollup of their leaf checks.
+                let badge = (r.has_children && r.total > 0).then(|| {
+                    (
+                        format!("  {}/{}", r.done, r.total),
+                        Style::default().fg(if r.done == r.total { C_CHECK } else { C_DIM }),
+                    )
+                });
+                (m, ms, ts, badge)
             }
-            ListItem::new(Line::from(spans))
-        }
-        MethodKind::Check => {
-            let (mark, style) = if r.checked {
-                (
-                    "☑ ",
-                    Style::default().fg(C_DIM).add_modifier(Modifier::CROSSED_OUT),
-                )
-            } else {
-                ("☐ ", Style::default().fg(C_FG_BRIGHT))
-            };
-            let mark_style = Style::default().fg(if r.checked { C_CHECK } else { C_DIM });
-            // Marker is 2 cols; wrap the text and hang-indent continuations.
-            let text_width = (inner_width as usize).saturating_sub(indent + 2);
-            let wrapped = wrap_text(&r.title, text_width);
-            let cont_pad = " ".repeat(indent + 2);
-            let lines: Vec<Line> = wrapped
-                .iter()
-                .enumerate()
-                .map(|(i, seg)| {
-                    if i == 0 {
-                        Line::from(vec![
-                            Span::raw(pad.clone()),
-                            Span::styled(mark, mark_style),
-                            Span::styled(seg.clone(), style),
-                        ])
-                    } else {
-                        Line::from(vec![
-                            Span::raw(cont_pad.clone()),
-                            Span::styled(seg.clone(), style),
-                        ])
-                    }
-                })
-                .collect();
-            ListItem::new(lines)
-        }
-        MethodKind::Note => {
-            // A floating comment: dim italic prose, no marker, wrapped.
-            let style = Style::default().fg(C_DIM).add_modifier(Modifier::ITALIC);
-            let text_width = (inner_width as usize).saturating_sub(indent);
-            let wrapped = wrap_text(&r.title, text_width);
-            let cont_pad = " ".repeat(indent);
-            let lines: Vec<Line> = wrapped
-                .iter()
-                .map(|seg| {
-                    Line::from(vec![
-                        Span::raw(cont_pad.clone()),
-                        Span::styled(seg.clone(), style),
-                    ])
-                })
-                .collect();
-            ListItem::new(lines)
+            MethodKind::Note => (
+                "· ".to_string(),
+                guide_style,
+                Style::default().fg(C_DIM).add_modifier(Modifier::ITALIC),
+                None,
+            ),
+        };
+    let marker_w = marker.chars().count();
+
+    let lead_w = gwidth + fold_w + marker_w;
+    let text_width = (inner_width as usize).saturating_sub(lead_w).max(1);
+    let wrapped = wrap_text(&r.title, text_width);
+
+    // Continuation lead: ancestor bars + blank elbow slot, a bar under this node
+    // if it has children, then spaces to align under the text.
+    let mut cont_lead = cont.clone();
+    if fold_w > 0 {
+        cont_lead.push_str(if child_bar { "│ " } else { "  " });
+    }
+    cont_lead.push_str(&" ".repeat(marker_w));
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, seg) in wrapped.iter().enumerate() {
+        if i == 0 {
+            let mut spans: Vec<Span> = Vec::new();
+            if !gpre.is_empty() {
+                spans.push(Span::styled(gpre.clone(), guide_style));
+            }
+            if fold_w > 0 {
+                spans.push(Span::styled(fold, guide_style));
+            }
+            if marker_w > 0 {
+                spans.push(Span::styled(marker.clone(), marker_style));
+            }
+            spans.push(Span::styled(seg.clone(), text_style));
+            if let Some((b, bs)) = &badge {
+                spans.push(Span::styled(b.clone(), *bs));
+            }
+            lines.push(Line::from(spans));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled(cont_lead.clone(), guide_style),
+                Span::styled(seg.clone(), text_style),
+            ]));
         }
     }
+    ListItem::new(lines)
 }
 
 fn render_method_bar(frame: &mut Frame, area: Rect, app: &App) {
@@ -1606,13 +1792,19 @@ fn render_method_bar(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(C_CHECK).add_modifier(Modifier::BOLD),
         )])
     } else if app.method_jump_active {
-        Line::from(vec![
-            Span::styled(
-                "  jump ",
-                Style::default().fg(C_ACCENT).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(app.method_query.as_str(), Style::default().fg(C_FG_BRIGHT)),
-        ])
+        let mut spans = vec![Span::styled(
+            "  jump ",
+            Style::default().fg(C_ACCENT).add_modifier(Modifier::BOLD),
+        )];
+        if app.method_jump_nav {
+            spans.push(Span::styled(
+                " NAV ",
+                Style::default().bg(C_CHECK).fg(C_ACCENT_BG).add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled(app.method_query.as_str(), Style::default().fg(C_FG_BRIGHT)));
+        Line::from(spans)
     } else {
         Line::from(vec![Span::styled(
             format!(
@@ -1622,7 +1814,7 @@ fn render_method_bar(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(C_DIM),
         )])
     };
-    if app.method_jump_active {
+    if app.method_jump_active && !app.method_jump_nav {
         frame.set_cursor_position(Position::new(
             area.x + 1 + 7 + app.method_query.len() as u16,
             area.y + 1,
@@ -1649,7 +1841,7 @@ fn render_method_sections(frame: &mut Frame, area: Rect, app: &App) {
         spans.push(Span::raw(" "));
     }
     if let Some(sec) = sections.get(app.method_section) {
-        let (d, t) = node_counts(sec);
+        let (d, t) = sec.leaf_counts();
         spans.push(Span::raw("  "));
         spans.push(Span::styled(
             sec.title.clone(),
@@ -1856,30 +2048,43 @@ fn handle_method_key(app: &mut App, terminal: &mut DefaultTerminal, key: KeyEven
 
     // Jump palette captures all typing while active.
     if app.method_jump_active {
-        match key.code {
-            KeyCode::Esc => {
-                app.method_jump_active = false;
-                app.method_query.clear();
+        // Esc is handled in the shared match (it backs out of nav, then cancels).
+        let plain = !ctrl && !key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::SUPER);
+        let sel_down = |app: &mut App| {
+            let n = jump_filtered(app).len();
+            if n > 0 {
+                app.method_jump_sel = (app.method_jump_sel + 1).min(n - 1);
             }
+        };
+        match key.code {
             KeyCode::Enter => commit_method_jump(app),
-            KeyCode::Up => app.method_jump_sel = app.method_jump_sel.saturating_sub(1),
-            KeyCode::Down => {
-                let n = jump_filtered(app).len();
-                if n > 0 {
-                    app.method_jump_sel = (app.method_jump_sel + 1).min(n - 1);
+            // Super+N (or Ctrl+N) toggles list-nav (j/k navigate, typing off).
+            KeyCode::Char('n')
+                if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
+            {
+                if app.method_jump_nav {
+                    app.method_jump_nav = false;
+                } else if !jump_filtered(app).is_empty() {
+                    app.method_jump_nav = true;
                 }
+            }
+            // Arrows always move the candidate selection.
+            KeyCode::Down => sel_down(app),
+            KeyCode::Up => app.method_jump_sel = app.method_jump_sel.saturating_sub(1),
+            // j/k navigate only in nav mode.
+            KeyCode::Char('j') if app.method_jump_nav && plain => sel_down(app),
+            KeyCode::Char('k') if app.method_jump_nav && plain => {
+                app.method_jump_sel = app.method_jump_sel.saturating_sub(1);
             }
             KeyCode::Char('u') if ctrl => {
                 app.method_query.clear();
                 app.method_jump_sel = 0;
             }
-            KeyCode::Backspace => {
+            KeyCode::Backspace if !app.method_jump_nav => {
                 app.method_query.pop();
                 app.method_jump_sel = 0;
             }
-            KeyCode::Char(c)
-                if !ctrl && !key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::SUPER) =>
-            {
+            KeyCode::Char(c) if !app.method_jump_nav && plain => {
                 app.method_query.push(c);
                 app.method_jump_sel = 0;
             }
@@ -1906,6 +2111,7 @@ fn handle_method_key(app: &mut App, terminal: &mut DefaultTerminal, key: KeyEven
     match key.code {
         KeyCode::Char('/') => {
             app.method_jump_active = true;
+            app.method_jump_nav = false;
             app.method_query.clear();
             app.method_jump_sel = 0;
         }
@@ -2007,25 +2213,25 @@ fn handle_method_key(app: &mut App, terminal: &mut DefaultTerminal, key: KeyEven
                 app.method_tree_state.select(Some(0));
             }
         }
-        // Right / l: focus the tree from the cards, else expand a collapsed heading.
+        // Right / l: focus the tree from the cards, else expand a collapsed parent.
         KeyCode::Right | KeyCode::Char('l') => {
             if !app.method_focus {
                 focus_method_tree(app);
             } else {
                 let rows = rows_for(app, app.method_section, app.method_card);
                 if let Some(r) = app.method_tree_state.selected().and_then(|s| rows.get(s)) {
-                    if r.is_heading && !r.expanded {
+                    if r.has_children && !r.expanded {
                         app.method_collapsed.remove(&r.key);
                     }
                 }
             }
         }
-        // Left / h: collapse a heading, step to the parent, or fall back to the cards.
+        // Left / h: collapse a parent, step to the parent row, or fall back to cards.
         KeyCode::Left | KeyCode::Char('h') => {
             if app.method_focus {
                 let rows = rows_for(app, app.method_section, app.method_card);
                 match app.method_tree_state.selected().and_then(|s| rows.get(s)) {
-                    Some(r) if r.is_heading && r.expanded => {
+                    Some(r) if r.has_children && r.expanded => {
                         let k = r.key.clone();
                         app.method_collapsed.insert(k);
                     }
@@ -2041,7 +2247,7 @@ fn handle_method_key(app: &mut App, terminal: &mut DefaultTerminal, key: KeyEven
                 }
             }
         }
-        // Enter / Space: focus the tree, toggle a heading, or check an item.
+        // Enter / Space: focus tree; toggle a heading; check a leaf; cascade a parent.
         KeyCode::Enter | KeyCode::Char(' ') => {
             if !app.method_focus {
                 focus_method_tree(app);
@@ -2052,8 +2258,15 @@ fn handle_method_key(app: &mut App, terminal: &mut DefaultTerminal, key: KeyEven
                         let k = r.key.clone();
                         toggle_method_collapsed(app, &k);
                     } else if r.kind == MethodKind::Check {
-                        let (line, want) = (r.src_line, !r.checked);
-                        toggle_method_check(app, line, want);
+                        let want = !r.checked;
+                        if r.is_leaf {
+                            apply_method_checks(app, &[r.src_line], want);
+                        } else {
+                            // Parent: cascade the new state to every leaf under it.
+                            let key = r.key.clone();
+                            let lines = method_leaf_lines(app, &key);
+                            apply_method_checks(app, &lines, want);
+                        }
                     }
                 }
             }
@@ -2183,41 +2396,92 @@ fn toggle_method_collapsed(app: &mut App, key: &str) {
     }
 }
 
-/// Flip a checkbox: rewrite the `- [ ]`/`- [x]` marker on its source line, then
-/// re-parse so the in-memory tree matches the file.
-fn toggle_method_check(app: &mut App, src_line: usize, checked: bool) {
-    let Some(path) = app.method_path().map(|p| p.to_path_buf()) else {
-        return;
-    };
-    if flip_check_line(&path, src_line, checked).is_ok() {
-        app.method_reload();
+/// Set the checkbox marker on one line: swap `[ ]`↔`[x]`, or insert a marker
+/// after the dash for a bare `- text` bullet so it becomes a real checkbox.
+fn set_marker_line(l: &mut String, checked: bool) {
+    let target = if checked { "[x]" } else { "[ ]" };
+    for m in ["[ ]", "[x]", "[X]"] {
+        if let Some(pos) = l.find(m) {
+            l.replace_range(pos..pos + 3, target);
+            return;
+        }
+    }
+    if let Some(pos) = l.find("- ") {
+        l.insert_str(pos + 2, &format!("{} ", target));
     }
 }
 
-fn flip_check_line(path: &Path, line_idx: usize, checked: bool) -> std::io::Result<()> {
-    let content = fs::read_to_string(path)?;
-    let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
-    if let Some(l) = lines.get_mut(line_idx) {
-        let target = if checked { "[x]" } else { "[ ]" };
-        let mut swapped = false;
-        for m in ["[ ]", "[x]", "[X]"] {
-            if let Some(pos) = l.find(m) {
-                l.replace_range(pos..pos + 3, target);
-                swapped = true;
-                break;
-            }
+/// Check/uncheck the given source lines, reconcile parent checkboxes to match
+/// their leaves, then re-parse so the in-memory tree matches the file.
+fn apply_method_checks(app: &mut App, lines: &[usize], checked: bool) {
+    let Some(path) = app.method_path().map(|p| p.to_path_buf()) else {
+        return;
+    };
+    let Ok(content) = fs::read_to_string(&path) else {
+        return;
+    };
+    let mut fl: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+    for &ln in lines {
+        if let Some(l) = fl.get_mut(ln) {
+            set_marker_line(l, checked);
         }
-        // A bare `- text` bullet has no marker yet — insert one after the dash so
-        // it becomes a real checkbox.
-        if !swapped {
-            if let Some(pos) = l.find("- ") {
-                l.insert_str(pos + 2, &format!("{} ", target));
+    }
+    normalize_parent_markers(&mut fl);
+    let _ = fs::write(&path, fl.join("\n") + "\n");
+    app.method_reload();
+}
+
+/// Make every parent check's marker follow its leaves (`[x]` iff all leaves are
+/// checked). Parses the current lines, then rewrites parent lines bottom-up.
+fn normalize_parent_markers(fl: &mut [String]) {
+    let tree = crate::methodology::parse(&fl.join("\n"));
+    fn visit(node: &MethodNode, fl: &mut [String]) {
+        for c in &node.children {
+            visit(c, fl);
+        }
+        if node.kind == MethodKind::Check && !node.is_leaf_check() {
+            if let Some(l) = fl.get_mut(node.src_line) {
+                set_marker_line(l, node.all_leaves_checked());
             }
         }
     }
-    let mut out = lines.join("\n");
-    out.push('\n');
-    fs::write(path, out)
+    for n in &tree {
+        visit(n, fl);
+    }
+}
+
+/// Resolve the node at `key` ("doc/section/card/i/j/…") within the active doc.
+fn method_node_at<'a>(app: &'a App, key: &str) -> Option<&'a MethodNode> {
+    let parts: Vec<usize> = key.split('/').filter_map(|s| s.parse().ok()).collect();
+    if parts.len() < 4 || parts[0] != app.method_doc {
+        return None;
+    }
+    let sections = crate::methodology::sections(app.method_tree());
+    let sec = sections.get(parts[1])?;
+    let cards = card_roots(sec);
+    let (_, roots) = cards.get(parts[2])?;
+    let mut node: &MethodNode = roots.get(parts[3]).copied()?;
+    for &idx in &parts[4..] {
+        node = node.children.get(idx)?;
+    }
+    Some(node)
+}
+
+/// Source lines of every leaf check under the node at `key`.
+fn method_leaf_lines(app: &App, key: &str) -> Vec<usize> {
+    fn collect(node: &MethodNode, out: &mut Vec<usize>) {
+        if node.is_leaf_check() {
+            out.push(node.src_line);
+        }
+        for c in &node.children {
+            collect(c, out);
+        }
+    }
+    let mut out = Vec::new();
+    if let Some(node) = method_node_at(app, key) {
+        collect(node, &mut out);
+    }
+    out
 }
 
 /// Uncheck every `- [x]` in the active document, then re-parse.
@@ -2340,6 +2604,7 @@ fn commit_method_jump(app: &mut App) {
     let cands = jump_filtered(app);
     let target = cands.get(app.method_jump_sel).map(|t| (t.si, t.ci, t.key.clone()));
     app.method_jump_active = false;
+    app.method_jump_nav = false;
     app.method_query.clear();
     let Some((si, ci, key)) = target else { return };
     // Remember where we were before jumping away.
@@ -2500,12 +2765,23 @@ fn render_search_input(frame: &mut Frame, area: Rect, app: &App) {
             .add_modifier(Modifier::BOLD),
     ));
     mode_spans.push(Span::raw(" "));
+    // NAV badge when the results list has focus (j/k navigate, typing is off).
+    if app.search_nav {
+        mode_spans.push(Span::styled(
+            " NAV ",
+            Style::default()
+                .bg(C_CHECK)
+                .fg(C_ACCENT_BG)
+                .add_modifier(Modifier::BOLD),
+        ));
+        mode_spans.push(Span::raw(" "));
+    }
     let mode_title = Line::from(mode_spans);
 
     let mut block = Block::default()
         .title_top(mode_title)
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(C_BORDER));
+        .border_style(Style::default().fg(if app.search_nav { C_ACCENT } else { C_BORDER }));
 
     if app.is_chain_edit_mode {
         block = block.title_bottom(Line::from("CHAIN_EDIT_MODE").left_aligned());
@@ -2522,10 +2798,13 @@ fn render_search_input(frame: &mut Frame, area: Rect, app: &App) {
 
     let input = Paragraph::new(line).block(block);
 
-    frame.set_cursor_position(Position::new(
-        area.x + 1 + 2 + app.cursor_index as u16, // border + padding + index
-        area.y + 1,                               // border
-    ));
+    // Only show the text cursor while typing (input mode).
+    if !app.search_nav {
+        frame.set_cursor_position(Position::new(
+            area.x + 1 + 2 + app.cursor_index as u16, // border + padding + index
+            area.y + 1,                               // border
+        ));
+    }
     frame.render_widget(input, area);
 }
 
@@ -2578,6 +2857,55 @@ fn entry_in_file(entry: &Entry, filter: Option<&str>) -> bool {
     }
 }
 
+/// The command's tool binary (lowercased) — the first real token, skipping common
+/// wrappers and env assignments; empty for URL-only "commands".
+fn tool_of(cmd: &str) -> String {
+    const WRAPPERS: &[&str] = &[
+        "sudo", "doas", "proxychains", "proxychains4", "python", "python3", "pipx",
+        "env", "time", "watch", "nohup",
+    ];
+    for tok in cmd.split_whitespace() {
+        if tok.is_empty() {
+            continue;
+        }
+        // env assignment like FOO=bar
+        if tok.contains('=') && !tok.contains('/') {
+            continue;
+        }
+        let low = tok.to_lowercase();
+        if WRAPPERS.contains(&low.as_str()) {
+            continue;
+        }
+        if low.starts_with("http://") || low.starts_with("https://") {
+            return String::new();
+        }
+        // strip any path prefix: /usr/bin/ffuf -> ffuf
+        return low.rsplit('/').next().unwrap_or(&low).to_string();
+    }
+    String::new()
+}
+
+/// How well `token` matches lowercase `field`: 0 = not a substring, 1 = mid-word
+/// substring, 2 = word-prefix, 3 = whole word.
+fn token_quality(field: &str, token: &str) -> u32 {
+    if token.is_empty() || !field.contains(token) {
+        return 0;
+    }
+    let mut q = 1;
+    for word in field.split(|c: char| !c.is_alphanumeric()) {
+        if word.is_empty() {
+            continue;
+        }
+        if word == token {
+            return 3;
+        }
+        if word.starts_with(token) {
+            q = q.max(2);
+        }
+    }
+    q
+}
+
 fn search(app: &mut App, reset_selection: bool) {
     app.current_chain_index = 0;
     let previous_selection = app.list_state.selected();
@@ -2587,110 +2915,81 @@ fn search(app: &mut App, reset_selection: bool) {
     let query = app.query.trim();
 
     if query.is_empty() {
-        // No fuzzy query: list every entry that passes the file filter.
-        app.results = (0..app.entries.len())
+        // No fuzzy query: list every entry that passes the file filter, with
+        // favorites floated to the top (stable, so file order is otherwise kept).
+        let mut results: Vec<usize> = (0..app.entries.len())
             .filter(|&i| entry_in_file(&app.entries[i], file_ref))
             .collect();
+        results.sort_by_key(|&i| !app.entries[i].favorite);
+        app.results = results;
     } else {
-        let mut config = Config::DEFAULT;
-        config.prefer_prefix = true;
-        let mut matcher = nucleo::Matcher::new(config);
-        let pattern = Pattern::parse(query, CaseMatching::Ignore, Normalization::Smart);
+        // All-words matching: split the query into words and require EVERY word to
+        // match some field (as a substring / word-prefix). Entries missing any word
+        // are dropped, so loose fuzzy noise disappears. Each word scores by its best
+        // field (title > heading > tool/cmd) and match quality (whole-word >
+        // prefix > mid-word); the entry score is the sum.
         let query_lower = query.to_lowercase();
+        let tokens: Vec<&str> = query_lower.split_whitespace().collect();
 
-        let has_substr = |text: &str| text.to_lowercase().contains(&query_lower);
-        let title_bonus = |t: &str| -> u32 { if has_substr(t) { 512 } else { 0 } };
-        let cmd_bonus = |t: &str| -> u32 { if has_substr(t) { 256 } else { 0 } };
-        let heading_bonus = |t: &str| -> u32 { if has_substr(t) { 128 } else { 0 } };
-
-        // Reward matches at the start of the title or at a word boundary within
-        // it, so typing the beginning of a title surfaces it in a few keystrokes.
-        let prefix_bonus = |t: &str| -> u32 {
-            let tl = t.to_lowercase();
-            if tl.starts_with(&query_lower) {
-                1024
-            } else if tl
-                .split(|c: char| !c.is_alphanumeric())
-                .any(|w| !w.is_empty() && w.starts_with(&query_lower))
-            {
-                384
-            } else {
-                0
-            }
-        };
-
-        let mut scored: Vec<(usize, u32)> = Vec::new();
-
+        let mut scored: Vec<(usize, i64, bool)> = Vec::new();
         for (i, entry) in app.entries.iter().enumerate() {
             if !entry_in_file(entry, file_ref) {
                 continue;
             }
-            match app.mode {
-                SearchMode::CMD => {
-                    let mut buf = Vec::new();
-                    let haystack = nucleo::Utf32Str::new(entry.cmd.as_str(), &mut buf);
-                    if let Some(score) = pattern.score(haystack, &mut matcher) {
-                        scored.push((i, score.saturating_add(cmd_bonus(&entry.cmd))));
+            let title = entry.title.to_lowercase();
+            let heading = entry.heading_path.join(" > ").to_lowercase();
+            let cmd = entry.cmd.to_lowercase();
+            let tool = tool_of(&entry.cmd);
+
+            // (lowercased field text, weight) considered for the active mode. The
+            // prose description is deliberately excluded — a word buried there
+            // shouldn't keep an otherwise-unrelated command in the results.
+            let fields: Vec<(&str, i64)> = match app.mode {
+                SearchMode::TITLE => vec![(title.as_str(), 1000)],
+                SearchMode::HEADING => vec![(heading.as_str(), 1000)],
+                SearchMode::CMD => vec![(tool.as_str(), 800), (cmd.as_str(), 400)],
+                SearchMode::ALL => vec![
+                    (title.as_str(), 1000),
+                    (tool.as_str(), 800),
+                    (heading.as_str(), 500),
+                    (cmd.as_str(), 200),
+                ],
+            };
+
+            let mut total: i64 = 0;
+            let mut all_matched = true;
+            for &tok in &tokens {
+                let mut best = 0i64;
+                for &(text, weight) in &fields {
+                    let q = token_quality(text, tok) as i64;
+                    if q > 0 {
+                        best = best.max(weight + q * 250);
                     }
                 }
-                SearchMode::TITLE => {
-                    let mut buf = Vec::new();
-                    let haystack = nucleo::Utf32Str::new(entry.title.as_str(), &mut buf);
-                    if let Some(score) = pattern.score(haystack, &mut matcher) {
-                        let bonus =
-                            title_bonus(&entry.title).saturating_add(prefix_bonus(&entry.title));
-                        scored.push((i, score.saturating_add(bonus)));
-                    }
+                if best == 0 {
+                    all_matched = false;
+                    break;
                 }
-                SearchMode::HEADING => {
-                    let temp_string = entry.heading_path.join(" > ");
-                    let mut buf = Vec::new();
-                    let haystack = nucleo::Utf32Str::new(&temp_string, &mut buf);
-                    if let Some(score) = pattern.score(haystack, &mut matcher) {
-                        scored.push((i, score.saturating_add(heading_bonus(&temp_string))));
-                    }
-                }
-                SearchMode::ALL => {
-                    let heading_str = entry.heading_path.join(" ");
-
-                    // Recall: one haystack across all fields so a multi-word query
-                    // (e.g. "mssql linux") can match a word in the title and a word
-                    // in the heading/description/command.
-                    let combined = format!(
-                        "{}  {}  {}  {}",
-                        entry.title, heading_str, entry.description, entry.cmd
-                    );
-                    let mut cb = Vec::new();
-                    let c_hay = nucleo::Utf32Str::new(&combined, &mut cb);
-
-                    if let Some(base) = pattern.score(c_hay, &mut matcher) {
-                        // Ranking: pull title (and to a lesser extent heading)
-                        // matches to the top of the recall set.
-                        let mut t_buf = Vec::new();
-                        let t_hay = nucleo::Utf32Str::new(entry.title.as_str(), &mut t_buf);
-                        let t_score = pattern.score(t_hay, &mut matcher).unwrap_or(0);
-
-                        let mut h_buf = Vec::new();
-                        let h_hay = nucleo::Utf32Str::new(&heading_str, &mut h_buf);
-                        let h_score = pattern.score(h_hay, &mut matcher).unwrap_or(0);
-
-                        let bonus = title_bonus(&entry.title)
-                            .saturating_add(prefix_bonus(&entry.title))
-                            .saturating_add(heading_bonus(&heading_str))
-                            .saturating_add(cmd_bonus(&entry.cmd));
-
-                        let total = base
-                            .saturating_add(t_score.saturating_mul(3))
-                            .saturating_add(h_score)
-                            .saturating_add(bonus);
-                        scored.push((i, total));
-                    }
-                }
+                total += best;
             }
+            if !all_matched {
+                continue;
+            }
+
+            // Reward the whole query being a title prefix, and prefer shorter
+            // (more specific) titles as a tie-break.
+            if title.starts_with(&query_lower) {
+                total += 500;
+            }
+            total -= title.chars().count().min(250) as i64;
+
+            scored.push((i, total, entry.favorite));
         }
 
-        scored.sort_by(|a, b| b.1.cmp(&a.1));
-        app.results = scored.into_iter().map(|(i, _)| i).collect();
+        // Favorites first (they're already all-words-relevant since they matched),
+        // then by score.
+        scored.sort_by(|a, b| b.2.cmp(&a.2).then(b.1.cmp(&a.1)));
+        app.results = scored.into_iter().map(|(i, _, _)| i).collect();
     }
 
     if app.results.is_empty() {
@@ -2718,17 +3017,45 @@ fn render_results(frame: &mut Frame, area: Rect, app: &mut App) {
         .iter()
         .filter_map(|&i| app.entries.get(i))
         .map(|e| {
-            let breadcrumb = e.heading_path.join(" › ");
-
             let mut lines: Vec<Line> = Vec::new();
 
+            // Title (bold), with a small ✦ pinned top-right on favorites.
+            let title_style = Style::default().fg(C_FG_BRIGHT).add_modifier(Modifier::BOLD);
+            let tw = if e.favorite {
+                inner_width.saturating_sub(2).max(1)
+            } else {
+                inner_width.max(1)
+            };
+            let tchunks = textwrap::wrap(&e.title, tw);
+            if e.favorite && tchunks.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::raw(" ".repeat(inner_width.saturating_sub(1))),
+                    Span::styled("✦", Style::default().fg(C_ACCENT)),
+                ]));
+            }
+            for (idx, chunk) in tchunks.iter().enumerate() {
+                if idx == 0 && e.favorite {
+                    let pad = inner_width.saturating_sub(chunk.chars().count() + 1);
+                    lines.push(Line::from(vec![
+                        Span::styled(chunk.to_string(), title_style),
+                        Span::raw(" ".repeat(pad)),
+                        Span::styled("✦", Style::default().fg(C_ACCENT)),
+                    ]));
+                } else {
+                    lines.push(Line::from(Span::styled(chunk.to_string(), title_style)));
+                }
+            }
+
+            // Heading breadcrumb (dim).
+            let breadcrumb = e.heading_path.join(" › ");
             for chunk in textwrap::wrap(&breadcrumb, inner_width.max(1)) {
                 lines.push(Line::from(Span::styled(
-                    chunk.into_owned(),
+                    chunk.to_string(),
                     Style::default().fg(C_DIM),
                 )));
             }
 
+            // Command.
             let wrapped = textwrap::wrap(&e.cmd, cmd_width.max(1));
             for (idx, chunk) in wrapped.iter().enumerate() {
                 let prefix = if idx == 0 { "  $ " } else { "    " };

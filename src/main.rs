@@ -79,6 +79,9 @@ pub struct Entry {
     pub description: String,
     pub source_file: PathBuf,
     pub heading_path: Vec<String>,
+    /// Starred by the user — pinned above non-favorites among search matches.
+    #[serde(default)]
+    pub favorite: bool,
 }
 
 impl Entry {
@@ -90,6 +93,7 @@ impl Entry {
             description: String::new(),
             source_file: PathBuf::new(),
             heading_path: Vec::new(),
+            favorite: false,
         }
     }
 }
@@ -190,6 +194,13 @@ pub struct App {
     pub query: String,
     pub mode: SearchMode,
     pub list_state: ListState,
+    /// Search tab: focus is on the results list (j/k navigate) vs the query
+    /// input (typing). Transient UI state, not persisted.
+    pub search_nav: bool,
+    /// Browse tab: same nav-vs-input focus for the folder filter.
+    pub browse_nav: bool,
+    /// Methodology jump palette: nav-vs-input focus while `/` is active.
+    pub method_jump_nav: bool,
     /// Expanded folder keys in the Browse tab (folder path joined by NUL).
     pub expanded: HashSet<String>,
     /// Loaded methodology documents (one per JSONs/methodology/*.md). Each is a
@@ -391,6 +402,9 @@ impl App {
             },
             top_tab: saved_top_tab,
             list_state,
+            search_nav: false,
+            browse_nav: false,
+            method_jump_nav: false,
             expanded: saved_expanded,
             method_docs,
             method_doc,
