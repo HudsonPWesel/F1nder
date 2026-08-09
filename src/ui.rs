@@ -19,20 +19,40 @@ use crossterm::terminal::{
 use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tabs};
+use ratatui::widgets::{
+    Block, BorderType, Borders, List, ListItem, ListState, Padding, Paragraph, Tabs,
+};
 use ratatui::{DefaultTerminal, Frame};
 use std::process::Command;
 use std::sync::OnceLock;
 
-const C_BORDER: Color = Color::Rgb(140, 150, 170); // muted blue-gray for borders
-const C_DIM: Color = Color::Rgb(100, 110, 130); // dim text / breadcrumbs
-const C_FG_BRIGHT: Color = Color::Rgb(220, 228, 245); // bright/primary text
-const C_ACCENT: Color = Color::Rgb(92, 196, 255); // cyan accent (tabs, mode badge)
-const C_ACCENT_BG: Color = Color::Rgb(14, 24, 38); // dark bg for accent badge text
-const C_HIGHLIGHT_BG: Color = Color::Rgb(20, 30, 40); // list selection highlight (focused pane)
-const C_HIGHLIGHT_DIM: Color = Color::Rgb(12, 17, 24); // selection highlight for the unfocused pane
-const C_TITLE: Color = Color::Rgb(175, 185, 209); // description / title text
-const C_DESC: Color = Color::Rgb(140, 150, 170); // description body text
+// Palette — tuned for a dark terminal. Three text tiers (bright > body > dim)
+// plus a fainter guide tone, so content reads above the recessive frames.
+const C_BORDER: Color = Color::Rgb(66, 76, 98); // subtle frames that recede behind content
+const C_DIM: Color = Color::Rgb(128, 140, 162); // tier-3: breadcrumbs / secondary text
+const C_GUIDE: Color = Color::Rgb(80, 90, 112); // tree connector guides (fainter than text)
+const C_FG_BRIGHT: Color = Color::Rgb(230, 236, 249); // tier-1: primary text
+const C_ACCENT: Color = Color::Rgb(104, 202, 255); // cyan accent (tabs, mode badge)
+const C_ACCENT_BG: Color = Color::Rgb(11, 19, 31); // ink behind accent pills
+const C_HIGHLIGHT_BG: Color = Color::Rgb(33, 48, 67); // selected row (focused pane)
+const C_HIGHLIGHT_DIM: Color = Color::Rgb(22, 30, 43); // selected row (unfocused pane)
+const C_TITLE: Color = Color::Rgb(182, 193, 216); // tier-2: body / subtitle text
+const C_DESC: Color = Color::Rgb(154, 164, 186); // description body text
+const C_STAR: Color = Color::Rgb(242, 202, 96); // favorite star (warm gold)
+
+// Nerd Font glyphs (JetBrainsMono Nerd Font Mono renders each as one cell; we
+// pad with a trailing space for a 2-column marker aligned like the old symbols).
+const IC_SEARCH: &str = "\u{f002}"; //
+const IC_BROWSE: &str = "\u{f03a}"; //
+const IC_METHOD: &str = "\u{f0ae}"; //
+const IC_STAR: &str = "\u{f005}"; //
+const IC_FOLDER: &str = "\u{f07b}"; //
+const IC_FOLDER_OPEN: &str = "\u{f07c}"; //
+const IC_CMD: &str = "\u{f120}"; //
+const IC_CHECK_ON: &str = "\u{f046}"; //
+const IC_CHECK_OFF: &str = "\u{f096}"; //
+const IC_SECTION: &str = "\u{f0ca}"; //
+const IC_ITEM: &str = "\u{f105}"; //
 
 static EDITOR_TEMP_PATH: OnceLock<String> = OnceLock::new();
 
@@ -676,6 +696,31 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         1 => render_folder_view(frame, combined, app),
         _ => render_method_view(frame, combined, app),
     }
+
+    render_footer(frame, chunks[4], app);
+}
+
+/// A dim key-hint strip in the reserved bottom row, with the app name pinned right.
+fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
+    let hint = match app.top_tab {
+        0 => "↑↓ move · Enter copy · Tab mode · ⌘F file · ⌘S favorite · ⌘N nav",
+        1 => "↑↓ move · h/l fold · Enter copy · ⌘F file · ⌘N nav",
+        _ => "Tab section · ⌘F doc · hjkl move · Space check · / jump",
+    };
+    let brand = "F1nder";
+    let left = format!("  {}   [ ] switch tab", hint);
+    let pad = (area.width as usize)
+        .saturating_sub(left.chars().count() + brand.chars().count() + 2);
+    let line = Line::from(vec![
+        Span::styled(left, Style::default().fg(C_DIM)),
+        Span::raw(" ".repeat(pad)),
+        Span::styled(
+            brand,
+            Style::default().fg(C_GUIDE).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+    ]);
+    frame.render_widget(Paragraph::new(line), area);
 }
 
 /// A single visible line of the Browse tree, after expand/collapse is applied.
@@ -1200,6 +1245,7 @@ fn render_browse_filter(frame: &mut Frame, area: Rect, app: &App) {
     let block = Block::default()
         .title_top(title)
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(if app.browse_nav { C_ACCENT } else { C_BORDER }));
 
     let line = if app.browse_query.is_empty() {
@@ -1246,20 +1292,23 @@ fn render_folder_view(frame: &mut Frame, area: Rect, app: &mut App) {
             let indent = "  ".repeat(r.depth);
             if r.is_folder {
                 let marker = if r.expanded { "▾" } else { "▸" };
+                let folder = if r.expanded { IC_FOLDER_OPEN } else { IC_FOLDER };
                 ListItem::new(Line::from(vec![
                     Span::raw(indent),
+                    Span::styled(format!("{} ", marker), Style::default().fg(C_GUIDE)),
+                    Span::styled(format!("{} ", folder), Style::default().fg(C_ACCENT)),
                     Span::styled(
-                        format!("{} {}", marker, r.text),
+                        r.text.clone(),
                         Style::default()
                             .fg(C_FG_BRIGHT)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(format!("  ({})", r.count), Style::default().fg(C_DIM)),
+                    Span::styled(format!("  {}", r.count), Style::default().fg(C_DIM)),
                 ]))
             } else {
                 ListItem::new(Line::from(vec![
                     Span::raw(indent),
-                    Span::styled("  ", Style::default().fg(C_DIM)),
+                    Span::styled(format!("  {} ", IC_CMD), Style::default().fg(C_DIM)),
                     Span::styled(r.text.clone(), Style::default().fg(C_TITLE)),
                 ]))
             }
@@ -1268,7 +1317,12 @@ fn render_folder_view(frame: &mut Frame, area: Rect, app: &mut App) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title_bottom(format!(" BROWSE  {} entries ", app.entries.len()))
+        .border_type(BorderType::Rounded)
+        .padding(Padding::horizontal(1))
+        .title_bottom(Line::from(vec![Span::styled(
+            format!(" {} entries ", app.entries.len()),
+            Style::default().fg(C_DIM),
+        )]))
         .border_style(Style::default().fg(C_BORDER));
 
     let list = List::new(items).block(block).highlight_style(
@@ -1291,7 +1345,9 @@ fn render_folder_view(frame: &mut Frame, area: Rect, app: &mut App) {
 fn render_browse_detail(frame: &mut Frame, area: Rect, entry: Option<&Entry>) {
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(C_BORDER))
+        .padding(Padding::horizontal(1))
         .title(" COMMAND ")
         .title_alignment(Alignment::Center);
 
@@ -1341,7 +1397,7 @@ fn render_browse_detail(frame: &mut Frame, area: Rect, entry: Option<&Entry>) {
 // from JSONs/methodology.md. Mirrors the Browse-tree machinery.
 // ---------------------------------------------------------------------------
 
-const C_CHECK: Color = Color::Rgb(99, 211, 138);
+const C_CHECK: Color = Color::Rgb(112, 222, 152);
 
 /// A flattened row of the detail checklist tree for the selected attack card.
 struct MethodRow {
@@ -1639,7 +1695,7 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
 }
 
 fn method_row_item<'a>(r: &'a MethodRow, inner_width: u16) -> ListItem<'a> {
-    let guide_style = Style::default().fg(C_DIM);
+    let guide_style = Style::default().fg(C_GUIDE);
 
     // Tree connector prefix. Depth 0 (card roots) draw no guides.
     let mut gpre = String::new();
@@ -1682,11 +1738,11 @@ fn method_row_item<'a>(r: &'a MethodRow, inner_width: u16) -> ListItem<'a> {
             MethodKind::Check => {
                 let (m, ts) = if r.checked {
                     (
-                        "☑ ".to_string(),
+                        format!("{} ", IC_CHECK_ON),
                         Style::default().fg(C_DIM).add_modifier(Modifier::CROSSED_OUT),
                     )
                 } else {
-                    ("☐ ".to_string(), Style::default().fg(C_FG_BRIGHT))
+                    (format!("{} ", IC_CHECK_OFF), Style::default().fg(C_FG_BRIGHT))
                 };
                 let ms = Style::default().fg(if r.checked { C_CHECK } else { C_DIM });
                 // Parent items show a rollup of their leaf checks.
@@ -1779,6 +1835,7 @@ fn render_method_bar(frame: &mut Frame, area: Rect, app: &App) {
     let block = Block::default()
         .title_top(Line::from(title))
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(if app.method_jump_active || app.method_pending_reset {
             C_ACCENT
         } else {
@@ -1860,6 +1917,7 @@ fn render_jump_palette(frame: &mut Frame, area: Rect, app: &App) {
     let cands = jump_filtered(app);
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(C_ACCENT))
         .title(" JUMP ")
         .title_alignment(Alignment::Center);
@@ -1875,9 +1933,13 @@ fn render_jump_palette(frame: &mut Frame, area: Rect, app: &App) {
     let items: Vec<ListItem> = cands
         .iter()
         .map(|t| {
-            let icon = if t.key.is_some() { "  " } else { "▤ " };
+            let (icon, istyle) = if t.key.is_some() {
+                (format!("  {} ", IC_ITEM), Style::default().fg(C_DIM))
+            } else {
+                (format!("{} ", IC_SECTION), Style::default().fg(C_ACCENT))
+            };
             ListItem::new(Line::from(vec![
-                Span::styled(icon, Style::default().fg(C_DIM)),
+                Span::styled(icon, istyle),
                 Span::styled(t.label.clone(), Style::default().fg(C_FG_BRIGHT)),
             ]))
         })
@@ -1914,6 +1976,7 @@ fn render_method_view(frame: &mut Frame, area: Rect, app: &mut App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(C_BORDER)),
         );
         frame.render_widget(p, vparts[2]);
@@ -1982,6 +2045,7 @@ fn render_method_view(frame: &mut Frame, area: Rect, app: &mut App) {
         .collect();
     let cblock = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(if cards_focused { C_ACCENT } else { C_BORDER }))
         .title(" ATTACKS ")
         .title_alignment(Alignment::Center);
@@ -2016,6 +2080,7 @@ fn render_method_view(frame: &mut Frame, area: Rect, app: &mut App) {
     let tree_focused = app.method_focus;
     let tblock = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(if tree_focused { C_ACCENT } else { C_BORDER }))
         .title(format!(
             " {} ",
@@ -2729,23 +2794,28 @@ fn edit_method_section(app: &mut App, terminal: &mut DefaultTerminal, add: bool)
 }
 
 fn render_top_tabs(frame: &mut Frame, area: Rect, app: &App) {
-    let tabs = Tabs::new(vec!["Search", "Browse", "Methodology"])
-        .select(app.top_tab)
-        .style(Style::default().fg(C_DIM))
-        .highlight_style(
-            Style::default()
-                .fg(C_ACCENT)
-                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-        )
-        .divider(" ")
-        .padding("  ", "  ");
+    let tabs = Tabs::new(vec![
+        format!("{}  Search", IC_SEARCH),
+        format!("{}  Browse", IC_BROWSE),
+        format!("{}  Methodology", IC_METHOD),
+    ])
+    .select(app.top_tab)
+    .style(Style::default().fg(C_DIM))
+    .highlight_style(
+        Style::default()
+            .bg(C_ACCENT)
+            .fg(C_ACCENT_BG)
+            .add_modifier(Modifier::BOLD),
+    )
+    .divider(Span::styled("·", Style::default().fg(C_GUIDE)))
+    .padding("  ", "  ");
 
     frame.render_widget(tabs, area);
 }
 
 fn render_search_input(frame: &mut Frame, area: Rect, app: &App) {
     let mut mode_spans = vec![
-        Span::raw(" "),
+        Span::styled(format!(" {} ", IC_SEARCH), Style::default().fg(C_ACCENT)),
         Span::styled(
             format!(" {} ", app.mode.to_string()),
             Style::default()
@@ -2781,6 +2851,7 @@ fn render_search_input(frame: &mut Frame, area: Rect, app: &App) {
     let mut block = Block::default()
         .title_top(mode_title)
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(if app.search_nav { C_ACCENT } else { C_BORDER }));
 
     if app.is_chain_edit_mode {
@@ -2788,7 +2859,10 @@ fn render_search_input(frame: &mut Frame, area: Rect, app: &App) {
     }
 
     let line = if app.query.is_empty() {
-        Line::from(vec![Span::raw("  ")])
+        Line::from(vec![Span::styled(
+            "  search commands…",
+            Style::default().fg(C_DIM),
+        )])
     } else {
         Line::from(vec![
             Span::raw("  "),
@@ -3006,10 +3080,16 @@ fn search(app: &mut App, reset_selection: bool) {
 fn render_results(frame: &mut Frame, area: Rect, app: &mut App) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .title_bottom(format!(" RESULTS  {} entries ", app.entries.len()))
+        .border_type(BorderType::Rounded)
+        .padding(Padding::horizontal(1))
+        .title_bottom(Line::from(vec![Span::styled(
+            format!(" {} results ", app.results.len()),
+            Style::default().fg(C_DIM),
+        )]))
         .border_style(Style::default().fg(C_BORDER));
 
-    let inner_width = area.width.saturating_sub(2) as usize;
+    // Inner width = area minus the two border columns and the 1-col padding each side.
+    let inner_width = area.width.saturating_sub(4) as usize;
     let cmd_width = inner_width.saturating_sub(4);
 
     let items: Vec<ListItem> = app
@@ -3030,7 +3110,7 @@ fn render_results(frame: &mut Frame, area: Rect, app: &mut App) {
             if e.favorite && tchunks.is_empty() {
                 lines.push(Line::from(vec![
                     Span::raw(" ".repeat(inner_width.saturating_sub(1))),
-                    Span::styled("✦", Style::default().fg(C_ACCENT)),
+                    Span::styled(IC_STAR, Style::default().fg(C_STAR)),
                 ]));
             }
             for (idx, chunk) in tchunks.iter().enumerate() {
@@ -3039,7 +3119,7 @@ fn render_results(frame: &mut Frame, area: Rect, app: &mut App) {
                     lines.push(Line::from(vec![
                         Span::styled(chunk.to_string(), title_style),
                         Span::raw(" ".repeat(pad)),
-                        Span::styled("✦", Style::default().fg(C_ACCENT)),
+                        Span::styled(IC_STAR, Style::default().fg(C_STAR)),
                     ]));
                 } else {
                     lines.push(Line::from(Span::styled(chunk.to_string(), title_style)));
@@ -3060,7 +3140,7 @@ fn render_results(frame: &mut Frame, area: Rect, app: &mut App) {
             for (idx, chunk) in wrapped.iter().enumerate() {
                 let prefix = if idx == 0 { "  $ " } else { "    " };
                 lines.push(Line::from(vec![
-                    Span::styled(prefix, Style::default().fg(C_DIM)),
+                    Span::styled(prefix, Style::default().fg(C_ACCENT)),
                     Span::styled(chunk.to_string(), Style::default().fg(C_FG_BRIGHT)),
                 ]));
             }
@@ -3086,6 +3166,7 @@ fn render_chain(frame: &mut Frame, area: Rect, chain_entries: &[&Entry], selecte
             .block(
                 Block::default()
                     .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
                     .border_style(Style::default().fg(C_BORDER))
                     .title(" ATTACK CHAIN ")
                     .title_alignment(Alignment::Center),
@@ -3116,6 +3197,8 @@ fn render_chain(frame: &mut Frame, area: Rect, chain_entries: &[&Entry], selecte
     let chain_widget: Paragraph<'_> = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
         Block::default()
             .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .padding(Padding::horizontal(1))
             .title_top(" ATTACK CHAIN ")
             .title_alignment(Alignment::Center)
             .border_style(Style::default().fg(C_BORDER)),
@@ -3134,6 +3217,7 @@ fn render_detail(frame: &mut Frame, area: Rect, app: &App) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
                     .border_style(Style::default().fg(C_BORDER))
                     .title(" DESCRIPTION ")
                     .title_alignment(Alignment::Center),
@@ -3161,7 +3245,9 @@ fn render_detail(frame: &mut Frame, area: Rect, app: &App) {
     let top = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
         Block::default()
             .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(C_BORDER))
+            .padding(Padding::horizontal(1))
             .title(" DESCRIPTION ")
             .title_alignment(Alignment::Center),
     );
