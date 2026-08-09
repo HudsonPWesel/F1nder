@@ -11,14 +11,10 @@ use crate::{App, Chain, Entry, MethodPos, SearchMode, TreeNode};
 use color_eyre::Result;
 use color_eyre::eyre::eyre;
 use crossterm::cursor::{Hide, Show};
-use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
-};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-    supports_keyboard_enhancement,
 };
 use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -80,45 +76,14 @@ enum Section {
     SourceFile,
 }
 
-/// Whether the terminal speaks the kitty keyboard protocol. Queried once and
-/// cached — the query round-trips an escape sequence, so we don't repeat it.
-fn kbd_enhancement_supported() -> bool {
-    static SUPPORTED: OnceLock<bool> = OnceLock::new();
-    *SUPPORTED.get_or_init(|| supports_keyboard_enhancement().unwrap_or(false))
-}
-
-/// Push the "disambiguate escape codes" flag so Ctrl+J arrives as a distinct
-/// key instead of collapsing onto Enter (both are raw byte LF in legacy mode).
-/// No-op where the protocol is unsupported. The flag stack is per-screen, so
-/// this must be re-pushed after every alternate-screen re-entry ($EDITOR).
-pub fn push_kbd_enhancement() {
-    if kbd_enhancement_supported() {
-        let _ = execute!(
-            stdout(),
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-        );
-    }
-}
-
-fn pop_kbd_enhancement() {
-    if kbd_enhancement_supported() {
-        let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
-    }
-}
-
 pub fn run_event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
-    push_kbd_enhancement();
     search(app, false);
-    let result = loop {
+    loop {
         terminal.draw(|frame| render(frame, app))?;
-        match handle_key_event(app, terminal) {
-            Ok(true) => break Ok(()),
-            Ok(false) => {}
-            Err(e) => break Err(e),
+        if handle_key_event(app, terminal)? {
+            break Ok(());
         }
-    };
-    pop_kbd_enhancement();
-    result
+    }
 }
 
 fn copy_to_clipboard(text: &str) -> bool {
@@ -496,7 +461,6 @@ fn handle_key_event(app: &mut App, terminal: &mut DefaultTerminal) -> Result<boo
                 // Re-enable raw mode and re-enter alternate screen
                 enable_raw_mode()?;
                 execute!(stdout(), EnterAlternateScreen, Hide)?;
-                push_kbd_enhancement();
                 terminal.clear()?;
             }
             // Chain-edit toggle: Super+C (or Ctrl+C) — moved off 'n' so Super+N is
@@ -551,7 +515,6 @@ fn handle_key_event(app: &mut App, terminal: &mut DefaultTerminal) -> Result<boo
                     // Re-enable raw mode and re-enter alternate screen
                     enable_raw_mode()?;
                     execute!(stdout(), EnterAlternateScreen, Hide)?;
-                    push_kbd_enhancement();
                     terminal.clear()?;
                 }
             }
@@ -601,13 +564,23 @@ fn handle_key_event(app: &mut App, terminal: &mut DefaultTerminal) -> Result<boo
                 search(app, true);
             }
             KeyCode::Tab => {
-                app.mode = match app.mode {
-                    SearchMode::CMD => SearchMode::HEADING,
-                    SearchMode::HEADING => SearchMode::TITLE,
-                    SearchMode::TITLE => SearchMode::ALL,
-                    SearchMode::ALL => SearchMode::CMD,
-                };
-                search(app, true);
+                // While typing, Tab accepts a pending ghost-text completion;
+                // otherwise it cycles the search mode.
+                if !app.search_nav
+                    && let Some(sfx) = complete_suffix(&app.vocab, last_token(&app.query))
+                {
+                    app.query.push_str(&sfx);
+                    app.cursor_index = app.query.len();
+                    search(app, true);
+                } else {
+                    app.mode = match app.mode {
+                        SearchMode::CMD => SearchMode::HEADING,
+                        SearchMode::HEADING => SearchMode::TITLE,
+                        SearchMode::TITLE => SearchMode::ALL,
+                        SearchMode::ALL => SearchMode::CMD,
+                    };
+                    search(app, true);
+                }
             }
             // File filter: Ctrl+F or Super+F cycles forward; add Shift (or an
             // uppercase 'F') to cycle in reverse.
@@ -681,16 +654,6 @@ fn handle_key_event(app: &mut App, terminal: &mut DefaultTerminal) -> Result<boo
                     app.cursor_index += 1;
                 }
             }
-            // Ctrl+J accepts the inline ghost-text completion.
-            KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if !app.search_nav {
-                    if let Some(sfx) = complete_suffix(&app.vocab, last_token(&app.query)) {
-                        app.query.push_str(&sfx);
-                        app.cursor_index = app.query.len();
-                        search(app, true);
-                    }
-                }
-            }
             KeyCode::Backspace => {
                 if app.cursor_index > 0 {
                     app.cursor_index -= 1;
@@ -751,8 +714,8 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 /// A dim key-hint strip in the reserved bottom row, with the app name pinned right.
 fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     let hint = match app.top_tab {
-        0 => "↑↓ move · ^J complete · Enter copy · Tab mode · ⌘F file · ⌘S favorite · ⌘N nav",
-        1 => "↑↓ move · ^J complete · h/l fold · Enter copy · ⌘F file · ⌘N nav",
+        0 => "↑↓ move · ⇥ complete/mode · Enter copy · ⌘F file · ⌘S favorite · ⌘N nav",
+        1 => "↑↓ move · ⇥ complete · h/l fold · Enter copy · ⌘F file · ⌘N nav",
         _ => "Tab section · ⌘F doc · hjkl move · Space check · / jump",
     };
     let brand = "F1nder";
@@ -1160,10 +1123,10 @@ fn handle_browse_key(app: &mut App, terminal: &mut DefaultTerminal, key: KeyEven
         // h/l fold and unfold folders in nav mode (mirror Left/Right).
         KeyCode::Char('l') if app.browse_nav && plain => browse_toggle_folder(app),
         KeyCode::Char('h') if app.browse_nav && plain => browse_collapse_or_parent(app),
-        // Ctrl+J accepts the inline ghost-text completion while typing.
-        KeyCode::Char('j')
-            if ctrl
-                && !app.browse_nav
+        // Tab accepts a pending ghost-text completion while typing; with no
+        // completion pending it falls through to the mode-cycle Tab arm below.
+        KeyCode::Tab
+            if !app.browse_nav
                 && complete_suffix(&app.vocab, last_token(&app.browse_query)).is_some() =>
         {
             if let Some(sfx) = complete_suffix(&app.vocab, last_token(&app.browse_query)) {
@@ -1220,7 +1183,6 @@ fn handle_browse_key(app: &mut App, terminal: &mut DefaultTerminal, key: KeyEven
 
                         enable_raw_mode()?;
                         execute!(stdout(), EnterAlternateScreen, Hide)?;
-                        push_kbd_enhancement();
                         terminal.clear()?;
 
                         if !new_name.is_empty() && new_name != text {
@@ -1243,7 +1205,6 @@ fn handle_browse_key(app: &mut App, terminal: &mut DefaultTerminal, key: KeyEven
 
                     enable_raw_mode()?;
                     execute!(stdout(), EnterAlternateScreen, Hide)?;
-                    push_kbd_enhancement();
                     terminal.clear()?;
                 }
             }
@@ -1288,7 +1249,6 @@ fn handle_browse_key(app: &mut App, terminal: &mut DefaultTerminal, key: KeyEven
 
             enable_raw_mode()?;
             execute!(stdout(), EnterAlternateScreen, Hide)?;
-            push_kbd_enhancement();
             terminal.clear()?;
         }
         // File filter: Ctrl+F or Super+F forward; add Shift (or 'F') for reverse.
@@ -2666,8 +2626,8 @@ fn handle_method_key(app: &mut App, terminal: &mut DefaultTerminal, key: KeyEven
                 app.method_query.pop();
                 app.method_jump_sel = 0;
             }
-            // Ctrl+J accepts the inline ghost-text completion.
-            KeyCode::Char('j') if ctrl && !app.method_jump_nav => {
+            // Tab accepts the inline ghost-text completion.
+            KeyCode::Tab if !app.method_jump_nav => {
                 if let Some(sfx) = complete_suffix(&jump_vocab(app), last_token(&app.method_query)) {
                     app.method_query.push_str(&sfx);
                     app.method_jump_sel = 0;
@@ -3287,7 +3247,6 @@ fn edit_method_section(app: &mut App, terminal: &mut DefaultTerminal, add: bool)
     fs::remove_file(get_editor_temp_path())?;
     enable_raw_mode()?;
     execute!(stdout(), EnterAlternateScreen, Hide)?;
-    push_kbd_enhancement();
     terminal.clear()?;
 
     let mut new_lines: Vec<String> = Vec::with_capacity(all.len());
