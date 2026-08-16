@@ -7,7 +7,7 @@ use std::io::stdout;
 use std::path::{Path, PathBuf};
 
 use crate::methodology::{MethodKind, MethodNode};
-use crate::{App, Chain, Entry, MethodPos, SearchMode, TreeNode};
+use crate::{App, Chain, Entry, MethodPos, SearchMode, SearchPane, TreeNode};
 use color_eyre::Result;
 use color_eyre::eyre::eyre;
 use crossterm::cursor::{Hide, Show};
@@ -20,7 +20,7 @@ use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, BorderType, Borders, List, ListItem, ListState, Padding, Paragraph,
+    Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph,
 };
 use ratatui::{DefaultTerminal, Frame};
 use std::process::Command;
@@ -168,8 +168,15 @@ fn entry_to_template(entry: &Entry) -> String {
     out
 }
 
-fn parse_template(entry_id: &str, app: &App) -> Result<Entry> {
-    let contents = fs::read_to_string(get_editor_temp_path())?;
+// Pure template parser: no temp file, no App. Parses one cmd-maker block
+// (`--- TITLE ---` … `--- COMMANDS ---`), anchoring SOURCE-FILE under `cmds_dir`.
+// Reused by the interactive $EDITOR flow and by the CLI bulk-import path.
+pub fn parse_template_str(
+    entry_id: &str,
+    contents: &str,
+    cmds_dir: &Path,
+    favorite: bool,
+) -> Result<Entry> {
     let mut section = Section::None;
 
     let mut title = String::new();
@@ -251,7 +258,7 @@ fn parse_template(entry_id: &str, app: &App) -> Result<Entry> {
                 filename = format!("{}-CMDs.json", filename);
 
                 // Always anchor under JSONs/cmds/
-                let full_path = app.cmds_dir.join(filename);
+                let full_path = cmds_dir.join(filename);
 
                 source_file.push_str(full_path.to_string_lossy().as_ref());
                 source_file.push('\n');
@@ -284,15 +291,21 @@ fn parse_template(entry_id: &str, app: &App) -> Result<Entry> {
             .map(|s| s.trim().to_string())
             .collect(),
         source_file: PathBuf::from(source_file.trim()),
-        // Preserve the star across an in-place edit (new entries default false).
-        favorite: app
-            .entry_index
-            .get(entry_id)
-            .and_then(|&i| app.entries.get(i))
-            .map(|e| e.favorite)
-            .unwrap_or(false),
+        favorite,
     };
     Ok(new_entry)
+}
+
+fn parse_template(entry_id: &str, app: &App) -> Result<Entry> {
+    let contents = fs::read_to_string(get_editor_temp_path())?;
+    // Preserve the star across an in-place edit (new entries default false).
+    let favorite = app
+        .entry_index
+        .get(entry_id)
+        .and_then(|&i| app.entries.get(i))
+        .map(|e| e.favorite)
+        .unwrap_or(false);
+    parse_template_str(entry_id, &contents, &app.cmds_dir, favorite)
 }
 
 fn open_editor(path: &str) -> std::io::Result<std::process::ExitStatus> {
@@ -346,6 +359,8 @@ fn search_sel_down(app: &mut App) {
         .unwrap_or(0);
     app.list_state.select(Some(i));
     app.current_chain_index = 0;
+    app.desc_scroll = 0;
+    app.chain_sel = 0;
 }
 
 /// Move the Search results selection up (clamped to the first row).
@@ -356,12 +371,218 @@ fn search_sel_up(app: &mut App) {
         app.list_state.select(Some(0));
     }
     app.current_chain_index = 0;
+    app.desc_scroll = 0;
+    app.chain_sel = 0;
+}
+
+/// The resolvable step ids of the attack chain currently shown for the selection.
+fn displayed_chain_steps(app: &App) -> Vec<String> {
+    let Some(entry) = app.selected_entry() else {
+        return Vec::new();
+    };
+    let chains = app.find_chains_for_entry(&entry.id);
+    let Some(chain) = chains.get(app.current_chain_index) else {
+        return Vec::new();
+    };
+    chain
+        .steps
+        .iter()
+        .filter(|id| app.entry_index.contains_key(*id))
+        .cloned()
+        .collect()
+}
+
+/// Id of the chain currently displayed for the selection (for keeping the same
+/// chain highlighted after the selection jumps to one of its steps).
+fn current_displayed_chain_id(app: &App) -> Option<String> {
+    let entry = app.selected_entry()?;
+    let chains = app.find_chains_for_entry(&entry.id);
+    chains.get(app.current_chain_index).map(|c| c.id.clone())
+}
+
+/// Focus the results/search pane.
+fn focus_search_pane(app: &mut App) {
+    app.search_focus = SearchPane::Results;
+}
+
+/// Focus the last-used right pane (Description or Chain).
+fn focus_right_pane(app: &mut App) {
+    app.search_focus = app.last_right_pane;
+    if app.search_focus == SearchPane::Chain {
+        init_chain_sel(app);
+    }
+}
+
+/// Start the chain cursor on the current command within the chain (else the top).
+fn init_chain_sel(app: &mut App) {
+    let steps = displayed_chain_steps(app);
+    let cur = app.selected_entry().map(|e| e.id.clone());
+    app.chain_sel = cur
+        .and_then(|id| steps.iter().position(|s| *s == id))
+        .unwrap_or(0);
+}
+
+/// j / ↓ in nav mode — move *between panels* only (never scroll/step content):
+/// results selection, or Description → Chain.
+fn search_nav_down(app: &mut App) {
+    match app.search_focus {
+        SearchPane::Results => search_sel_down(app),
+        SearchPane::Description => {
+            app.search_focus = SearchPane::Chain;
+            app.last_right_pane = SearchPane::Chain;
+            init_chain_sel(app);
+        }
+        SearchPane::Chain => {}
+    }
+}
+
+/// k / ↑ in nav mode — move *between panels* only: results selection, or
+/// Chain → Description.
+fn search_nav_up(app: &mut App) {
+    match app.search_focus {
+        SearchPane::Results => search_sel_up(app),
+        SearchPane::Chain => {
+            app.search_focus = SearchPane::Description;
+            app.last_right_pane = SearchPane::Description;
+        }
+        SearchPane::Description => {}
+    }
+}
+
+/// j / ↓ with nav OFF: scroll the focused pane (or move the results selection).
+fn search_scroll_down(app: &mut App) {
+    match app.search_focus {
+        SearchPane::Results => search_sel_down(app),
+        SearchPane::Description => app.desc_scroll = app.desc_scroll.saturating_add(1),
+        SearchPane::Chain => chain_sel_move(app, 1),
+    }
+}
+
+/// k / ↑ with nav OFF: scroll the focused pane (or move the results selection).
+fn search_scroll_up(app: &mut App) {
+    match app.search_focus {
+        SearchPane::Results => search_sel_up(app),
+        SearchPane::Description => app.desc_scroll = app.desc_scroll.saturating_sub(1),
+        SearchPane::Chain => chain_sel_move(app, -1),
+    }
+}
+
+/// Move the highlighted chain step, clamped to the chain's resolvable length.
+fn chain_sel_move(app: &mut App, delta: i32) {
+    let len = displayed_chain_steps(app).len();
+    if len == 0 {
+        return;
+    }
+    app.chain_sel = (app.chain_sel as i32 + delta).clamp(0, len as i32 - 1) as usize;
+}
+
+/// Present the highlighted chain step as the main selection ("present in search").
+fn chain_present(app: &mut App) {
+    let steps = displayed_chain_steps(app);
+    let Some(target_id) = steps.get(app.chain_sel).cloned() else {
+        return;
+    };
+    let Some(&idx) = app.entry_index.get(&target_id) else {
+        return;
+    };
+    let Some(p) = app.results.iter().position(|&i| i == idx) else {
+        return;
+    };
+    // Keep the same chain highlighted after the selection jumps to this step.
+    let chain_id = current_displayed_chain_id(app);
+    let new_ci = chain_id.and_then(|cid| {
+        app.find_chains_for_entry(&target_id)
+            .iter()
+            .position(|c| c.id == cid)
+    });
+    app.list_state.select(Some(p));
+    app.desc_scroll = 0;
+    if let Some(ci) = new_ci {
+        app.current_chain_index = ci;
+    }
+    app.search_focus = SearchPane::Results;
+}
+
+/// Open the given entry in `$EDITOR` via the cmd-maker template and save changes.
+fn edit_command(app: &mut App, terminal: &mut DefaultTerminal, entry_index: usize) -> Result<()> {
+    let Some(entry) = app.entries.get(entry_index).cloned() else {
+        return Ok(());
+    };
+    disable_raw_mode()?;
+    execute!(stdout(), LeaveAlternateScreen, Show)?;
+    let out = entry_to_template(&entry);
+    fs::write(get_editor_temp_path(), out)?;
+    let _ = open_editor(get_editor_temp_path());
+    let updated = parse_template(&entry.id, app)?;
+    app.entries[entry_index] = updated;
+    app.dirty = true;
+    let _ = fs::remove_file(get_editor_temp_path());
+    enable_raw_mode()?;
+    execute!(stdout(), EnterAlternateScreen, Hide)?;
+    terminal.clear()?;
+    Ok(())
+}
+
+/// Reset the Search-tab layout and view to defaults: pane sizes, focus, and
+/// scroll positions. Stays in nav mode and leaves the query and file filter alone.
+fn reset_search_view(app: &mut App) {
+    app.main_split_pct = 60;
+    app.right_split_pct = 60;
+    app.search_focus = SearchPane::Results;
+    app.last_right_pane = SearchPane::Description;
+    app.desc_scroll = 0;
+    app.chain_sel = 0;
+}
+
+/// Toggle the file-filter selection for the stem at `app.file_filters[idx]`
+/// (idx >= 1; idx 0 = "All" clears the selection).
+fn file_filter_toggle(app: &mut App, idx: usize) {
+    if idx == 0 {
+        app.file_selected.clear();
+        return;
+    }
+    if let Some(name) = app.file_filters.get(idx).cloned() {
+        if !app.file_selected.remove(&name) {
+            app.file_selected.insert(name);
+        }
+    }
+}
+
+/// Modal key handling for the number-based file-filter popup (⌘F). Number keys
+/// toggle files (0 = All / clear), Enter/Esc close.
+fn handle_file_filter_key(app: &mut App, key: KeyEvent) -> Result<bool> {
+    match key.code {
+        KeyCode::Esc | KeyCode::Enter => {
+            app.file_filter_active = false;
+            search(app, true);
+        }
+        // Also allow ⌘F to close the popup it opened.
+        KeyCode::Char('f' | 'F')
+            if key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
+        {
+            app.file_filter_active = false;
+            search(app, true);
+        }
+        KeyCode::Char(c) if c.is_ascii_digit() => {
+            let idx = c.to_digit(10).unwrap() as usize;
+            file_filter_toggle(app, idx);
+            search(app, true);
+        }
+        _ => {}
+    }
+    Ok(false)
 }
 
 fn handle_key_event(app: &mut App, terminal: &mut DefaultTerminal) -> Result<bool> {
     if let Event::Key(key) = event::read()? {
         if key.kind != KeyEventKind::Press {
             return Ok(false);
+        }
+        // The file-filter popup is modal on any tab (it is shared).
+        if app.file_filter_active {
+            return handle_file_filter_key(app, key);
         }
         // The Browse and Methodology tabs have their own key handling. Esc (quit)
         // and `[`/`]` (tab switching) still fall through to the shared match below.
@@ -378,8 +599,15 @@ fn handle_key_event(app: &mut App, terminal: &mut DefaultTerminal) -> Result<boo
             // Esc first backs out of any list-nav focus; otherwise it cancels the
             // jump palette, or quits.
             KeyCode::Esc => {
+                // Esc backs out one step at a time: nav mode → keep the focused
+                // pane; then focus → back to the results pane; only then quit.
                 if app.top_tab == 0 && app.search_nav {
                     app.search_nav = false;
+                    return Ok(false);
+                }
+                if app.top_tab == 0 && app.search_focus != SearchPane::Results {
+                    app.search_focus = SearchPane::Results;
+                    app.desc_scroll = 0;
                     return Ok(false);
                 }
                 if app.top_tab == 1 && app.browse_nav {
@@ -493,29 +721,32 @@ fn handle_key_event(app: &mut App, terminal: &mut DefaultTerminal) -> Result<boo
                 }
             }
             KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Some(entry) = app.selected_entry() {
-                    let Some(selected_index) = app.selected_entry_index() else {
-                        return Ok(false);
-                    };
-
-                    // Disable raw mode and leave alternate screen
-                    disable_raw_mode()?;
-                    execute!(stdout(), LeaveAlternateScreen, Show)?;
-                    let out = entry_to_template(&entry);
-                    fs::write(get_editor_temp_path(), out)?;
-
-                    let _ = open_editor(get_editor_temp_path());
-
-                    let updated_entry = parse_template(&entry.id, &app)?;
-                    app.entries[selected_index] = updated_entry;
-                    app.dirty = true;
-
-                    fs::remove_file(get_editor_temp_path())?;
-
-                    // Re-enable raw mode and re-enter alternate screen
-                    enable_raw_mode()?;
-                    execute!(stdout(), EnterAlternateScreen, Hide)?;
-                    terminal.clear()?;
+                if let Some(i) = app.selected_entry_index() {
+                    edit_command(app, terminal, i)?;
+                }
+            }
+            // Plain `e` edits when a right pane is focused: the current command
+            // (Description) or the highlighted chain step (Chain).
+            KeyCode::Char('e')
+                if app.search_focus == SearchPane::Description
+                    && !key.modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                    ) =>
+            {
+                if let Some(i) = app.selected_entry_index() {
+                    edit_command(app, terminal, i)?;
+                }
+            }
+            KeyCode::Char('e')
+                if app.search_focus == SearchPane::Chain
+                    && !key.modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                    ) =>
+            {
+                let steps = displayed_chain_steps(app);
+                if let Some(i) = steps.get(app.chain_sel).and_then(|id| app.entry_index.get(id)) {
+                    let i = *i;
+                    edit_command(app, terminal, i)?;
                 }
             }
             KeyCode::Enter if app.is_chain_edit_mode => {
@@ -547,6 +778,10 @@ fn handle_key_event(app: &mut App, terminal: &mut DefaultTerminal) -> Result<boo
                 app.query.clear();
                 app.cursor_index = 0;
                 search(app, true);
+            }
+            // Enter on a chain step presents that command as the main selection.
+            KeyCode::Enter if app.search_focus == SearchPane::Chain => {
+                chain_present(app);
             }
             KeyCode::Enter => {
                 if let Some(entry) = app.selected_entry() {
@@ -582,45 +817,70 @@ fn handle_key_event(app: &mut App, terminal: &mut DefaultTerminal) -> Result<boo
                     search(app, true);
                 }
             }
-            // File filter: Ctrl+F or Super+F cycles forward; add Shift (or an
-            // uppercase 'F') to cycle in reverse.
+            // File filter: Ctrl+F or Super+F opens the numbered file-filter popup.
             KeyCode::Char('f' | 'F')
                 if key
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
             {
-                let reverse = matches!(key.code, KeyCode::Char('F'))
-                    || key.modifiers.contains(KeyModifiers::SHIFT);
-                if reverse {
-                    app.cycle_file_filter_rev();
-                } else {
-                    app.cycle_file_filter();
-                }
-                search(app, true);
+                app.file_filter_active = true;
             }
 
             KeyCode::Char('[') => {
                 app.top_tab = (app.top_tab + 2) % 3;
                 app.search_nav = false;
+                app.search_focus = SearchPane::Results;
                 app.browse_nav = false;
                 app.save_prev_method();
             }
             KeyCode::Char(']') => {
                 app.top_tab = (app.top_tab + 1) % 3;
                 app.search_nav = false;
+                app.search_focus = SearchPane::Results;
                 app.browse_nav = false;
                 app.save_prev_method();
             }
 
-            // Arrows always move the selection (in both typing and nav modes).
-            KeyCode::Down => search_sel_down(app),
-            KeyCode::Up => search_sel_up(app),
-            // Super+N (or Ctrl+N) toggles list-nav (j/k navigate, typing off).
-            // Esc also exits.
+            // Resize the Search panes with Shift + H/J/K/L (any mode): H/L
+            // shrink/grow the results column, J/K grow/shrink the description
+            // height. Search is case-insensitive, so stealing uppercase HJKL from
+            // typing costs nothing, and these are delivered reliably (unlike
+            // Cmd/Option+arrows, which many terminals intercept).
+            KeyCode::Char('H') => {
+                app.main_split_pct = app.main_split_pct.saturating_sub(5).max(20);
+            }
+            KeyCode::Char('L') => {
+                app.main_split_pct = (app.main_split_pct + 5).min(80);
+            }
+            KeyCode::Char('J') => {
+                app.right_split_pct = (app.right_split_pct + 5).min(80);
+            }
+            KeyCode::Char('K') => {
+                app.right_split_pct = app.right_split_pct.saturating_sub(5).max(20);
+            }
+
+            // Arrows: nav mode moves focus/selection; nav off scrolls the focused
+            // pane (or moves the results selection).
+            KeyCode::Down => {
+                if app.search_nav {
+                    search_nav_down(app)
+                } else {
+                    search_scroll_down(app)
+                }
+            }
+            KeyCode::Up => {
+                if app.search_nav {
+                    search_nav_up(app)
+                } else {
+                    search_scroll_up(app)
+                }
+            }
+            // Super+N (or Ctrl+N) toggles nav mode (pane focus + list nav).
             KeyCode::Char('n')
                 if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
             {
                 if app.search_nav {
+                    // Leave nav but keep the focused pane, so you can now scroll it.
                     app.search_nav = false;
                 } else if !app.results.is_empty() {
                     app.search_nav = true;
@@ -629,14 +889,17 @@ fn handle_key_event(app: &mut App, terminal: &mut DefaultTerminal) -> Result<boo
                     }
                 }
             }
-            // j/k navigate the results while in list-nav mode.
+            // Space in nav mode resets the layout/view to defaults.
+            KeyCode::Char(' ') if app.search_nav => reset_search_view(app),
+            // Nav mode: j/k move the selection or switch Description↔Chain; h/l
+            // toggle between the results pane and the last-used right pane.
             KeyCode::Char('j')
                 if app.search_nav
                     && !key.modifiers.intersects(
                         KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
                     ) =>
             {
-                search_sel_down(app);
+                search_nav_down(app);
             }
             KeyCode::Char('k')
                 if app.search_nav
@@ -644,13 +907,56 @@ fn handle_key_event(app: &mut App, terminal: &mut DefaultTerminal) -> Result<boo
                         KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
                     ) =>
             {
-                search_sel_up(app);
+                search_nav_up(app);
             }
+            KeyCode::Char('l')
+                if app.search_nav
+                    && !key.modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                    ) =>
+            {
+                focus_right_pane(app);
+            }
+            KeyCode::Char('h')
+                if app.search_nav
+                    && !key.modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                    ) =>
+            {
+                focus_search_pane(app);
+            }
+            // Nav off with a right pane focused: j/k scroll it. (On the results
+            // pane, j/k fall through to the typing arm below.)
+            KeyCode::Char('j')
+                if !app.search_nav
+                    && app.search_focus != SearchPane::Results
+                    && !key.modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                    ) =>
+            {
+                search_scroll_down(app);
+            }
+            KeyCode::Char('k')
+                if !app.search_nav
+                    && app.search_focus != SearchPane::Results
+                    && !key.modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                    ) =>
+            {
+                search_scroll_up(app);
+            }
+            // ←/→: nav mode toggles panes; while typing they move the query cursor.
             KeyCode::Left => {
-                app.cursor_index = app.cursor_index.saturating_sub(1);
+                if app.search_nav {
+                    focus_search_pane(app);
+                } else {
+                    app.cursor_index = app.cursor_index.saturating_sub(1);
+                }
             }
             KeyCode::Right => {
-                if app.cursor_index < app.query.len() {
+                if app.search_nav {
+                    focus_right_pane(app);
+                } else if app.cursor_index < app.query.len() {
                     app.cursor_index += 1;
                 }
             }
@@ -661,9 +967,11 @@ fn handle_key_event(app: &mut App, terminal: &mut DefaultTerminal) -> Result<boo
                     search(app, true);
                 }
             }
-            // Typing filters — but not while list-nav has focus.
+            // Typing filters — only on the results pane (nav off), never while nav
+            // has focus or a right pane is focused.
             KeyCode::Char(c)
                 if !app.search_nav
+                    && app.search_focus == SearchPane::Results
                     && !key.modifiers.intersects(
                         KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
                     ) =>
@@ -708,13 +1016,98 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         _ => render_method_view(frame, combined, app),
     }
 
+    // The shared file-filter popup overlays whichever tab is active.
+    if app.file_filter_active {
+        render_file_filter(frame, chunks[3], app);
+    }
+
     render_footer(frame, chunks[4], app);
+}
+
+/// A centered rectangle of the given size within `area` (clamped to fit).
+fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    }
+}
+
+/// The numbered file-filter popup (⌘F). Each source file has a number; pressing
+/// it toggles that file in the multi-select. "0 All" clears the selection.
+fn render_file_filter(frame: &mut Frame, area: Rect, app: &mut App) {
+    let n = app.file_filters.len();
+    let width = 40u16.min(area.width.saturating_sub(4)).max(24);
+    let height = ((n as u16) + 4).clamp(6, area.height.saturating_sub(2).max(6));
+    let popup = centered_rect(width, height, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(C_ACCENT))
+        .padding(Padding::new(1, 1, 0, 0))
+        .title(" Filter by file ")
+        .title_alignment(Alignment::Center);
+    let inner = block.inner(popup);
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+
+    let rows = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, name) in app.file_filters.iter().enumerate() {
+        let selected = if i == 0 {
+            app.file_selected.is_empty()
+        } else {
+            app.file_selected.contains(name)
+        };
+        // "All" behaves like a radio (on when nothing is selected); the rest are
+        // checkboxes.
+        let mark = if i == 0 {
+            if selected { "◉" } else { "○" }
+        } else if selected {
+            "☑"
+        } else {
+            "☐"
+        };
+        let label = if i == 0 {
+            "All"
+        } else {
+            name.trim_end_matches("-CMDs")
+        };
+        let name_style = if selected {
+            Style::default().fg(C_FG_BRIGHT).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(C_DIM)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {i}  "), Style::default().fg(C_ACCENT).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{mark} "),
+                Style::default().fg(if selected { C_STAR } else { C_DIM }),
+            ),
+            Span::styled(label.to_string(), name_style),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(lines), rows[0]);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "number toggles · Enter/Esc close",
+            Style::default().fg(C_DIM),
+        )))
+        .alignment(Alignment::Center),
+        rows[1],
+    );
 }
 
 /// A dim key-hint strip in the reserved bottom row, with the app name pinned right.
 fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     let hint = match app.top_tab {
-        0 => "↑↓ move · ⇥ complete/mode · Enter copy · ⌘F file · ⌘S favorite · ⌘N nav",
+        0 => "⌘N nav · hjkl panels · ⇧HJKL resize · ⌘F filter · nav+Space reset · e edit",
         1 => "↑↓ move · ⇥ complete · h/l fold · Enter copy · ⌘F file · ⌘N nav",
         _ => "Tab section · ⌘F doc · hjkl move · Space check · / jump",
     };
@@ -766,12 +1159,11 @@ fn count_matches(node: &TreeNode, matches: Option<&HashSet<usize>>) -> usize {
 fn browse_match_set(app: &App) -> HashSet<usize> {
     let ql = app.browse_query.to_lowercase();
     let terms: Vec<&str> = ql.split_whitespace().collect();
-    let file_ref = app.file_filter_name();
     app.entries
         .iter()
         .enumerate()
         .filter_map(|(i, e)| {
-            if !entry_in_file(e, file_ref) {
+            if !app.entry_passes_file(e) {
                 return None;
             }
             // Match against the field(s) selected by the browse filter mode.
@@ -972,7 +1364,7 @@ fn browse_rows(app: &App) -> Vec<BrowseRow> {
     // A text filter auto-expands to reveal matches; a file-only filter just
     // prunes to that file's subtree and stays foldable.
     let has_text = !app.browse_query.trim().is_empty();
-    let has_file = app.file_filter_name().is_some();
+    let has_file = !app.file_selected.is_empty();
     let prune: Option<HashSet<usize>> = if has_text || has_file {
         Some(browse_match_set(app))
     } else {
@@ -1251,21 +1643,13 @@ fn handle_browse_key(app: &mut App, terminal: &mut DefaultTerminal, key: KeyEven
             execute!(stdout(), EnterAlternateScreen, Hide)?;
             terminal.clear()?;
         }
-        // File filter: Ctrl+F or Super+F forward; add Shift (or 'F') for reverse.
+        // File filter: Ctrl+F or Super+F opens the numbered file-filter popup.
         KeyCode::Char('f' | 'F')
             if key
                 .modifiers
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
         {
-            let reverse = matches!(key.code, KeyCode::Char('F'))
-                || key.modifiers.contains(KeyModifiers::SHIFT);
-            if reverse {
-                app.cycle_file_filter_rev();
-            } else {
-                app.cycle_file_filter();
-            }
-            app.browse_collapsed.clear();
-            app.browse_state.select(Some(0));
+            app.file_filter_active = true;
         }
         // Cycle the filter field mode (TITLE / HEADING / CMD / ALL), like the
         // regular search's Tab. Shift+Tab cycles in reverse.
@@ -1691,7 +2075,7 @@ fn render_browse_filter(frame: &mut Frame, area: Rect, app: &App) {
         Span::raw("  "),
         Span::styled(format!(" {} ", IC_FOLDER), Style::default().fg(C_DIM)),
         Span::styled(
-            format!("{} ", app.file_filter_name().unwrap_or("all")),
+            format!("{} ", app.file_filter_label()),
             Style::default().fg(C_TITLE),
         ),
         Span::raw(" "),
@@ -3347,14 +3731,14 @@ fn render_search_input(frame: &mut Frame, area: Rect, app: &App) {
         ),
     ];
 
-    // Show the file filter as a subtle folder chip next to the mode badge (Ctrl+F cycles it).
+    // Show the file filter as a subtle folder chip next to the mode badge (⌘F opens the picker).
     mode_spans.push(Span::raw("  "));
     mode_spans.push(Span::styled(
         format!(" {} ", IC_FOLDER),
         Style::default().fg(C_DIM),
     ));
     mode_spans.push(Span::styled(
-        format!("{} ", app.file_filter_name().unwrap_or("all")),
+        format!("{} ", app.file_filter_label()),
         Style::default().fg(C_TITLE),
     ));
     mode_spans.push(Span::raw(" "));
@@ -3413,13 +3797,19 @@ fn render_search_input(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_main(frame: &mut Frame, area: Rect, app: &mut App) {
-    let cols =
-        Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)]).split(area);
+    let cols = Layout::horizontal([
+        Constraint::Percentage(app.main_split_pct),
+        Constraint::Min(0),
+    ])
+    .split(area);
 
     render_results(frame, cols[0], app);
 
-    let right_rows =
-        Layout::vertical([Constraint::Percentage(60), Constraint::Min(0)]).split(cols[1]);
+    let right_rows = Layout::vertical([
+        Constraint::Percentage(app.right_split_pct),
+        Constraint::Min(0),
+    ])
+    .split(cols[1]);
 
     render_detail(frame, right_rows[0], app);
 
@@ -3441,7 +3831,16 @@ fn render_main(frame: &mut Frame, area: Rect, app: &mut App) {
         .map(|v| v.as_slice())
         .unwrap_or(&[]);
 
-    render_chain(frame, right_rows[1], current_chain, &entry_id);
+    // The chain pane shows its step cursor whenever it holds focus (nav or not).
+    let chain_focused = app.search_focus == SearchPane::Chain;
+    render_chain(
+        frame,
+        right_rows[1],
+        current_chain,
+        &entry_id,
+        chain_focused,
+        app.chain_sel,
+    );
 }
 
 /// The source-file stem of an entry (e.g. `CAPE-CMDs`).
@@ -3451,14 +3850,6 @@ fn entry_stem(entry: &Entry) -> String {
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default()
-}
-
-/// Whether an entry belongs to the active file filter (`None` = all files).
-fn entry_in_file(entry: &Entry, filter: Option<&str>) -> bool {
-    match filter {
-        None => true,
-        Some(name) => entry_stem(entry) == name,
-    }
 }
 
 /// The command's tool binary (lowercased) — the first real token, skipping common
@@ -3512,17 +3903,17 @@ fn token_quality(field: &str, token: &str) -> u32 {
 
 fn search(app: &mut App, reset_selection: bool) {
     app.current_chain_index = 0;
+    app.desc_scroll = 0;
+    app.chain_sel = 0;
     let previous_selection = app.list_state.selected();
 
-    let file_filter = app.file_filter_name().map(|s| s.to_string());
-    let file_ref = file_filter.as_deref();
     let query = app.query.trim();
 
     if query.is_empty() {
         // No fuzzy query: list every entry that passes the file filter, with
         // favorites floated to the top (stable, so file order is otherwise kept).
         let mut results: Vec<usize> = (0..app.entries.len())
-            .filter(|&i| entry_in_file(&app.entries[i], file_ref))
+            .filter(|&i| app.entry_passes_file(&app.entries[i]))
             .collect();
         results.sort_by_key(|&i| !app.entries[i].favorite);
         app.results = results;
@@ -3537,7 +3928,7 @@ fn search(app: &mut App, reset_selection: bool) {
 
         let mut scored: Vec<(usize, i64, bool)> = Vec::new();
         for (i, entry) in app.entries.iter().enumerate() {
-            if !entry_in_file(entry, file_ref) {
+            if !app.entry_passes_file(entry) {
                 continue;
             }
             let title = entry.title.to_lowercase();
@@ -3608,6 +3999,22 @@ fn search(app: &mut App, reset_selection: bool) {
     }
 }
 fn render_results(frame: &mut Frame, area: Rect, app: &mut App) {
+    // A pane-focus situation exists when nav is on, or focus has moved to a right
+    // pane. In that case the focused pane gets the accent border and the results
+    // selection dims when focus is elsewhere; otherwise (plain typing) it's bright.
+    let pane_focus_active = app.search_nav || app.search_focus != SearchPane::Results;
+    let results_focused = app.search_focus == SearchPane::Results;
+    let border = if results_focused && pane_focus_active {
+        C_ACCENT
+    } else {
+        C_BORDER
+    };
+    let hl_bg = if pane_focus_active && !results_focused {
+        C_HIGHLIGHT_DIM
+    } else {
+        C_HIGHLIGHT_BG
+    };
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -3616,7 +4023,7 @@ fn render_results(frame: &mut Frame, area: Rect, app: &mut App) {
             format!(" {} results ", app.results.len()),
             Style::default().fg(C_DIM),
         )]))
-        .border_style(Style::default().fg(C_BORDER));
+        .border_style(Style::default().fg(border));
 
     // Inner width = area minus the two border columns and the 2-col padding each side.
     let inner_width = area.width.saturating_sub(6) as usize;
@@ -3681,14 +4088,20 @@ fn render_results(frame: &mut Frame, area: Rect, app: &mut App) {
         })
         .collect();
 
-    let list = List::new(items).block(block).highlight_style(
-        Style::default()
-            .bg(C_HIGHLIGHT_BG)
-            .add_modifier(Modifier::BOLD),
-    );
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(Style::default().bg(hl_bg).add_modifier(Modifier::BOLD));
     frame.render_stateful_widget(list, area, &mut app.list_state);
 }
-fn render_chain(frame: &mut Frame, area: Rect, chain_entries: &[&Entry], selected_entry_id: &str) {
+fn render_chain(
+    frame: &mut Frame,
+    area: Rect,
+    chain_entries: &[&Entry],
+    selected_entry_id: &str,
+    focused: bool,
+    chain_sel: usize,
+) {
+    let border = if focused { C_ACCENT } else { C_BORDER };
     if chain_entries.is_empty() {
         let p = Paragraph::new("No chain for this command")
             .style(Style::default().fg(C_DIM))
@@ -3696,8 +4109,8 @@ fn render_chain(frame: &mut Frame, area: Rect, chain_entries: &[&Entry], selecte
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(C_BORDER))
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(border))
                     .title(" ATTACK CHAIN ")
                     .title_alignment(Alignment::Center),
             );
@@ -3708,17 +4121,32 @@ fn render_chain(frame: &mut Frame, area: Rect, chain_entries: &[&Entry], selecte
 
     let lines: Vec<Line> = chain_entries
         .iter()
-        .flat_map(|chain_entry| {
-            let style = if selected_entry_id == chain_entry.id {
-                Style::default()
-                    .fg(C_FG_BRIGHT)
-                    .add_modifier(Modifier::BOLD)
+        .enumerate()
+        .flat_map(|(idx, chain_entry)| {
+            let is_cursor = focused && idx == chain_sel;
+            let is_current = selected_entry_id == chain_entry.id;
+            let (marker, marker_style, cmd_style) = if is_cursor {
+                (
+                    "▸ ",
+                    Style::default().fg(C_ACCENT).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(C_FG_BRIGHT)
+                        .bg(C_HIGHLIGHT_BG)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else if is_current {
+                let s = Style::default().fg(C_FG_BRIGHT).add_modifier(Modifier::BOLD);
+                ("• ", s, s)
             } else {
-                Style::default().fg(C_DIM)
+                let s = Style::default().fg(C_DIM);
+                ("  ", s, s)
             };
             vec![
                 Line::from(""),
-                Line::from(Span::styled(chain_entry.cmd.as_str(), style)),
+                Line::from(vec![
+                    Span::styled(marker, marker_style),
+                    Span::styled(chain_entry.cmd.as_str(), cmd_style),
+                ]),
                 Line::from(""),
             ]
         })
@@ -3731,24 +4159,25 @@ fn render_chain(frame: &mut Frame, area: Rect, chain_entries: &[&Entry], selecte
             .padding(Padding::new(2, 2, 1, 0))
             .title_top(" ATTACK CHAIN ")
             .title_alignment(Alignment::Center)
-            .border_style(Style::default().fg(C_BORDER)),
+            .border_style(Style::default().fg(border)),
     );
 
     frame.render_widget(chain_widget, area);
 }
 
-fn render_detail(frame: &mut Frame, area: Rect, app: &App) {
-    let selected = app.selected_entry();
+fn render_detail(frame: &mut Frame, area: Rect, app: &mut App) {
+    let focused = app.search_focus == SearchPane::Description;
+    let border = if focused { C_ACCENT } else { C_BORDER };
 
-    let Some(entry) = selected else {
+    let Some(entry) = app.selected_entry() else {
         let p = Paragraph::new(vec![Line::from(""), Line::from("Select an entry")])
             .style(Style::default().fg(C_DIM))
             .alignment(Alignment::Center)
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(C_BORDER))
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(border))
                     .title(" DESCRIPTION ")
                     .title_alignment(Alignment::Center),
             );
@@ -3760,26 +4189,217 @@ fn render_detail(frame: &mut Frame, area: Rect, app: &App) {
     let lines_iter = entry
         .description
         .lines()
-        .map(|l| Line::from(Span::styled(l, Style::default().fg(C_DESC))));
+        .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(C_DESC))));
 
     let mut lines = vec![
         Line::from(""),
-        Line::from(Span::styled(
-            entry.title.as_str(),
-            Style::default().fg(C_TITLE),
-        )),
+        Line::from(Span::styled(entry.title.clone(), Style::default().fg(C_TITLE))),
     ];
-
     lines.extend(lines_iter);
 
-    let top = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(C_BORDER))
-            .padding(Padding::new(2, 2, 1, 0))
-            .title(" DESCRIPTION ")
-            .title_alignment(Alignment::Center),
-    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border))
+        .padding(Padding::new(2, 2, 1, 0))
+        .title(" DESCRIPTION ")
+        .title_alignment(Alignment::Center);
+
+    // Clamp the scroll offset to the wrapped content height so ↓ can't scroll the
+    // text off into empty space. Inner area = borders (2) + horizontal padding (4)
+    // and top padding (1). ratatui's own line_count is unstable, so approximate
+    // the wrapped height with textwrap: 1 blank + wrapped title + wrapped desc.
+    let inner_w = area.width.saturating_sub(6).max(1) as usize;
+    let inner_h = area.height.saturating_sub(3);
+    let mut total: u16 = 1;
+    total = total.saturating_add(textwrap::wrap(&entry.title, inner_w).len().max(1) as u16);
+    for l in entry.description.lines() {
+        total = total.saturating_add(textwrap::wrap(l, inner_w).len().max(1) as u16);
+    }
+
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+    app.desc_scroll = app.desc_scroll.min(total.saturating_sub(inner_h));
+    let top = para.block(block).scroll((app.desc_scroll, 0));
     frame.render_widget(top, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        chain_present, file_filter_toggle, init_chain_sel, parse_template_str, reset_search_view,
+        search_nav_down, search_scroll_down,
+    };
+    use crate::{App, Chain, Entry, SearchPane};
+    use std::path::{Path, PathBuf};
+
+    fn mk_entry(id: &str) -> Entry {
+        Entry {
+            id: id.to_string(),
+            title: format!("title {id}"),
+            cmd: format!("cmd {id}"),
+            description: "desc".to_string(),
+            source_file: PathBuf::from("/tmp/X-CMDs.json"),
+            heading_path: vec!["H".to_string()],
+            favorite: false,
+        }
+    }
+
+    #[test]
+    fn chain_focus_scroll_and_present() {
+        let entries = vec![mk_entry("a"), mk_entry("b"), mk_entry("c")];
+        let chains = vec![Chain {
+            id: "ch".to_string(),
+            steps: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            name: "n".to_string(),
+            description: "d".to_string(),
+        }];
+        let mut app = App::new(
+            entries,
+            chains,
+            PathBuf::from("/tmp"),
+            PathBuf::from("/tmp"),
+            vec![],
+        );
+        app.results = vec![0, 1, 2];
+        app.list_state.select(Some(0));
+        app.current_chain_index = 0;
+
+        // Focus the chain: the cursor starts on the current command (a → 0).
+        app.search_focus = SearchPane::Chain;
+        init_chain_sel(&mut app);
+        assert_eq!(app.chain_sel, 0);
+
+        // Nav off + focus chain: j steps through the chain, clamped at the end.
+        search_scroll_down(&mut app);
+        assert_eq!(app.chain_sel, 1);
+        search_scroll_down(&mut app);
+        assert_eq!(app.chain_sel, 2);
+        search_scroll_down(&mut app);
+        assert_eq!(app.chain_sel, 2);
+
+        // Enter presents the highlighted step (c) as the main selection.
+        chain_present(&mut app);
+        assert_eq!(app.list_state.selected(), Some(2));
+        assert_eq!(app.search_focus, SearchPane::Results);
+    }
+
+    #[test]
+    fn nav_switches_panels_without_stepping() {
+        use super::search_nav_up;
+        let entries = vec![mk_entry("a"), mk_entry("b"), mk_entry("c")];
+        let chains = vec![Chain {
+            id: "ch".to_string(),
+            steps: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            name: "n".to_string(),
+            description: "d".to_string(),
+        }];
+        let mut app = App::new(
+            entries,
+            chains,
+            PathBuf::from("/tmp"),
+            PathBuf::from("/tmp"),
+            vec![],
+        );
+        app.results = vec![0, 1, 2];
+        app.list_state.select(Some(0));
+
+        // Description → Chain switches the panel, not the chain cursor.
+        app.search_focus = SearchPane::Description;
+        search_nav_down(&mut app);
+        assert_eq!(app.search_focus, SearchPane::Chain);
+        assert_eq!(app.chain_sel, 0);
+
+        // In nav mode, another ↓ on the chain is a no-op (no stepping).
+        search_nav_down(&mut app);
+        assert_eq!(app.chain_sel, 0);
+        assert_eq!(app.search_focus, SearchPane::Chain);
+
+        // ↑ from the chain returns to the description.
+        search_nav_up(&mut app);
+        assert_eq!(app.search_focus, SearchPane::Description);
+    }
+
+    const BLOCK: &str = "--- TITLE ---\n\
+Run Full Tenant Enumeration via AzurEnum\n\
+--- HEADING_PATH ---\n\
+Azure > AD Enumeration > Full Scan > Linux\n\
+--- DESCRIPTION ---\n\
+Runs AzurEnum for a comprehensive Entra ID tenant assessment.\n\
+--- SOURCE-FILE ---\n\
+OAOTC\n\
+--- COMMANDS ---\n\
+pipx install azurenum\n\
+azurenum --interactive\n";
+
+    #[test]
+    fn parses_a_good_block() {
+        let cmds_dir = Path::new("/tmp/JSONs/cmds");
+        let e = parse_template_str("deadbeef", BLOCK, cmds_dir, false).unwrap();
+        assert_eq!(e.id, "deadbeef");
+        assert_eq!(e.title, "Run Full Tenant Enumeration via AzurEnum");
+        assert_eq!(
+            e.heading_path,
+            vec!["Azure", "AD Enumeration", "Full Scan", "Linux"]
+        );
+        assert_eq!(e.cmd, "pipx install azurenum\nazurenum --interactive");
+        assert_eq!(e.source_file, cmds_dir.join("OAOTC-CMDs.json"));
+        assert!(!e.favorite);
+    }
+
+    #[test]
+    fn file_filter_multiselect_and_reset() {
+        let mut entries = vec![mk_entry("a"), mk_entry("b"), mk_entry("c")];
+        entries[0].source_file = PathBuf::from("/x/CAPE-CMDs.json");
+        entries[1].source_file = PathBuf::from("/x/OAOTC-CMDs.json");
+        entries[2].source_file = PathBuf::from("/x/CAPE-CMDs.json");
+        let mut app = App::new(
+            entries,
+            vec![],
+            PathBuf::from("/tmp"),
+            PathBuf::from("/tmp"),
+            vec![],
+        );
+        // file_filters = ["All", "CAPE-CMDs", "OAOTC-CMDs"] (sorted stems).
+        assert_eq!(app.file_filters, vec!["All", "CAPE-CMDs", "OAOTC-CMDs"]);
+
+        // Empty selection = everything passes.
+        assert!(app.entry_passes_file(&app.entries[0]));
+
+        // Toggle CAPE (idx 1) on: only CAPE entries pass; toggling OAOTC adds it.
+        file_filter_toggle(&mut app, 1);
+        assert!(app.entry_passes_file(&app.entries[0])); // CAPE
+        assert!(!app.entry_passes_file(&app.entries[1])); // OAOTC excluded
+        file_filter_toggle(&mut app, 2);
+        assert!(app.entry_passes_file(&app.entries[1])); // now included
+        assert_eq!(app.file_selected.len(), 2);
+
+        // Toggling CAPE again removes it.
+        file_filter_toggle(&mut app, 1);
+        assert!(!app.entry_passes_file(&app.entries[0]));
+
+        // "0" (All) clears the whole selection.
+        file_filter_toggle(&mut app, 0);
+        assert!(app.file_selected.is_empty());
+
+        // Reset restores layout/view, stays in nav, keeps the filter.
+        app.file_selected.insert("CAPE-CMDs".to_string());
+        app.main_split_pct = 30;
+        app.search_focus = SearchPane::Chain;
+        app.search_nav = true;
+        app.desc_scroll = 5;
+        reset_search_view(&mut app);
+        assert_eq!(app.main_split_pct, 60);
+        assert_eq!(app.search_focus, SearchPane::Results);
+        assert!(app.search_nav); // stays in nav
+        assert_eq!(app.desc_scroll, 0);
+        assert!(app.file_selected.contains("CAPE-CMDs")); // filter preserved
+    }
+
+    #[test]
+    fn rejects_block_missing_commands() {
+        let no_cmds = "--- TITLE ---\nX\n--- HEADING_PATH ---\nA > B\n\
+                       --- DESCRIPTION ---\nd\n--- SOURCE-FILE ---\nOAOTC\n--- COMMANDS ---\n";
+        let r = parse_template_str("00000000", no_cmds, Path::new("/tmp"), false);
+        assert!(r.is_err());
+    }
 }

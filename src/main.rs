@@ -8,6 +8,7 @@ use std::{
 use strum::Display;
 
 use color_eyre::{Result, eyre::eyre};
+use rand::RngExt;
 use ratatui::widgets::ListState;
 use serde::{Deserialize, Serialize};
 mod methodology;
@@ -185,6 +186,16 @@ pub struct EntriesFile {
     pub entries: Vec<Entry>,
 }
 
+/// Summary of a bulk import: how many entries were added, how many were skipped
+/// as duplicates, a per-file breakdown of additions, and any per-block parse errors.
+#[derive(Debug, Default)]
+pub struct ImportReport {
+    pub added: usize,
+    pub skipped: usize,
+    pub added_by_file: HashMap<String, usize>,
+    pub errors: Vec<(usize, String)>,
+}
+
 #[derive(Debug, Display)]
 pub enum SearchMode {
     CMD,
@@ -211,6 +222,16 @@ pub struct MethodPos {
     pub focus: bool,
 }
 
+/// The focusable panes on the Search tab. In nav mode, h/l (or ←/→) cycle focus
+/// across them and j/k (or ↑/↓) act on whichever is focused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SearchPane {
+    #[default]
+    Results,
+    Description,
+    Chain,
+}
+
 pub struct App {
     pub top_tab: usize,
     pub entries: Vec<Entry>,
@@ -223,16 +244,33 @@ pub struct App {
     /// text changes). Filtered folders are expanded by default.
     pub browse_collapsed: HashSet<String>,
     /// File-name filter options: `"All"` at index 0, then each source-file stem.
+    /// Used for the ⌘F popup's numbered list.
     pub file_filters: Vec<String>,
-    /// Index into `file_filters` of the active file filter (0 = All). Shared by
-    /// both the Search and Browse tabs, cycled with Ctrl+F.
-    pub file_filter: usize,
+    /// The set of selected source-file stems (multi-select). Empty = show all.
+    /// Shared by the Search and Browse tabs.
+    pub file_selected: HashSet<String>,
     pub query: String,
     pub mode: SearchMode,
     pub list_state: ListState,
     /// Search tab: focus is on the results list (j/k navigate) vs the query
     /// input (typing). Transient UI state, not persisted.
     pub search_nav: bool,
+    /// Search tab (nav mode only): which of the three panes is focused.
+    pub search_focus: SearchPane,
+    /// Vertical scroll offset of the Search description pane. Reset to 0 whenever
+    /// the selected command changes.
+    pub desc_scroll: u16,
+    /// The last right-hand pane (Description or Chain) focus was on, so h/l
+    /// toggles back to it from the results pane.
+    pub last_right_pane: SearchPane,
+    /// Highlighted step index within the currently displayed attack chain.
+    pub chain_sel: usize,
+    /// Search-tab pane split ratios (percent), adjusted with Shift+HJKL:
+    /// `main_split_pct` = results-column width, `right_split_pct` = description height.
+    pub main_split_pct: u16,
+    pub right_split_pct: u16,
+    /// Whether the ⌘F file-filter popup is open.
+    pub file_filter_active: bool,
     /// Browse tab: same nav-vs-input focus for the folder filter.
     pub browse_nav: bool,
     /// Methodology jump palette: nav-vs-input focus while `/` is active.
@@ -404,16 +442,19 @@ impl App {
         let mut file_filters = vec!["All".to_string()];
         file_filters.extend(stems);
 
+        // Restore the selected file stems (persisted as a `+`-joined list on
+        // line 2). Only keep names that still exist as filter options.
         let saved_file = fs::read_to_string(get_prev_search_path())
             .unwrap_or_default()
             .lines()
             .nth(2)
             .unwrap_or("")
             .to_owned();
-        let file_filter = file_filters
-            .iter()
-            .position(|f| f == &saved_file)
-            .unwrap_or(0);
+        let file_selected: HashSet<String> = saved_file
+            .split('+')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty() && s != "All" && file_filters.iter().any(|f| f == s))
+            .collect();
 
         let entry_index = entries
             .iter()
@@ -467,7 +508,7 @@ impl App {
             browse_mode: saved_browse_mode,
             browse_collapsed: HashSet::new(),
             file_filters,
-            file_filter,
+            file_selected,
             results: vec![],
             cursor_index: fs::read_to_string(get_prev_search_path())
                 .unwrap_or(String::new())
@@ -480,6 +521,13 @@ impl App {
             is_chain_edit_mode: false,
             prev_selected_entry_id: String::from(""),
             current_chain_index: 0,
+            search_focus: SearchPane::Results,
+            desc_scroll: 0,
+            last_right_pane: SearchPane::Description,
+            chain_sel: 0,
+            main_split_pct: 60,
+            right_split_pct: 60,
+            file_filter_active: false,
             cmds_dir,
             chains_dir,
             dirty: false,
@@ -549,6 +597,68 @@ impl App {
         }
 
         Ok(())
+    }
+
+    /// Bulk-import cmd-maker template blocks from `path` into `self.entries`.
+    /// Splits the file on `--- TITLE ---` header lines, parses each block with the
+    /// same parser the $EDITOR flow uses, skips any block whose (title, command,
+    /// target file) already exists, and appends the rest with fresh ids. Does not
+    /// touch disk — the caller invokes `write_entries_to_json` afterward.
+    pub fn import_commands_file(&mut self, path: &Path) -> Result<ImportReport> {
+        let text = fs::read_to_string(path)
+            .map_err(|e| eyre!("cannot read import file {}: {e}", path.display()))?;
+
+        // Split into blocks, one per `--- TITLE ---` header. Anything before the
+        // first header is ignored; each block keeps its own header line.
+        let mut blocks: Vec<String> = Vec::new();
+        let mut cur: Option<String> = None;
+        for line in text.lines() {
+            if line.trim() == "--- TITLE ---" {
+                if let Some(b) = cur.take() {
+                    blocks.push(b);
+                }
+                cur = Some(String::new());
+            }
+            if let Some(b) = cur.as_mut() {
+                b.push_str(line);
+                b.push('\n');
+            }
+        }
+        if let Some(b) = cur.take() {
+            blocks.push(b);
+        }
+
+        let mut report = ImportReport::default();
+        let mut rng = rand::rng();
+
+        for (i, block) in blocks.iter().enumerate() {
+            let id = format!("{:08x}", rng.random::<u32>());
+            match ui::parse_template_str(&id, block, &self.cmds_dir, false) {
+                Ok(entry) => {
+                    let target = self.sanitize_source_path(&entry.source_file);
+                    let dup = self.entries.iter().any(|e| {
+                        e.title == entry.title
+                            && e.cmd == entry.cmd
+                            && self.sanitize_source_path(&e.source_file) == target
+                    });
+                    if dup {
+                        report.skipped += 1;
+                    } else {
+                        let fname = target
+                            .file_name()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        *report.added_by_file.entry(fname).or_insert(0) += 1;
+                        self.entries.push(entry);
+                        report.added += 1;
+                    }
+                }
+                Err(e) => report.errors.push((i + 1, e.to_string())),
+            }
+        }
+
+        self.rebuild_entry_index();
+        Ok(report)
     }
 
     pub fn write_chains_to_json(&mut self) -> Result<()> {
@@ -631,36 +741,40 @@ impl App {
             .collect()
     }
 
-    /// The active file-filter name, or `None` when set to "All".
-    pub fn file_filter_name(&self) -> Option<&str> {
-        if self.file_filter == 0 {
-            None
-        } else {
-            self.file_filters.get(self.file_filter).map(|s| s.as_str())
+    /// Whether an entry passes the file filter (no selection = all pass).
+    pub fn entry_passes_file(&self, entry: &Entry) -> bool {
+        if self.file_selected.is_empty() {
+            return true;
         }
+        entry
+            .source_file
+            .file_stem()
+            .map(|s| self.file_selected.contains(&s.to_string_lossy().into_owned()))
+            .unwrap_or(false)
     }
 
-    /// Advance the file filter to the next option, wrapping around.
-    pub fn cycle_file_filter(&mut self) {
-        if !self.file_filters.is_empty() {
-            self.file_filter = (self.file_filter + 1) % self.file_filters.len();
-        }
-    }
-
-    /// Move the file filter to the previous option, wrapping around.
-    pub fn cycle_file_filter_rev(&mut self) {
-        let n = self.file_filters.len();
-        if n != 0 {
-            self.file_filter = (self.file_filter + n - 1) % n;
+    /// A short label for the active filter: "all", the single stem, or "N files".
+    pub fn file_filter_label(&self) -> String {
+        match self.file_selected.len() {
+            0 => "all".to_string(),
+            1 => self.file_selected.iter().next().cloned().unwrap_or_default(),
+            n => format!("{n} files"),
         }
     }
 
     pub fn save_prev_search(&self) {
-        let file = self
+        // Persist the selected stems as a `+`-joined list (in filter order).
+        let sel: Vec<&str> = self
             .file_filters
-            .get(self.file_filter)
+            .iter()
+            .filter(|f| self.file_selected.contains(*f))
             .map(|s| s.as_str())
-            .unwrap_or("All");
+            .collect();
+        let file = if sel.is_empty() {
+            "All".to_string()
+        } else {
+            sel.join("+")
+        };
         let _ = fs::write(
             get_prev_search_path(),
             format!("{}\n{}\n{}", self.query, self.mode, file),
@@ -746,8 +860,44 @@ impl App {
     }
 }
 
+fn print_usage() {
+    println!(
+        "f1nder — fuzzy search / browse / methodology for pentest commands\n\n\
+         Usage:\n  \
+         f1nder                 launch the TUI\n  \
+         f1nder --import FILE   bulk-import cmd-maker template blocks from FILE\n  \
+         f1nder --help          show this help\n\n\
+         --import (-i) reads a file of `--- TITLE ---` … `--- COMMANDS ---` blocks,\n\
+         routes each to JSONs/cmds/<SOURCE-FILE>-CMDs.json, and skips duplicates."
+    );
+}
+
 fn main() -> Result<()> {
     color_eyre::install()?;
+
+    // Minimal hand-rolled argv parsing (no clap dependency). With no args we
+    // launch the TUI as before; `--import FILE` runs a headless bulk import.
+    let mut import_file: Option<PathBuf> = None;
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                print_usage();
+                return Ok(());
+            }
+            "-i" | "--import" => {
+                let f = args.next().ok_or_else(|| {
+                    eyre!("--import requires a FILE argument (e.g. f1nder --import commands.md)")
+                })?;
+                import_file = Some(PathBuf::from(f));
+            }
+            other => {
+                return Err(eyre!(
+                    "unknown argument: {other}\n\nRun `f1nder --help` for usage."
+                ));
+            }
+        }
+    }
 
     let exe_path = std::env::current_exe()?;
     let root = exe_path
@@ -830,6 +980,33 @@ fn main() -> Result<()> {
     }
 
     let mut app = App::new(entries, chains, cmds_dir, chains_dir, method_docs);
+
+    // Headless bulk-import path: ingest the file, write the affected JSONs, and
+    // exit without launching the TUI. `app.entries` already holds the full
+    // existing set, so write_entries_to_json regrouping is non-destructive.
+    if let Some(import_file) = import_file {
+        let report = app.import_commands_file(&import_file)?;
+        app.write_entries_to_json()?;
+
+        let skipped = if report.skipped > 0 {
+            format!(", skipped {} duplicate(s)", report.skipped)
+        } else {
+            String::new()
+        };
+        println!("Imported {} command(s){}.", report.added, skipped);
+        let mut files: Vec<_> = report.added_by_file.into_iter().collect();
+        files.sort();
+        for (f, n) in files {
+            println!("  {n:>4}  {f}");
+        }
+        if !report.errors.is_empty() {
+            eprintln!("\n{} block(s) skipped due to errors:", report.errors.len());
+            for (i, e) in &report.errors {
+                eprintln!("  block {i}: {e}");
+            }
+        }
+        return Ok(());
+    }
 
     ratatui::run(|terminal| ui::run_event_loop(terminal, &mut app))?;
 
