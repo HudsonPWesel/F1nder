@@ -944,8 +944,20 @@ fn main() -> Result<()> {
         chains.extend(cf.chains);
     }
 
+    // Purge steps that no longer resolve to an existing command (e.g. a command
+    // was deleted while it was a chain step) and drop any chain left with fewer
+    // than two real steps — the same invariant the in-app delete paths keep, so
+    // a deleted command can never linger in the attack chain. `chains_healed`
+    // marks that on-disk data was stale so we rewrite it on quit.
     let valid_ids: HashSet<String> = entries.iter().map(|e| e.id.clone()).collect();
-    chains.retain(|chain| chain.steps.iter().any(|id| valid_ids.contains(id)));
+    let steps_before: usize = chains.iter().map(|c| c.steps.len()).sum();
+    let chains_before = chains.len();
+    for chain in &mut chains {
+        chain.steps.retain(|id| valid_ids.contains(id));
+    }
+    chains.retain(|chain| chain.steps.len() >= 2);
+    let chains_healed = chains.len() != chains_before
+        || chains.iter().map(|c| c.steps.len()).sum::<usize>() != steps_before;
 
     // Load methodology documents from JSONs/methodology/*.md (each a separate,
     // switchable checklist). Falls back to a legacy single JSONs/methodology.md.
@@ -980,6 +992,10 @@ fn main() -> Result<()> {
     }
 
     let mut app = App::new(entries, chains, cmds_dir, chains_dir, method_docs);
+    // Persist the cleaned-up chains on quit if load had to heal stale steps.
+    if chains_healed {
+        app.dirty = true;
+    }
 
     // Headless bulk-import path: ingest the file, write the affected JSONs, and
     // exit without launching the TUI. `app.entries` already holds the full

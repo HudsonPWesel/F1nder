@@ -4119,6 +4119,16 @@ fn render_chain(
         return;
     };
 
+    // Height (in wrapped rows) each step occupies: 1 blank + wrapped(cmd) + 1
+    // blank. ratatui's own line_count is unstable, so approximate the wrapped
+    // command height with textwrap, matching render_detail's approach.
+    let inner_w = area.width.saturating_sub(6).max(1) as usize;
+    let inner_h = area.height.saturating_sub(3);
+    let step_heights: Vec<u16> = chain_entries
+        .iter()
+        .map(|e| 2 + textwrap::wrap(&e.cmd, inner_w).len().max(1) as u16)
+        .collect();
+
     let lines: Vec<Line> = chain_entries
         .iter()
         .enumerate()
@@ -4152,15 +4162,41 @@ fn render_chain(
         })
         .collect();
 
-    let chain_widget: Paragraph<'_> = Paragraph::new(lines).wrap(Wrap { trim: false }).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .padding(Padding::new(2, 2, 1, 0))
-            .title_top(" ATTACK CHAIN ")
-            .title_alignment(Alignment::Center)
-            .border_style(Style::default().fg(border)),
-    );
+    // Scroll so the highlighted step (cursor when focused, else the current
+    // command) stays inside the viewport instead of only the marker moving.
+    let target = if focused {
+        chain_sel
+    } else {
+        chain_entries
+            .iter()
+            .position(|e| e.id == selected_entry_id)
+            .unwrap_or(0)
+    };
+    let target = target.min(step_heights.len().saturating_sub(1));
+    let start: u16 = step_heights[..target].iter().sum();
+    let end = start.saturating_add(step_heights.get(target).copied().unwrap_or(0));
+    let total: u16 = step_heights.iter().sum();
+    let mut scroll = 0u16;
+    if end > inner_h {
+        scroll = end - inner_h;
+    }
+    if start < scroll {
+        scroll = start;
+    }
+    scroll = scroll.min(total.saturating_sub(inner_h));
+
+    let chain_widget: Paragraph<'_> = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .padding(Padding::new(2, 2, 1, 0))
+                .title_top(" ATTACK CHAIN ")
+                .title_alignment(Alignment::Center)
+                .border_style(Style::default().fg(border)),
+        );
 
     frame.render_widget(chain_widget, area);
 }
