@@ -363,9 +363,26 @@ mod tests {
         let tree = parse(&md);
         let secs = sections(&tree);
         eprintln!("ad: sections={}", secs.len());
-        // Roman-numeral sections I..XVI.
-        assert_eq!(secs.len(), 16, "expected 16 AD sections");
-        assert_eq!(secs[0].title.trim_start_matches("I. "), "External Recon");
+        // Roman-numeral sections I..VIII.
+        assert_eq!(secs.len(), 8, "expected 8 AD sections");
+        assert_eq!(
+            secs[0].title.trim_start_matches("I. "),
+            "Recon & Uncredentialed Enumeration"
+        );
+        // AD CS is its own section and nests ESC nodes under `##` cards.
+        let adcs = secs[3];
+        assert_eq!(adcs.title.trim_start_matches("IV. "), "AD CS");
+        let templates = adcs
+            .children
+            .iter()
+            .find(|c| c.title == "Template Misconfigurations")
+            .expect("Template Misconfigurations card");
+        for esc in ["ESC1", "ESC9", "ESC13", "ESC14", "ESC15"] {
+            assert!(
+                templates.children.iter().any(|c| c.title == esc),
+                "{esc} should nest under Template Misconfigurations"
+            );
+        }
     }
 
     #[test]
@@ -390,6 +407,29 @@ mod tests {
             ex_secs.iter().all(|s| section_re().is_match(s.title.trim_start())),
             "all external sections should be numbered"
         );
+    }
+
+    #[test]
+    fn parses_privesc_docs() {
+        // Linux and Windows priv-esc docs: a title line (skipped) plus
+        // roman-numeral sections that become the sub-tabs, with no leftover
+        // Notion `[text](url)` link markup in any title.
+        for (file, want) in [("linux.md", 5), ("windows.md", 8)] {
+            let md = std::fs::read_to_string(format!("JSONs/methodology/{file}")).unwrap();
+            let tree = parse(&md);
+            let secs = sections(&tree);
+            let names: Vec<&str> = secs.iter().map(|s| s.title.as_str()).collect();
+            eprintln!("{file} sections: {names:?}");
+            assert_eq!(secs.len(), want, "expected {want} sections in {file}");
+            assert!(
+                secs.iter().all(|s| section_re().is_match(s.title.trim_start())),
+                "all {file} sections should be roman-numeral numbered"
+            );
+            assert!(
+                names.iter().all(|n| !n.contains('[') && !n.contains("](")),
+                "no leftover link markup in {file} titles"
+            );
+        }
     }
 }
 

@@ -2,16 +2,19 @@ use std::{
     collections::{HashMap, HashSet},
     ffi::OsStr,
     fs::{self, OpenOptions},
+    io::Write,
     path::{Path, PathBuf},
     sync::OnceLock,
 };
 use strum::Display;
 
-use color_eyre::{Result, eyre::eyre};
+use color_eyre::{Result, eyre::WrapErr, eyre::eyre};
 use rand::RngExt;
 use ratatui::widgets::ListState;
 use serde::{Deserialize, Serialize};
+mod fill;
 mod methodology;
+mod score;
 mod ui;
 
 use methodology::MethodNode;
@@ -314,6 +317,9 @@ pub struct App {
     /// Frequency-ranked word list (titles, headings, tool names) for inline
     /// autocomplete on the Search and Browse inputs.
     pub vocab: Vec<String>,
+    /// Pre-tokenized search index, parallel to `entries`. Rebuilt by
+    /// [`App::rebuild_entry_index`] whenever entry text changes.
+    pub index: Vec<score::EntryIndex>,
     pub cursor_index: usize,
     pub chains: Vec<Chain>,
     pub entry_index: HashMap<String, usize>,
@@ -322,6 +328,14 @@ pub struct App {
     pub current_chain_index: usize,
     pub cmds_dir: PathBuf,
     pub chains_dir: PathBuf,
+    /// Where remembered variable values live (`JSONs/vars.json`). Unlike the
+    /// `/tmp/prev_*` view state, these should survive a reboot.
+    pub vars_path: PathBuf,
+    /// The open fill-in-the-blanks modal, if any. Modal over every tab.
+    pub fill: Option<Box<fill::FillState>>,
+    /// Machine-derived variable sources (sticky store, /etc/hosts, shell
+    /// history, env, local tunnel IP). Built lazily on the first fill.
+    pub var_ctx: Option<fill::VarContext>,
     pub dirty: bool,
 }
 
@@ -462,9 +476,11 @@ impl App {
             .map(|(i, e)| (e.id.clone(), i))
             .collect();
         let vocab = build_vocab(&entries);
+        let index = score::build_index(&entries);
         Self {
             entries,
             vocab,
+            index,
             query: fs::read_to_string(get_prev_search_path())
                 .unwrap_or(String::new())
                 .lines()
@@ -528,8 +544,11 @@ impl App {
             main_split_pct: 60,
             right_split_pct: 60,
             file_filter_active: false,
+            vars_path: cmds_dir.parent().unwrap_or(&cmds_dir).join("vars.json"),
             cmds_dir,
             chains_dir,
+            fill: None,
+            var_ctx: None,
             dirty: false,
         }
     }
@@ -547,6 +566,8 @@ impl App {
             .and_then(|i| self.results.get(i).copied())
     }
 
+    /// Rebuild both the id->position map and the search token index. Call this
+    /// after any change to `entries` that adds, removes, or edits an entry.
     pub fn rebuild_entry_index(&mut self) {
         self.entry_index = self
             .entries
@@ -554,6 +575,7 @@ impl App {
             .enumerate()
             .map(|(i, e)| (e.id.clone(), i))
             .collect();
+        self.index = score::build_index(&self.entries);
     }
 
     pub fn sanitize_source_path(&self, raw: &PathBuf) -> PathBuf {
@@ -576,12 +598,7 @@ impl App {
         }
 
         for (filepath, ef) in &entries_by_filename {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(filepath)?;
-            serde_json::to_writer_pretty(&mut file, &ef)?;
+            write_json_atomic(filepath, ef)?;
         }
 
         if !entries_by_filename.is_empty() {
@@ -691,12 +708,7 @@ impl App {
         }
 
         for (filepath, cf) in &chains_by_filename {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(filepath)?;
-            serde_json::to_writer_pretty(&mut file, &cf)?;
+            write_json_atomic(filepath, cf)?;
         }
 
         if !chains_by_filename.is_empty() && self.chains_dir.exists() {
@@ -862,13 +874,14 @@ impl App {
 
 fn print_usage() {
     println!(
-        "f1nder — fuzzy search / browse / methodology for pentest commands\n\n\
+        "f1nder — typo-tolerant search / browse / methodology for pentest commands\n\n\
          Usage:\n  \
          f1nder                 launch the TUI\n  \
          f1nder --import FILE   bulk-import cmd-maker template blocks from FILE\n  \
          f1nder --help          show this help\n\n\
          --import (-i) reads a file of `--- TITLE ---` … `--- COMMANDS ---` blocks,\n\
-         routes each to JSONs/cmds/<SOURCE-FILE>-CMDs.json, and skips duplicates."
+         routes each to JSONs/cmds/<SOURCE-FILE>-CMDs.json, and skips duplicates.\n\
+         --audit-vars prints what the fill-in-the-blanks detector finds per source file."
     );
 }
 
@@ -878,9 +891,15 @@ fn main() -> Result<()> {
     // Minimal hand-rolled argv parsing (no clap dependency). With no args we
     // launch the TUI as before; `--import FILE` runs a headless bulk import.
     let mut import_file: Option<PathBuf> = None;
+    let mut audit_vars = false;
+    let mut audit_filter: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--audit-vars" => audit_vars = true,
+            other if audit_vars && audit_filter.is_none() => {
+                audit_filter = Some(other.to_string())
+            }
             "-h" | "--help" => {
                 print_usage();
                 return Ok(());
@@ -925,12 +944,33 @@ fn main() -> Result<()> {
             continue;
         }
         let text = fs::read_to_string(&path)?;
-        let ef: EntriesFile = serde_json::from_str(&text)?;
+        let ef: EntriesFile = serde_json::from_str(&text)
+            .wrap_err_with(|| format!("corrupt commands file: {}", path.display()))?;
         for mut e in ef.entries {
             // Always override source_file with the canonical path we just read from.
             e.source_file = path.clone();
             entries.push(e);
         }
+    }
+
+    // Headless: report what the fill-in detector finds across the whole corpus,
+    // so the placeholder conventions can be normalised incrementally.
+    if audit_vars {
+        let rows: Vec<(String, String, String)> = entries
+            .iter()
+            .map(|e| {
+                (
+                    e.source_file
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_default(),
+                    e.title.clone(),
+                    e.cmd.clone(),
+                )
+            })
+            .collect();
+        fill::audit(&rows, audit_filter.as_deref());
+        return Ok(());
     }
 
     let mut chains: Vec<Chain> = Vec::new();
@@ -940,7 +980,8 @@ fn main() -> Result<()> {
             continue;
         }
         let text = fs::read_to_string(&path)?;
-        let cf: ChainsFile = serde_json::from_str(&text)?;
+        let cf: ChainsFile = serde_json::from_str(&text)
+            .wrap_err_with(|| format!("corrupt chains file: {}", path.display()))?;
         chains.extend(cf.chains);
     }
 
@@ -1034,5 +1075,37 @@ fn main() -> Result<()> {
     app.save_prev_browse();
     app.save_prev_method();
 
+    Ok(())
+}
+
+/// Serialise `value` and replace `path` with it atomically.
+///
+/// The old code opened the target with `truncate(true)` and streamed straight
+/// into it, so anything that cut the write short — a kill on quit, a
+/// serialisation error, a full disk — left a half-written file on disk that
+/// `serde_json::from_str` then refused to parse on the next start, taking the
+/// whole app down with it. Serialising into memory first means a failure never
+/// touches the target, and the rename is atomic, so the file on disk is always
+/// either the complete old version or the complete new one.
+fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(value)?;
+
+    // Sibling temp file so the rename stays on one filesystem. The `.tmp`
+    // extension keeps it out of the `*.json` load and prune loops.
+    let tmp = path.with_extension("json.tmp");
+    {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+    }
+
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e.into());
+    }
     Ok(())
 }

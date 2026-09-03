@@ -7,6 +7,7 @@ use std::io::stdout;
 use std::path::{Path, PathBuf};
 
 use crate::methodology::{MethodKind, MethodNode};
+use crate::score;
 use crate::{App, Chain, Entry, MethodPos, SearchMode, SearchPane, TreeNode};
 use color_eyre::Result;
 use color_eyre::eyre::eyre;
@@ -515,6 +516,7 @@ fn edit_command(app: &mut App, terminal: &mut DefaultTerminal, entry_index: usiz
     let _ = open_editor(get_editor_temp_path());
     let updated = parse_template(&entry.id, app)?;
     app.entries[entry_index] = updated;
+    app.index[entry_index] = score::index_entry(&app.entries[entry_index]);
     app.dirty = true;
     let _ = fs::remove_file(get_editor_temp_path());
     enable_raw_mode()?;
@@ -579,6 +581,11 @@ fn handle_key_event(app: &mut App, terminal: &mut DefaultTerminal) -> Result<boo
     if let Event::Key(key) = event::read()? {
         if key.kind != KeyEventKind::Press {
             return Ok(false);
+        }
+        // The fill-in-the-blanks modal is the innermost modal: it owns every
+        // key while open, including Esc.
+        if app.fill.is_some() {
+            return handle_fill_key(app, key);
         }
         // The file-filter popup is modal on any tab (it is shared).
         if app.file_filter_active {
@@ -784,8 +791,9 @@ fn handle_key_event(app: &mut App, terminal: &mut DefaultTerminal) -> Result<boo
                 chain_present(app);
             }
             KeyCode::Enter => {
-                if let Some(entry) = app.selected_entry() {
-                    copy_to_clipboard(&entry.cmd);
+                if let Some(idx) = app.results.get(app.list_state.selected().unwrap_or(0)).copied()
+                {
+                    return open_fill_or_copy(app, idx);
                 }
                 return Ok(true);
             }
@@ -1021,6 +1029,11 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         render_file_filter(frame, chunks[3], app);
     }
 
+    // The fill modal sits above everything else.
+    if app.fill.is_some() {
+        render_fill(frame, frame.area(), app);
+    }
+
     render_footer(frame, chunks[4], app);
 }
 
@@ -1106,10 +1119,14 @@ fn render_file_filter(frame: &mut Frame, area: Rect, app: &mut App) {
 
 /// A dim key-hint strip in the reserved bottom row, with the app name pinned right.
 fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
-    let hint = match app.top_tab {
-        0 => "⌘N nav · hjkl panels · ⇧HJKL resize · ⌘F filter · nav+Space reset · e edit",
-        1 => "↑↓ move · ⇥ complete · h/l fold · Enter copy · ⌘F file · ⌘N nav",
-        _ => "Tab section · ⌘F doc · hjkl move · Space check · / jump",
+    let hint = if app.fill.is_some() {
+        "⏎ next field · ⇥ move · ^P/^N suggestions · ^T target · ^R reset · ^Y copy now · Esc cancel"
+    } else {
+        match app.top_tab {
+            0 => "⌘N nav · hjkl panels · ⇧HJKL resize · ⌘F filter · nav+Space reset · e edit",
+            1 => "↑↓ move · ⇥ complete · h/l fold · Enter copy · ⌘F file · ⌘N nav",
+            _ => "Tab section · ⌘F doc · hjkl move · Space check · / jump",
+        }
     };
     let brand = "F1nder";
     let left = format!("  {}   [ ] switch tab", hint);
@@ -1153,12 +1170,11 @@ fn count_matches(node: &TreeNode, matches: Option<&HashSet<usize>>) -> usize {
     }
 }
 
-/// The set of entry indices matching the Browse filter: every whitespace-separated
-/// word must appear (case-insensitively) as a substring of the entry's title or
-/// heading path. Predictable and precise — `sql injection` needs both words.
+/// The set of entry indices matching the Browse filter: every query word must
+/// match somewhere in the mode's fields, using the same typo-tolerant matcher as
+/// the Search tab. Predictable and precise — `sql injection` needs both words.
 fn browse_match_set(app: &App) -> HashSet<usize> {
-    let ql = app.browse_query.to_lowercase();
-    let terms: Vec<&str> = ql.split_whitespace().collect();
+    let terms = score::query_tokens(&app.browse_query);
     app.entries
         .iter()
         .enumerate()
@@ -1166,16 +1182,15 @@ fn browse_match_set(app: &App) -> HashSet<usize> {
             if !app.entry_passes_file(e) {
                 return None;
             }
+            let ix = app.index.get(i)?;
             // Match against the field(s) selected by the browse filter mode.
-            let hay = match app.browse_mode {
-                SearchMode::TITLE => e.title.to_lowercase(),
-                SearchMode::HEADING => e.heading_path.join(" ").to_lowercase(),
-                SearchMode::CMD => e.cmd.to_lowercase(),
-                SearchMode::ALL => {
-                    format!("{} {} {}", e.title, e.heading_path.join(" "), e.cmd).to_lowercase()
-                }
+            let fields: Vec<&score::FieldIndex> = match app.browse_mode {
+                SearchMode::TITLE => vec![&ix.title],
+                SearchMode::HEADING => vec![&ix.heading],
+                SearchMode::CMD => vec![&ix.cmd, &ix.tool],
+                SearchMode::ALL => vec![&ix.title, &ix.heading, &ix.cmd, &ix.tool],
             };
-            if terms.iter().all(|t| hay.contains(t)) {
+            if score::matches_fields(&fields, &terms) {
                 Some(i)
             } else {
                 None
@@ -1538,7 +1553,7 @@ fn handle_browse_key(app: &mut App, terminal: &mut DefaultTerminal, key: KeyEven
                     set_folder_expanded(app, &key, !expanded_now, filtering);
                 } else if key.code == KeyCode::Enter {
                     if let Some(idx) = row.entry_index {
-                        copy_to_clipboard(&app.entries[idx].cmd);
+                        return open_fill_or_copy(app, idx);
                     }
                     return Ok(true);
                 }
@@ -1592,6 +1607,7 @@ fn handle_browse_key(app: &mut App, terminal: &mut DefaultTerminal, key: KeyEven
                     let _ = open_editor(get_editor_temp_path());
                     let updated_entry = parse_template(&entry.id, app)?;
                     app.entries[idx] = updated_entry;
+                    app.index[idx] = score::index_entry(&app.entries[idx]);
                     app.dirty = true;
                     fs::remove_file(get_editor_temp_path())?;
 
@@ -1755,6 +1771,8 @@ fn sort_tree(nodes: &mut [TreeNode], stem: Option<&str>) {
 fn root_rank(stem: &str) -> i32 {
     const ORDER: &[&str] = &[
         "CPTS-CMDs",
+        "WPE-CMDs",
+        "LPE-CMDs",
         "CAPE-CMDs",
         "CWES-CMDs",
         "CWEE-CMDs",
@@ -1774,6 +1792,8 @@ fn root_label(stem: &str) -> String {
     match stem {
         "CAPE-CMDs" => "Active Directory  (CAPE)",
         "CPTS-CMDs" => "Penetration Testing  (CPTS)",
+        "WPE-CMDs" => "Windows PrivEsc  (WPE)",
+        "LPE-CMDs" => "Linux PrivEsc  (LPE)",
         "CWEE-CMDs" => "Web — Expert  (CWEE)",
         "CWES-CMDs" => "Web — Standard  (CWES)",
         "CWPE-CMDs" => "Wireless  (CWPE)",
@@ -1791,6 +1811,8 @@ fn folder_rank(stem: &str, name: &str) -> i32 {
     let order: &[&str] = match stem {
         "CAPE-CMDs" => CAPE_ORDER,
         "CPTS-CMDs" => CPTS_ORDER,
+        "WPE-CMDs" => WPE_ORDER,
+        "LPE-CMDs" => LPE_ORDER,
         "CWEE-CMDs" => CWEE_ORDER,
         "CWES-CMDs" => CWES_ORDER,
         "CWPE-CMDs" => CWPE_ORDER,
@@ -1808,52 +1830,140 @@ fn folder_rank(stem: &str, name: &str) -> i32 {
 // Curated folder orders per command set, aligned to JSONs/methodology/*.md.
 // Names not present in a file are harmless; unmatched folders fall to the end.
 
-/// CAPE ← ad.md phase order (Recon → Enum → Foothold → ADCS → Relay → DACL →
-/// Delegation → MSSQL → Exchange → SCCM → Cred Theft → Lateral → Trusts → Post).
+/// WPE ← windows.md (I. Environmental Awareness → … → VII. Miscellaneous).
+/// Section names + key subsection names, applied at every depth.
+const WPE_ORDER: &[&str] = &[
+    "Windows PrivEsc",
+    "I. Environmental Awareness",
+    "Situational Awareness",
+    "Enumerate Protections",
+    "Enumerate System Information",
+    "Services",
+    "Scheduled Tasks",
+    "Installed Programs",
+    "User Information",
+    "Group Information",
+    "Network Details",
+    "Enumerate Named Pipes",
+    "Tools",
+    "II. User Privileges",
+    "SeImpersonatePrivilege",
+    "SeDebugPrivilege",
+    "SeTakeOwnershipPrivilege",
+    "Adjust Token Privileges",
+    "III. Group Privileges",
+    "Backup Operators",
+    "Event Log Readers",
+    "DnsAdmins",
+    "Hyper-V Administrators",
+    "Print Operators",
+    "Server Operators",
+    "IV. Attacking OS",
+    "CVEs",
+    "UAC Bypasses",
+    "V. Credential Theft",
+    "Credential Theft Tools",
+    "Manual Credential Hunting",
+    "AppData",
+    "Special Files & Locations",
+    "VI. Citrix Breakout",
+    "VII. Miscellaneous",
+    "Interaction With Users",
+    "Pillaging",
+    "Other Techniques",
+    "End of Life Systems",
+];
+
+/// LPE ← linux.md (I. Initial Enumeration → … → V. Misc Techniques).
+const LPE_ORDER: &[&str] = &[
+    "Linux PrivEsc",
+    "I. Initial Enumeration",
+    "Credential Hunting in Web Directory",
+    "Enumerate Networking Info",
+    "Enumerate System Information",
+    "Enumerate Block Devices",
+    "Enumerate Users & Groups",
+    "II. Common PrivEsc Vectors",
+    "Enumerate Syscalls",
+    "Enumerate Processes",
+    "Cron Job Abuse",
+    "Permissions-based (SUID & SGID)",
+    "Sudo Rights Abuse",
+    "Privileged Groups",
+    "Capabilities",
+    "Files",
+    "Kernel Exploits",
+    "Sudo Version",
+    "Other Installed Binaries",
+    "III. Auto Enum Tools",
+    "IV. Services & Internals",
+    "Packages & Vulnerable Services",
+    "Logrotate",
+    "Path Abuse",
+    "Shared Libraries",
+    "Shared Object Hijacking",
+    "Python Library Hijacking",
+    "V. Misc Techniques",
+    "Weak NFS Privileges",
+    "Hijacking Tmux Sessions",
+    "Escaping Restricted Shells",
+];
+
+/// CAPE ← ad.md, which is now eight phases:
+/// I. Recon & Uncredentialed → II. Foothold → III. Credentialed Enumeration →
+/// IV. AD CS → V. Domain Privilege Escalation → VI. Service Attacks →
+/// VII. Credential Access & Lateral Movement → VIII. Trusts & Post-Compromise.
 const CAPE_ORDER: &[&str] = &[
-    "Getting Started",
+    // I. Recon & Uncredentialed Enumeration
     "Setting Up",
-    "Active Directory",
-    "Initial Access",
+    "Getting Started",
     "Network Scanning",
+    "Initial Access",
+    // II. Obtaining a Foothold
+    "Credential Theft",
+    "Roasting Attacks",
+    // III. Credentialed Domain Enumeration
+    "Active Directory",
     "AD Enumeration",
-    "NetExec (nxc)",
     "nxc",
     "Rusthound-CE",
-    "Remote Services",
-    "Remote Management Tools",
-    "Spoofing",
+    // IV. AD CS
     "ADCS Attacks",
+    // V. Domain Privilege Escalation
     "NTLM Relay Attacks",
     "Advanced NTLM Relay Attacks",
     "DACL Attacks",
-    "Roasting Attacks",
+    "Attribute Modification",
+    "Spoofing",
+    "Group Policy",
     "Unconstrained Delegation",
     "Constrained Delegation",
     "Ticket Abuse",
     "Kerberos Authentication",
+    "Privilege Escalation",
+    // VI. Service Attacks
     "MSSQL Server",
     "Abusing SQL Server Links",
     "Microsoft Exchange",
     "SCCM",
-    "Group Policy",
-    "Attribute Modification",
-    "Credential Theft",
+    // VII. Credential Access & Lateral Movement
     "Command Execution",
     "Execute Commands",
     "Getting a Remote Shell",
+    "Remote Services",
+    "Server Message Block (SMB)",
+    "Remote Management Tools",
     "Lateral Movement",
     "Tunneling & Pivoting & Lateral Movement",
-    "Server Message Block (SMB)",
-    "Inter Forest Attacks",
-    "Cross Forest Attacks",
-    "Privilege Escalation",
     "Post Exploitation",
     "Establishing Persistence",
     "Antivirus Evasion",
     "C2 Frameworks",
     "Sliver C2",
     "Shell Utilities",
+    // VIII. Trusts & Post-Compromise
+    "Inter Forest Attacks",
+    "Cross Forest Attacks",
     "String Manipulation",
     "Miscellaneous",
 ];
@@ -2510,14 +2620,10 @@ fn jump_targets(app: &App) -> Vec<JumpTarget> {
 }
 
 fn jump_filtered(app: &App) -> Vec<JumpTarget> {
-    let q = app.method_query.to_lowercase();
-    let terms: Vec<&str> = q.split_whitespace().collect();
+    let terms = score::query_tokens(&app.method_query);
     jump_targets(app)
         .into_iter()
-        .filter(|t| {
-            let l = t.label.to_lowercase();
-            terms.iter().all(|term| l.contains(term))
-        })
+        .filter(|t| score::matches_text(&t.label, &terms))
         .collect()
 }
 
@@ -3852,140 +3958,21 @@ fn entry_stem(entry: &Entry) -> String {
         .unwrap_or_default()
 }
 
-/// The command's tool binary (lowercased) — the first real token, skipping common
-/// wrappers and env assignments; empty for URL-only "commands".
-fn tool_of(cmd: &str) -> String {
-    const WRAPPERS: &[&str] = &[
-        "sudo", "doas", "proxychains", "proxychains4", "python", "python3", "pipx",
-        "env", "time", "watch", "nohup",
-    ];
-    for tok in cmd.split_whitespace() {
-        if tok.is_empty() {
-            continue;
-        }
-        // env assignment like FOO=bar
-        if tok.contains('=') && !tok.contains('/') {
-            continue;
-        }
-        let low = tok.to_lowercase();
-        if WRAPPERS.contains(&low.as_str()) {
-            continue;
-        }
-        if low.starts_with("http://") || low.starts_with("https://") {
-            return String::new();
-        }
-        // strip any path prefix: /usr/bin/ffuf -> ffuf
-        return low.rsplit('/').next().unwrap_or(&low).to_string();
-    }
-    String::new()
-}
-
-/// How well `token` matches lowercase `field`: 0 = not a substring, 1 = mid-word
-/// substring, 2 = word-prefix, 3 = whole word.
-fn token_quality(field: &str, token: &str) -> u32 {
-    if token.is_empty() || !field.contains(token) {
-        return 0;
-    }
-    let mut q = 1;
-    for word in field.split(|c: char| !c.is_alphanumeric()) {
-        if word.is_empty() {
-            continue;
-        }
-        if word == token {
-            return 3;
-        }
-        if word.starts_with(token) {
-            q = q.max(2);
-        }
-    }
-    q
-}
-
 fn search(app: &mut App, reset_selection: bool) {
     app.current_chain_index = 0;
     app.desc_scroll = 0;
     app.chain_sel = 0;
     let previous_selection = app.list_state.selected();
 
-    let query = app.query.trim();
-
-    if query.is_empty() {
-        // No fuzzy query: list every entry that passes the file filter, with
-        // favorites floated to the top (stable, so file order is otherwise kept).
-        let mut results: Vec<usize> = (0..app.entries.len())
-            .filter(|&i| app.entry_passes_file(&app.entries[i]))
-            .collect();
-        results.sort_by_key(|&i| !app.entries[i].favorite);
-        app.results = results;
-    } else {
-        // All-words matching: split the query into words and require EVERY word to
-        // match some field (as a substring / word-prefix). Entries missing any word
-        // are dropped, so loose fuzzy noise disappears. Each word scores by its best
-        // field (title > heading > tool/cmd) and match quality (whole-word >
-        // prefix > mid-word); the entry score is the sum.
-        let query_lower = query.to_lowercase();
-        let tokens: Vec<&str> = query_lower.split_whitespace().collect();
-
-        let mut scored: Vec<(usize, i64, bool)> = Vec::new();
-        for (i, entry) in app.entries.iter().enumerate() {
-            if !app.entry_passes_file(entry) {
-                continue;
-            }
-            let title = entry.title.to_lowercase();
-            let heading = entry.heading_path.join(" > ").to_lowercase();
-            let cmd = entry.cmd.to_lowercase();
-            let tool = tool_of(&entry.cmd);
-
-            // (lowercased field text, weight) considered for the active mode. The
-            // prose description is deliberately excluded — a word buried there
-            // shouldn't keep an otherwise-unrelated command in the results.
-            let fields: Vec<(&str, i64)> = match app.mode {
-                SearchMode::TITLE => vec![(title.as_str(), 1000)],
-                SearchMode::HEADING => vec![(heading.as_str(), 1000)],
-                SearchMode::CMD => vec![(tool.as_str(), 800), (cmd.as_str(), 400)],
-                SearchMode::ALL => vec![
-                    (title.as_str(), 1000),
-                    (tool.as_str(), 800),
-                    (heading.as_str(), 500),
-                    (cmd.as_str(), 200),
-                ],
-            };
-
-            let mut total: i64 = 0;
-            let mut all_matched = true;
-            for &tok in &tokens {
-                let mut best = 0i64;
-                for &(text, weight) in &fields {
-                    let q = token_quality(text, tok) as i64;
-                    if q > 0 {
-                        best = best.max(weight + q * 250);
-                    }
-                }
-                if best == 0 {
-                    all_matched = false;
-                    break;
-                }
-                total += best;
-            }
-            if !all_matched {
-                continue;
-            }
-
-            // Reward the whole query being a title prefix, and prefer shorter
-            // (more specific) titles as a tie-break.
-            if title.starts_with(&query_lower) {
-                total += 500;
-            }
-            total -= title.chars().count().min(250) as i64;
-
-            scored.push((i, total, entry.favorite));
-        }
-
-        // Favorites first (they're already all-words-relevant since they matched),
-        // then by score.
-        scored.sort_by(|a, b| b.2.cmp(&a.2).then(b.1.cmp(&a.1)));
-        app.results = scored.into_iter().map(|(i, _, _)| i).collect();
-    }
+    // All matching and ranking lives in `score`; see that module for the
+    // weighting, adjacency and typo-tolerance rules.
+    app.results = score::rank(
+        &app.entries,
+        &app.index,
+        &app.query,
+        &app.mode,
+        |e| app.entry_passes_file(e),
+    );
 
     if app.results.is_empty() {
         app.list_state.select(None);
@@ -3998,6 +3985,7 @@ fn search(app: &mut App, reset_selection: bool) {
         }
     }
 }
+
 fn render_results(frame: &mut Frame, area: Rect, app: &mut App) {
     // A pane-focus situation exists when nav is on, or focus has moved to a right
     // pane. In that case the focused pane gets the accent border and the results
@@ -4262,10 +4250,12 @@ fn render_detail(frame: &mut Frame, area: Rect, app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::{
-        chain_present, file_filter_toggle, init_chain_sel, parse_template_str, reset_search_view,
-        search_nav_down, search_scroll_down,
+        chain_present, file_filter_toggle, handle_fill_key, init_chain_sel, open_fill_or_copy,
+        parse_template_str, reset_search_view, search_nav_down, search_scroll_down,
     };
+    use crate::fill;
     use crate::{App, Chain, Entry, SearchPane};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::path::{Path, PathBuf};
 
     fn mk_entry(id: &str) -> Entry {
@@ -4437,5 +4427,595 @@ azurenum --interactive\n";
                        --- DESCRIPTION ---\nd\n--- SOURCE-FILE ---\nOAOTC\n--- COMMANDS ---\n";
         let r = parse_template_str("00000000", no_cmds, Path::new("/tmp"), false);
         assert!(r.is_err());
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    fn app_with(cmd: &str) -> App {
+        app_named(cmd, "shared")
+    }
+
+    fn app_named(cmd: &str, tag: &str) -> App {
+        let mut e = mk_entry("z");
+        e.cmd = cmd.to_string();
+        let mut app = App::new(vec![e], vec![], PathBuf::from("/tmp"), PathBuf::from("/tmp"), vec![]);
+        app.results = vec![0];
+        app.list_state.select(Some(0));
+        // Keep the test off the machine's real /etc/hosts and shell history.
+        app.var_ctx = Some(fill::VarContext {
+            sticky: Default::default(),
+            hosts: vec![],
+            history: Default::default(),
+            env: Default::default(),
+            local_ip: None,
+        });
+        app.vars_path = PathBuf::from(format!("/tmp/f1nder-test-vars-{tag}.json"));
+        let _ = std::fs::remove_file(&app.vars_path);
+        app
+    }
+
+    /// A command with nothing to fill keeps the old behaviour: copy and quit,
+    /// with no modal in the way.
+    #[test]
+    fn plain_command_skips_the_modal() {
+        let mut app = app_with("whoami");
+        let quit = open_fill_or_copy(&mut app, 0).unwrap();
+        assert!(quit, "should copy and exit immediately");
+        assert!(app.fill.is_none());
+    }
+
+    /// Enter walks the fields and the last Enter finishes; the substituted text
+    /// is what lands on the clipboard.
+    #[test]
+    fn enter_walks_fields_then_finishes() {
+        let mut app = app_named("nxc smb 'TARGET' -u 'USER' -p 'PASSWORD'", "walk");
+        assert!(!open_fill_or_copy(&mut app, 0).unwrap());
+        assert_eq!(app.fill.as_ref().unwrap().fields.len(), 3);
+
+        for c in "10.0.0.5".chars() {
+            handle_fill_key(&mut app, key(KeyCode::Char(c))).unwrap();
+        }
+        assert!(!handle_fill_key(&mut app, key(KeyCode::Enter)).unwrap());
+        assert_eq!(app.fill.as_ref().unwrap().cur, 1);
+
+        for c in "bob".chars() {
+            handle_fill_key(&mut app, key(KeyCode::Char(c))).unwrap();
+        }
+        handle_fill_key(&mut app, key(KeyCode::Enter)).unwrap();
+        for c in "hunter2".chars() {
+            handle_fill_key(&mut app, key(KeyCode::Char(c))).unwrap();
+        }
+
+        let filled = fill::render_filled(app.fill.as_ref().unwrap());
+        assert_eq!(filled, "nxc smb '10.0.0.5' -u 'bob' -p 'hunter2'");
+
+        // The last Enter copies and quits, and the modal is gone.
+        assert!(handle_fill_key(&mut app, key(KeyCode::Enter)).unwrap());
+        assert!(app.fill.is_none());
+        let saved = fill::load_sticky(Path::new("/tmp/f1nder-test-vars-walk.json"));
+        assert_eq!(saved.get("user").map(String::as_str), Some("bob"));
+        assert_eq!(saved.get("pass").map(String::as_str), Some("hunter2"));
+        let _ = std::fs::remove_file("/tmp/f1nder-test-vars-walk.json");
+    }
+
+    /// Esc backs out without copying and without touching the sticky store.
+    #[test]
+    fn esc_cancels_the_fill() {
+        let mut app = app_with("nxc smb 'TARGET' -u 'USER'");
+        open_fill_or_copy(&mut app, 0).unwrap();
+        assert!(!handle_fill_key(&mut app, key(KeyCode::Esc)).unwrap());
+        assert!(app.fill.is_none());
+    }
+
+    /// Editing keys operate on the focused field only.
+    #[test]
+    fn editing_keys_target_the_focused_field() {
+        let mut app = app_with("nxc smb 'TARGET' -u 'USER'");
+        open_fill_or_copy(&mut app, 0).unwrap();
+        for c in "abc".chars() {
+            handle_fill_key(&mut app, key(KeyCode::Char(c))).unwrap();
+        }
+        handle_fill_key(&mut app, key(KeyCode::Backspace)).unwrap();
+        handle_fill_key(&mut app, key(KeyCode::Tab)).unwrap();
+        for c in "xy".chars() {
+            handle_fill_key(&mut app, key(KeyCode::Char(c))).unwrap();
+        }
+        let st = app.fill.as_ref().unwrap();
+        assert_eq!(st.fields[0].value, "ab");
+        assert_eq!(st.fields[1].value, "xy");
+
+        // Ctrl+U clears just the focused field.
+        handle_fill_key(&mut app, ctrl('u')).unwrap();
+        let st = app.fill.as_ref().unwrap();
+        assert_eq!(st.fields[1].value, "");
+        assert_eq!(st.fields[0].value, "ab");
+    }
+
+    /// Ctrl+Y finishes early, leaving untouched fields at their defaults —
+    /// which, with no context available, is the original literal text.
+    #[test]
+    fn copy_now_leaves_defaults_intact() {
+        let cmd = "nxc smb 10.129.5.5 -u htb-student -p 'Password1'";
+        let mut app = app_named(cmd, "copynow");
+        open_fill_or_copy(&mut app, 0).unwrap();
+        assert_eq!(fill::render_filled(app.fill.as_ref().unwrap()), cmd);
+        assert!(handle_fill_key(&mut app, ctrl('y')).unwrap());
+        assert!(app.fill.is_none());
+        let _ = std::fs::remove_file("/tmp/f1nder-test-vars-copynow.json");
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Fill-in-the-blanks
+//
+// Enter on a command opens this modal instead of copying blindly: each
+// detected variable becomes a row, pre-filled from the best source we can find
+// (last used → /etc/hosts → shell history → env → local tunnel IP → the
+// original literal). Enter walks the rows accepting defaults; the last Enter
+// copies the finished command and exits, exactly like Enter always has.
+// ─────────────────────────────────────────────────────────────────────────
+
+use crate::fill::{self, FillState, Origin};
+
+/// Enter on a command. With no detected blanks this is the old behaviour
+/// verbatim — copy and quit. Otherwise it opens the fill modal.
+fn open_fill_or_copy(app: &mut App, idx: usize) -> Result<bool> {
+    let cmd = app.entries[idx].cmd.clone();
+    let title = app.entries[idx].title.clone();
+    let (mut fields, slots) = fill::detect(&cmd);
+    if fields.is_empty() {
+        copy_to_clipboard(&cmd);
+        return Ok(true);
+    }
+
+    // Building the context shells out (ifconfig) and reads the history files,
+    // so it happens here on first use rather than at startup.
+    if app.var_ctx.is_none() {
+        app.var_ctx = Some(fill::VarContext::build(&app.vars_path));
+    }
+    let ctx = app.var_ctx.as_ref().unwrap();
+    let targets = ctx.hosts.clone();
+    for f in fields.iter_mut() {
+        f.suggestions = ctx.suggest(f, targets.first());
+        let (v, o) = f
+            .suggestions
+            .first()
+            .cloned()
+            .unwrap_or((String::new(), Origin::Empty));
+        f.cursor = v.len();
+        f.value = v;
+        f.origin = o;
+    }
+
+    app.fill = Some(Box::new(FillState {
+        title,
+        cmd,
+        slots,
+        fields,
+        cur: 0,
+        targets,
+        target_idx: 0,
+        field_scroll: 0,
+    }));
+    Ok(false)
+}
+
+/// Substitute, copy, remember the values, quit — the same exit path Enter has
+/// always taken.
+fn fill_finish(app: &mut App) -> Result<bool> {
+    let Some(st) = app.fill.take() else {
+        return Ok(true);
+    };
+    copy_to_clipboard(&fill::render_filled(&st));
+
+    let mut sticky = app
+        .var_ctx
+        .as_ref()
+        .map(|c| c.sticky.clone())
+        .unwrap_or_default();
+    for f in &st.fields {
+        if f.sticky && !f.value.trim().is_empty() {
+            sticky.insert(f.canon.clone(), f.value.clone());
+        }
+    }
+    fill::save_sticky(&app.vars_path, &sticky);
+    Ok(true)
+}
+
+fn prev_boundary(s: &str, i: usize) -> usize {
+    s[..i].chars().next_back().map(|c| i - c.len_utf8()).unwrap_or(0)
+}
+
+fn next_boundary(s: &str, i: usize) -> usize {
+    s[i..].chars().next().map(|c| i + c.len_utf8()).unwrap_or(i)
+}
+
+/// Move the focus, keeping the visible window over the field list in sync.
+fn fill_focus(st: &mut FillState, next: usize) {
+    st.cur = next.min(st.fields.len().saturating_sub(1));
+    if st.cur < st.field_scroll {
+        st.field_scroll = st.cur;
+    }
+}
+
+/// Cycle through the candidates gathered for the focused field.
+fn fill_cycle_suggestion(st: &mut FillState, forward: bool) {
+    let cur = st.cur;
+    let n = st.fields[cur].suggestions.len();
+    if n == 0 {
+        return;
+    }
+    let f = &mut st.fields[cur];
+    f.sugg_idx = if forward {
+        (f.sugg_idx + 1) % n
+    } else {
+        (f.sugg_idx + n - 1) % n
+    };
+    let (v, o) = f.suggestions[f.sugg_idx].clone();
+    f.cursor = v.len();
+    f.value = v;
+    f.origin = o;
+    f.edited = false;
+}
+
+fn handle_fill_key(app: &mut App, key: KeyEvent) -> Result<bool> {
+    let ctrl = key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER);
+
+    match key.code {
+        KeyCode::Esc => {
+            app.fill = None;
+        }
+        // Ctrl+Enter / Ctrl+Y finish from any field, leaving the rest at their
+        // defaults. (Not every terminal reports Ctrl+Enter, hence both.)
+        KeyCode::Enter if ctrl => return fill_finish(app),
+        KeyCode::Char('y' | 'Y') if ctrl => return fill_finish(app),
+        KeyCode::Enter => {
+            let last = {
+                let st = app.fill.as_ref().unwrap();
+                st.cur + 1 >= st.fields.len()
+            };
+            if last {
+                return fill_finish(app);
+            }
+            let st = app.fill.as_mut().unwrap();
+            fill_focus(st, st.cur + 1);
+        }
+        KeyCode::Tab | KeyCode::Down => {
+            let st = app.fill.as_mut().unwrap();
+            let next = (st.cur + 1) % st.fields.len();
+            fill_focus(st, next);
+        }
+        KeyCode::BackTab | KeyCode::Up => {
+            let st = app.fill.as_mut().unwrap();
+            let n = st.fields.len();
+            let next = (st.cur + n - 1) % n;
+            fill_focus(st, next);
+        }
+        // Suggestions live on ←/→ paging with Alt, and on Ctrl+N/Ctrl+P, so the
+        // arrows stay free for cursor movement inside the value.
+        KeyCode::Char('n' | 'N') if ctrl => {
+            fill_cycle_suggestion(app.fill.as_mut().unwrap(), true)
+        }
+        KeyCode::Char('p' | 'P') if ctrl => {
+            fill_cycle_suggestion(app.fill.as_mut().unwrap(), false)
+        }
+        // Cycle the active /etc/hosts target; host-shaped fields you have not
+        // typed into follow it.
+        KeyCode::Char('t' | 'T') if ctrl => {
+            let st = app.fill.as_mut().unwrap();
+            if !st.targets.is_empty() {
+                st.target_idx = (st.target_idx + 1) % st.targets.len();
+                let target = st.targets[st.target_idx].clone();
+                if let Some(ctx) = app.var_ctx.as_ref() {
+                    let st = app.fill.as_mut().unwrap();
+                    ctx.apply_target(&mut st.fields, Some(&target));
+                }
+            }
+        }
+        // Reset the focused field to its detected default.
+        KeyCode::Char('r' | 'R') if ctrl => {
+            let st = app.fill.as_mut().unwrap();
+            let f = &mut st.fields[st.cur];
+            f.sugg_idx = 0;
+            let (v, o) = f
+                .suggestions
+                .first()
+                .cloned()
+                .unwrap_or((String::new(), Origin::Empty));
+            f.cursor = v.len();
+            f.value = v;
+            f.origin = o;
+            f.edited = false;
+        }
+        KeyCode::Char('u' | 'U') if ctrl => {
+            let st = app.fill.as_mut().unwrap();
+            let f = &mut st.fields[st.cur];
+            f.value.clear();
+            f.cursor = 0;
+            f.edited = true;
+            f.origin = Origin::Empty;
+        }
+        KeyCode::Char('w' | 'W') if ctrl => {
+            let st = app.fill.as_mut().unwrap();
+            let f = &mut st.fields[st.cur];
+            let head = &f.value[..f.cursor];
+            let keep = head.trim_end().rfind(|c: char| c.is_whitespace()).map_or(0, |i| i + 1);
+            f.value.replace_range(keep..f.cursor, "");
+            f.cursor = keep;
+            f.edited = true;
+        }
+        KeyCode::Left => {
+            let st = app.fill.as_mut().unwrap();
+            let f = &mut st.fields[st.cur];
+            f.cursor = prev_boundary(&f.value, f.cursor);
+        }
+        KeyCode::Right => {
+            let st = app.fill.as_mut().unwrap();
+            let f = &mut st.fields[st.cur];
+            f.cursor = next_boundary(&f.value, f.cursor);
+        }
+        KeyCode::Home => {
+            let st = app.fill.as_mut().unwrap();
+            st.fields[st.cur].cursor = 0;
+        }
+        KeyCode::End => {
+            let st = app.fill.as_mut().unwrap();
+            let f = &mut st.fields[st.cur];
+            f.cursor = f.value.len();
+        }
+        KeyCode::Backspace => {
+            let st = app.fill.as_mut().unwrap();
+            let f = &mut st.fields[st.cur];
+            if f.cursor > 0 {
+                let at = prev_boundary(&f.value, f.cursor);
+                f.value.replace_range(at..f.cursor, "");
+                f.cursor = at;
+                f.edited = true;
+            }
+        }
+        KeyCode::Delete => {
+            let st = app.fill.as_mut().unwrap();
+            let f = &mut st.fields[st.cur];
+            if f.cursor < f.value.len() {
+                let to = next_boundary(&f.value, f.cursor);
+                f.value.replace_range(f.cursor..to, "");
+                f.edited = true;
+            }
+        }
+        KeyCode::Char(c) if !ctrl => {
+            let st = app.fill.as_mut().unwrap();
+            let f = &mut st.fields[st.cur];
+            f.value.insert(f.cursor, c);
+            f.cursor += c.len_utf8();
+            f.edited = true;
+            f.origin = Origin::Empty;
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+/// Break `text` into spans, starting a new `Line` at every newline so
+/// multi-line commands render as they will be pasted.
+fn push_preview(lines: &mut Vec<Line<'static>>, cur: &mut Vec<Span<'static>>, text: &str, style: Style) {
+    let mut first = true;
+    for part in text.split('\n') {
+        if !first {
+            lines.push(Line::from(std::mem::take(cur)));
+        }
+        first = false;
+        if !part.is_empty() {
+            cur.push(Span::styled(part.to_string(), style));
+        }
+    }
+}
+
+/// The live command preview: the original text with every slot substituted, the
+/// focused field's occurrences picked out in reverse video.
+fn fill_preview_lines(st: &FillState) -> Vec<Line<'static>> {
+    let plain = Style::default().fg(C_TITLE);
+    let filled = Style::default().fg(C_ACCENT);
+    let focused = Style::default()
+        .fg(C_FG_BRIGHT)
+        .bg(C_HIGHLIGHT_BG)
+        .add_modifier(Modifier::BOLD);
+    let empty = Style::default().fg(C_DIM).add_modifier(Modifier::ITALIC);
+
+    let mut lines: Vec<Line> = Vec::new();
+    let mut cur: Vec<Span> = Vec::new();
+    let mut at = 0usize;
+    for slot in &st.slots {
+        if slot.start > at {
+            push_preview(&mut lines, &mut cur, &st.cmd[at..slot.start], plain);
+        }
+        let f = &st.fields[slot.field];
+        let (text, style) = if f.value.is_empty() {
+            (format!("«{}»", f.label), empty)
+        } else if slot.field == st.cur {
+            (f.value.clone(), focused)
+        } else {
+            (f.value.clone(), filled)
+        };
+        push_preview(&mut lines, &mut cur, &text, style);
+        at = slot.end;
+    }
+    if at < st.cmd.len() {
+        push_preview(&mut lines, &mut cur, &st.cmd[at..], plain);
+    }
+    lines.push(Line::from(cur));
+    lines
+}
+
+const FILL_PREVIEW_MAX: u16 = 8;
+const FILL_FIELDS_MAX: usize = 12;
+
+/// Render the fill modal. Returns nothing; the cursor is placed on the focused
+/// field's value so typing reads naturally.
+fn render_fill(frame: &mut Frame, area: Rect, app: &mut App) {
+    let Some(st) = app.fill.as_mut() else { return };
+
+    let width = area.width.saturating_sub(6).clamp(40, 110);
+    let inner_w = width.saturating_sub(4).max(10);
+
+    let preview = fill_preview_lines(st);
+    // Paragraph wraps, so estimate the wrapped height to size the popup.
+    let preview_h: u16 = preview
+        .iter()
+        .map(|l| {
+            let w = l.width().max(1) as u16;
+            w.div_ceil(inner_w).max(1)
+        })
+        .sum::<u16>()
+        .clamp(1, FILL_PREVIEW_MAX);
+
+    let shown = st.fields.len().min(FILL_FIELDS_MAX);
+    // Keep the focused row inside the window.
+    if st.cur >= st.field_scroll + shown {
+        st.field_scroll = st.cur + 1 - shown;
+    }
+    if st.cur < st.field_scroll {
+        st.field_scroll = st.cur;
+    }
+
+    let height = (preview_h + shown as u16 + 4).min(area.height.saturating_sub(2).max(7));
+    let popup = centered_rect(width, height, area);
+
+    let filled_n = st.fields.iter().filter(|f| !f.value.is_empty()).count();
+    let title = format!(" Fill  ·  {}/{} set ", filled_n, st.fields.len());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(C_ACCENT))
+        .padding(Padding::new(1, 1, 0, 0))
+        .title(title)
+        .title_alignment(Alignment::Center);
+    let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+
+    let rows = Layout::vertical([
+        Constraint::Length(preview_h),
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+
+    frame.render_widget(
+        Paragraph::new(preview).wrap(Wrap { trim: false }),
+        rows[0],
+    );
+
+    // ── field rows ────────────────────────────────────────────────────
+    let label_w = st
+        .fields
+        .iter()
+        .map(|f| f.label.chars().count())
+        .max()
+        .unwrap_or(6)
+        .clamp(6, 18);
+    let hint_w = 15usize;
+    let value_w = (rows[2].width as usize).saturating_sub(2 + label_w + 1 + hint_w + 1);
+
+    let mut items: Vec<Line> = Vec::new();
+    for (i, f) in st
+        .fields
+        .iter()
+        .enumerate()
+        .skip(st.field_scroll)
+        .take(shown)
+    {
+        let focused = i == st.cur;
+        let marker = if focused { "▸ " } else { "  " };
+        let label_style = if focused {
+            Style::default().fg(C_FG_BRIGHT).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(C_DIM)
+        };
+        let (value_text, value_style) = if f.value.is_empty() {
+            (
+                "—".to_string(),
+                Style::default().fg(C_GUIDE).add_modifier(Modifier::ITALIC),
+            )
+        } else {
+            (
+                f.value.clone(),
+                Style::default().fg(if focused { C_FG_BRIGHT } else { C_TITLE }),
+            )
+        };
+        let shown_value: String = value_text.chars().take(value_w.max(4)).collect();
+        let pad = value_w.saturating_sub(shown_value.chars().count());
+
+        // For host-derived values the useful hint is *which* target, and the
+        // short name identifies it better than the full FQDN in 15 columns.
+        let mut hint = f.origin.label().to_string();
+        if f.origin == Origin::Hosts {
+            if let Some(t) = st.targets.get(st.target_idx) {
+                hint = if t.short.is_empty() {
+                    t.display().to_string()
+                } else {
+                    t.short.clone()
+                };
+            }
+        }
+        let counter = if f.suggestions.len() > 1 {
+            format!(" {}/{}", f.sugg_idx + 1, f.suggestions.len())
+        } else {
+            String::new()
+        };
+        // Trim the name, not the counter — the tail is the part worth keeping.
+        let room = hint_w.saturating_sub(counter.chars().count());
+        if hint.chars().count() > room {
+            hint = hint.chars().take(room.saturating_sub(1)).collect::<String>() + "…";
+        }
+        let hint = format!("{hint}{counter}");
+
+        items.push(Line::from(vec![
+            Span::styled(
+                marker,
+                Style::default().fg(if focused { C_ACCENT } else { C_BORDER }),
+            ),
+            Span::styled(format!("{:<w$} ", f.label, w = label_w), label_style),
+            Span::styled(shown_value, value_style),
+            Span::raw(" ".repeat(pad + 1)),
+            Span::styled(format!("{hint:>hint_w$}"), Style::default().fg(C_GUIDE)),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(items), rows[2]);
+
+    // ── hint bar ──────────────────────────────────────────────────────
+    let last = st.cur + 1 >= st.fields.len();
+    let advance = if last { "⏎ copy & exit" } else { "⏎ next" };
+    let target_hint = if st.targets.len() > 1 {
+        format!(" · ^T target ({}/{})", st.target_idx + 1, st.targets.len())
+    } else {
+        String::new()
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!("{advance} · ⇥ move · ^P/^N suggest{target_hint} · ^Y copy now · Esc cancel"),
+            Style::default().fg(C_DIM),
+        )))
+        .alignment(Alignment::Center),
+        rows[3],
+    );
+
+    // ── cursor on the focused value ───────────────────────────────────
+    if st.cur >= st.field_scroll && st.cur < st.field_scroll + shown {
+        let f = &st.fields[st.cur];
+        let col = f.value[..f.cursor].chars().count().min(value_w.max(4));
+        let x = rows[2].x + 2 + label_w as u16 + 1 + col as u16;
+        let y = rows[2].y + (st.cur - st.field_scroll) as u16;
+        if x < rows[2].x + rows[2].width && y < rows[2].y + rows[2].height {
+            frame.set_cursor_position(Position::new(x, y));
+        }
     }
 }
