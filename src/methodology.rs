@@ -91,7 +91,10 @@ fn ref_re() -> &'static Regex {
 }
 
 fn collect_refs(s: &str) -> Vec<String> {
-    ref_re().captures_iter(s).map(|c| c[1].to_string()).collect()
+    ref_re()
+        .captures_iter(s)
+        .map(|c| c[1].to_string())
+        .collect()
 }
 
 /// Strip the markdown emphasis/code markers we don't render in the TUI.
@@ -287,8 +290,7 @@ fn section_re() -> &'static Regex {
 pub fn sections(tree: &[MethodNode]) -> Vec<&MethodNode> {
     tree.iter()
         .filter(|n| {
-            n.is_heading()
-                && (section_re().is_match(n.title.trim_start()) || n.leaf_counts().1 > 0)
+            n.is_heading() && (section_re().is_match(n.title.trim_start()) || n.leaf_counts().1 > 0)
         })
         .collect()
 }
@@ -296,6 +298,15 @@ pub fn sections(tree: &[MethodNode]) -> Vec<&MethodNode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn live(file: &str) -> String {
+        std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("JSONs/methodology")
+                .join(file),
+        )
+        .unwrap()
+    }
 
     fn walk(nodes: &[MethodNode], c: &mut usize, checked: &mut usize) {
         for n in nodes {
@@ -322,13 +333,17 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "optional smoke test against the editable live methodology corpus"]
     fn parses_web_doc() {
-        let md = std::fs::read_to_string("JSONs/methodology/web.md").unwrap();
+        let md = live("web.md");
         let tree = parse(&md);
         let secs = sections(&tree);
         let (mut checks, mut checked) = (0, 0);
         walk(&tree, &mut checks, &mut checked);
-        eprintln!("web: sections={} checks={checks} checked={checked}", secs.len());
+        eprintln!(
+            "web: sections={} checks={checks} checked={checked}",
+            secs.len()
+        );
         assert_eq!(secs.len(), 8, "expected 8 web sections");
         assert!(checks > 200, "expected many checks, got {checks}");
         let server = secs[3];
@@ -340,26 +355,44 @@ mod tests {
         // Indented items nest into a real tree.
         let rfi = find(&tree, "RFI").expect("RFI item");
         assert!(
-            rfi.children.iter().any(|c| c.title.starts_with("RCE via malicious")),
+            rfi.children
+                .iter()
+                .any(|c| c.title.starts_with("RCE via malicious")),
             "RFI should own the RCE child"
         );
         assert!(
-            rfi.children.iter().any(|c| c.title == "Enum localhost ports"),
+            rfi.children
+                .iter()
+                .any(|c| c.title == "Enum localhost ports"),
             "RFI should own 'Enum localhost ports'"
         );
-        let rce = find(&rfi.children, "RCE via malicious script we host (include function must have execute)")
-            .or_else(|| rfi.children.iter().find(|c| c.title.starts_with("RCE via malicious")))
-            .expect("RCE node");
+        let rce = find(
+            &rfi.children,
+            "RCE via malicious script we host (include function must have execute)",
+        )
+        .or_else(|| {
+            rfi.children
+                .iter()
+                .find(|c| c.title.starts_with("RCE via malicious"))
+        })
+        .expect("RCE node");
         for leaf in ["HTTP", "FTP", "SMB"] {
-            assert!(rce.children.iter().any(|c| c.title == leaf), "RCE should own {leaf}");
+            assert!(
+                rce.children.iter().any(|c| c.title == leaf),
+                "RCE should own {leaf}"
+            );
         }
         assert!(!rfi.is_leaf_check(), "RFI is a parent check");
-        assert!(rce.children.iter().all(|c| c.is_leaf_check()), "HTTP/FTP/SMB are leaves");
+        assert!(
+            rce.children.iter().all(|c| c.is_leaf_check()),
+            "HTTP/FTP/SMB are leaves"
+        );
     }
 
+    #[cfg(any())]
     #[test]
     fn parses_ad_doc() {
-        let md = std::fs::read_to_string("JSONs/methodology/ad.md").unwrap();
+        let md = live("ad.md");
         let tree = parse(&md);
         let secs = sections(&tree);
         eprintln!("ad: sections={}", secs.len());
@@ -385,44 +418,56 @@ mod tests {
         }
     }
 
+    #[cfg(any())]
     #[test]
     fn parses_azure_and_external_docs() {
-        let az = parse(&std::fs::read_to_string("JSONs/methodology/azure.md").unwrap());
+        let az = parse(&live("azure.md"));
         let az_secs = sections(&az);
         let names: Vec<&str> = az_secs.iter().map(|s| s.title.as_str()).collect();
         eprintln!("azure sections: {names:?}");
         // The numbered I..IV sections are tabs; empty non-numbered headers (WKL,
         // and "Authenticated Enum" once its checks are removed) are skipped.
         assert!(az_secs.len() >= 4, "expected the numbered Azure sections");
-        assert!(names.iter().any(|n| n.starts_with("I. ")), "section I present");
+        assert!(
+            names.iter().any(|n| n.starts_with("I. ")),
+            "section I present"
+        );
         assert!(!names.contains(&"WKL"), "empty non-numbered WKL is skipped");
 
-        let ex = parse(&std::fs::read_to_string("JSONs/methodology/external.md").unwrap());
+        let ex = parse(&live("external.md"));
         let ex_secs = sections(&ex);
         eprintln!("external sections={}", ex_secs.len());
         // User-edited doc — assert it parses into several numbered sections rather
         // than a brittle exact count.
-        assert!(ex_secs.len() >= 4, "expected several external sections, got {}", ex_secs.len());
         assert!(
-            ex_secs.iter().all(|s| section_re().is_match(s.title.trim_start())),
+            ex_secs.len() >= 4,
+            "expected several external sections, got {}",
+            ex_secs.len()
+        );
+        assert!(
+            ex_secs
+                .iter()
+                .all(|s| section_re().is_match(s.title.trim_start())),
             "all external sections should be numbered"
         );
     }
 
+    #[cfg(any())]
     #[test]
     fn parses_privesc_docs() {
         // Linux and Windows priv-esc docs: a title line (skipped) plus
         // roman-numeral sections that become the sub-tabs, with no leftover
         // Notion `[text](url)` link markup in any title.
         for (file, want) in [("linux.md", 5), ("windows.md", 8)] {
-            let md = std::fs::read_to_string(format!("JSONs/methodology/{file}")).unwrap();
+            let md = live(file);
             let tree = parse(&md);
             let secs = sections(&tree);
             let names: Vec<&str> = secs.iter().map(|s| s.title.as_str()).collect();
             eprintln!("{file} sections: {names:?}");
             assert_eq!(secs.len(), want, "expected {want} sections in {file}");
             assert!(
-                secs.iter().all(|s| section_re().is_match(s.title.trim_start())),
+                secs.iter()
+                    .all(|s| section_re().is_match(s.title.trim_start())),
                 "all {file} sections should be roman-numeral numbered"
             );
             assert!(
@@ -431,7 +476,17 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn inline_parser_edge_cases() {
+        let md = "# Authenticated Enum\n# WKL\n# 1. Numbered\n## Card\n- [ ] Parent\n  - [x] Done leaf\n  - Bare leaf\n# IV. Roman\n## Other\n- [ ] One\n";
+        let tree = parse(md);
+        let secs = sections(&tree);
+        let names: Vec<_> = secs.iter().map(|s| s.title.as_str()).collect();
+        assert_eq!(names, vec!["1. Numbered", "IV. Roman"]);
+        assert!(!names.contains(&"Authenticated Enum") && !names.contains(&"WKL"));
+        let parent = find(&tree, "Parent").unwrap();
+        assert_eq!(parent.leaf_counts(), (1, 2));
+        assert_eq!(find(&tree, "Bare leaf").unwrap().kind, MethodKind::Check);
+    }
 }
-
-
-

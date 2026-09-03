@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet},
     ffi::OsStr,
     fs::{self, OpenOptions},
@@ -9,13 +10,22 @@ use std::{
 use strum::Display;
 
 use color_eyre::{Result, eyre::WrapErr, eyre::eyre};
+use crossterm::{
+    cursor::{Hide, Show},
+    execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+};
 use rand::RngExt;
 use ratatui::widgets::ListState;
+use ratatui::{Terminal, backend::CrosstermBackend};
 use serde::{Deserialize, Serialize};
 mod fill;
+mod keys;
 mod methodology;
+mod profile;
 mod score;
 mod ui;
+mod usage;
 
 use methodology::MethodNode;
 
@@ -88,6 +98,12 @@ pub struct Entry {
     pub favorite: bool,
 }
 
+impl Default for Entry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Entry {
     pub fn new() -> Self {
         Self {
@@ -124,7 +140,11 @@ fn build_vocab(entries: &[Entry]) -> Vec<String> {
         // The binary name (first token, path stripped) is prime completion fodder.
         if let Some(first) = e.cmd.split_whitespace().next() {
             let tool = first.rsplit('/').next().unwrap_or(first);
-            if tool.len() >= 2 && tool.chars().all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.')) {
+            if tool.len() >= 2
+                && tool
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            {
                 *counts.entry(tool.to_lowercase()).or_insert(0) += 3;
             }
         }
@@ -162,6 +182,7 @@ where
     std::result::Result::Ok(steps.into_iter().map(|s| s.entry_id).collect())
 }
 
+#[allow(clippy::ptr_arg)] // serde's `serialize_with` passes the declared Vec field.
 fn serialize_steps<S>(steps: &Vec<String>, serializer: S) -> std::result::Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
@@ -199,12 +220,16 @@ pub struct ImportReport {
     pub errors: Vec<(usize, String)>,
 }
 
-#[derive(Debug, Display)]
+#[derive(Debug, Display, Clone, Copy, PartialEq, Eq)]
 pub enum SearchMode {
     CMD,
     HEADING,
     TITLE,
     ALL,
+    /// Matches the same fields as `ALL`, but ranks what you have actually run
+    /// first (see [`usage::frecency`]). With an empty query it shows only used
+    /// commands, so launching straight into it answers "what was I doing".
+    RECENT,
 }
 
 /// One methodology document, loaded from a JSONs/methodology/*.md file. Fully
@@ -213,6 +238,7 @@ pub struct MethodDoc {
     pub name: String,
     pub path: PathBuf,
     pub tree: Vec<MethodNode>,
+    pub revision: u64,
 }
 
 /// Saved view position within a single section of a document — the card, the
@@ -274,6 +300,9 @@ pub struct App {
     pub right_split_pct: u16,
     /// Whether the ⌘F file-filter popup is open.
     pub file_filter_active: bool,
+    /// Whether the ⇥ search-mode picker popup is open. It replaces the old
+    /// blind Tab cycle: the modes are numbered, exactly like the file filter.
+    pub mode_popup_active: bool,
     /// Browse tab: same nav-vs-input focus for the folder filter.
     pub browse_nav: bool,
     /// Methodology jump palette: nav-vs-input focus while `/` is active.
@@ -331,11 +360,38 @@ pub struct App {
     /// Where remembered variable values live (`JSONs/vars.json`). Unlike the
     /// `/tmp/prev_*` view state, these should survive a reboot.
     pub vars_path: PathBuf,
+    /// The `JSONs/` root, kept so profiles can be enumerated and switched.
+    pub jsons_dir: PathBuf,
     /// The open fill-in-the-blanks modal, if any. Modal over every tab.
     pub fill: Option<Box<fill::FillState>>,
     /// Machine-derived variable sources (sticky store, /etc/hosts, shell
     /// history, env, local tunnel IP). Built lazily on the first fill.
     pub var_ctx: Option<fill::VarContext>,
+    pub print_result: bool,
+    pub result: Option<String>,
+    pub recent: Vec<usage::Use>,
+    pub recall: HashMap<String, HashMap<String, String>>,
+    /// Age-weighted usage score per entry id, powering `SearchMode::RECENT`.
+    pub frecency: HashMap<String, i64>,
+    /// Active engagement profile: scopes `vars.json`, the usage log, and the
+    /// `env.sh` export. `default` maps to the original unscoped paths.
+    pub profile: String,
+    /// The Ctrl+P profile switcher, when open.
+    pub profile_ui: Option<profile::ProfileUi>,
+    pub recents_active: bool,
+    pub recent_sel: usize,
+    pub help_active: bool,
+    pub help_scroll: usize,
+    pub method_return: Option<(usize, usize, usize, Option<usize>)>,
+    pub loaded_cmd_files: HashSet<PathBuf>,
+    pub loaded_chain_files: HashSet<PathBuf>,
+    pub(crate) method_rows_cache: RefCell<HashMap<String, Vec<ui::MethodRow>>>,
+    pub(crate) jump_vocab_cache: RefCell<HashMap<(usize, u64), Vec<String>>>,
+    /// Memo for filesystem path completion in the fill modal, keyed by the
+    /// typed value. `fill_completion` runs from both the key handler and the
+    /// renderer, so without this a `read_dir` + sort of a SecLists directory
+    /// happens on every frame.
+    pub(crate) path_cache: RefCell<Option<(String, Option<String>)>>,
     pub dirty: bool,
 }
 
@@ -399,7 +455,14 @@ impl App {
                     let card = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
                     let tree_sel = it.next().and_then(|s| s.parse::<usize>().ok());
                     let focus = it.next() == Some("1");
-                    method_pos.insert((d, s), MethodPos { card, tree_sel, focus });
+                    method_pos.insert(
+                        (d, s),
+                        MethodPos {
+                            card,
+                            tree_sel,
+                            focus,
+                        },
+                    );
                 }
             }
         }
@@ -419,7 +482,10 @@ impl App {
             })
             .collect();
         let method_section = method_doc_section.get(method_doc).copied().unwrap_or(0);
-        let active_pos = method_pos.get(&(method_doc, method_section)).cloned().unwrap_or_default();
+        let active_pos = method_pos
+            .get(&(method_doc, method_section))
+            .cloned()
+            .unwrap_or_default();
         let method_card = active_pos.card;
         let method_focus = active_pos.focus;
         let mut method_tree_state = ListState::default();
@@ -430,6 +496,7 @@ impl App {
             "CMD" => SearchMode::CMD,
             "HEADING" => SearchMode::HEADING,
             "TITLE" => SearchMode::TITLE,
+            "RECENT" => SearchMode::RECENT,
             _ => SearchMode::ALL,
         };
         let saved_expanded: HashSet<String> = browse_lines
@@ -477,18 +544,23 @@ impl App {
             .collect();
         let vocab = build_vocab(&entries);
         let index = score::build_index(&entries);
+        let jsons_dir = cmds_dir.parent().unwrap_or(&cmds_dir).to_path_buf();
+        let profile = profile::active(&jsons_dir);
+        let recent = usage::load(&profile);
+        let recall = usage::recall(&recent);
+        let frecency = usage::frecency(&recent);
         Self {
             entries,
             vocab,
             index,
             query: fs::read_to_string(get_prev_search_path())
-                .unwrap_or(String::new())
+                .unwrap_or_default()
                 .lines()
                 .nth(0)
                 .unwrap_or("")
                 .to_owned(),
             mode: match fs::read_to_string(get_prev_search_path())
-                .unwrap_or(String::new())
+                .unwrap_or_default()
                 .lines()
                 .nth(1)
                 .unwrap_or("ALL")
@@ -496,6 +568,7 @@ impl App {
                 "CMD" => SearchMode::CMD,
                 "HEADING" => SearchMode::HEADING,
                 "TITLE" => SearchMode::TITLE,
+                "RECENT" => SearchMode::RECENT,
                 _ => SearchMode::ALL,
             },
             top_tab: saved_top_tab,
@@ -527,7 +600,7 @@ impl App {
             file_selected,
             results: vec![],
             cursor_index: fs::read_to_string(get_prev_search_path())
-                .unwrap_or(String::new())
+                .unwrap_or_default()
                 .lines()
                 .nth(0)
                 .unwrap_or("")
@@ -544,11 +617,30 @@ impl App {
             main_split_pct: 60,
             right_split_pct: 60,
             file_filter_active: false,
-            vars_path: cmds_dir.parent().unwrap_or(&cmds_dir).join("vars.json"),
+            mode_popup_active: false,
+            vars_path: profile::vars_path(&jsons_dir, &profile),
+            jsons_dir,
             cmds_dir,
             chains_dir,
             fill: None,
             var_ctx: None,
+            print_result: false,
+            result: None,
+            recent,
+            recall,
+            frecency,
+            profile,
+            profile_ui: None,
+            recents_active: false,
+            recent_sel: 0,
+            help_active: false,
+            help_scroll: 0,
+            method_return: None,
+            loaded_cmd_files: HashSet::new(),
+            loaded_chain_files: HashSet::new(),
+            method_rows_cache: RefCell::new(HashMap::new()),
+            jump_vocab_cache: RefCell::new(HashMap::new()),
+            path_cache: RefCell::new(None),
             dirty: false,
         }
     }
@@ -576,9 +668,10 @@ impl App {
             .map(|(i, e)| (e.id.clone(), i))
             .collect();
         self.index = score::build_index(&self.entries);
+        self.vocab = build_vocab(&self.entries);
     }
 
-    pub fn sanitize_source_path(&self, raw: &PathBuf) -> PathBuf {
+    pub fn sanitize_source_path(&self, raw: &Path) -> PathBuf {
         let filename = raw
             .file_name()
             .unwrap_or_else(|| OsStr::new("unknown-CMDs.json"));
@@ -601,15 +694,9 @@ impl App {
             write_json_atomic(filepath, ef)?;
         }
 
-        if !entries_by_filename.is_empty() {
-            for dir_entry in fs::read_dir(&self.cmds_dir)? {
-                let path = dir_entry?.path();
-                if path.extension() != Some(OsStr::new("json")) {
-                    continue;
-                }
-                if !entries_by_filename.contains_key(&path) {
-                    fs::remove_file(&path)?;
-                }
+        for path in &self.loaded_cmd_files {
+            if !entries_by_filename.contains_key(path) {
+                write_json_atomic(path, &EntriesFile { entries: vec![] })?;
             }
         }
 
@@ -684,11 +771,11 @@ impl App {
         for chain in &self.chains {
             let mut source_entry: Option<&Entry> = None;
             for entry_id in &chain.steps {
-                if let Some(&index) = self.entry_index.get(entry_id) {
-                    if let Some(entry) = self.entries.get(index) {
-                        source_entry = Some(entry);
-                        break;
-                    }
+                if let Some(&index) = self.entry_index.get(entry_id)
+                    && let Some(entry) = self.entries.get(index)
+                {
+                    source_entry = Some(entry);
+                    break;
                 }
             }
             let out_path = match source_entry {
@@ -711,15 +798,9 @@ impl App {
             write_json_atomic(filepath, cf)?;
         }
 
-        if !chains_by_filename.is_empty() && self.chains_dir.exists() {
-            for dir_entry in fs::read_dir(&self.chains_dir)? {
-                let path = dir_entry?.path();
-                if path.extension() != Some(OsStr::new("json")) {
-                    continue;
-                }
-                if !chains_by_filename.contains_key(&path) {
-                    fs::remove_file(&path)?;
-                }
+        for path in &self.loaded_chain_files {
+            if !chains_by_filename.contains_key(path) {
+                write_json_atomic(path, &ChainsFile { chains: vec![] })?;
             }
         }
 
@@ -761,7 +842,10 @@ impl App {
         entry
             .source_file
             .file_stem()
-            .map(|s| self.file_selected.contains(&s.to_string_lossy().into_owned()))
+            .map(|s| {
+                self.file_selected
+                    .contains(&s.to_string_lossy().into_owned())
+            })
             .unwrap_or(false)
     }
 
@@ -769,7 +853,12 @@ impl App {
     pub fn file_filter_label(&self) -> String {
         match self.file_selected.len() {
             0 => "all".to_string(),
-            1 => self.file_selected.iter().next().cloned().unwrap_or_default(),
+            1 => self
+                .file_selected
+                .iter()
+                .next()
+                .cloned()
+                .unwrap_or_default(),
             n => format!("{n} files"),
         }
     }
@@ -818,7 +907,11 @@ impl App {
         // section, `P<doc>:<section>:<card>:<sel>:<foc>` per-section positions,
         // and `C<key>` collapsed-heading keys. The active (doc, section) reflects
         // the live fields.
-        let mut out = format!("{}\nV{}\n", self.method_doc, if self.method_show_comments { 1 } else { 0 });
+        let mut out = format!(
+            "{}\nV{}\n",
+            self.method_doc,
+            if self.method_show_comments { 1 } else { 0 }
+        );
         for i in 0..self.method_docs.len() {
             let sec = if i == self.method_doc {
                 self.method_section
@@ -839,7 +932,14 @@ impl App {
         );
         for ((d, s), p) in &pos {
             let sel = p.tree_sel.map(|n| n.to_string()).unwrap_or_default();
-            out.push_str(&format!("P{}:{}:{}:{}:{}\n", d, s, p.card, sel, if p.focus { 1 } else { 0 }));
+            out.push_str(&format!(
+                "P{}:{}:{}:{}:{}\n",
+                d,
+                s,
+                p.card,
+                sel,
+                if p.focus { 1 } else { 0 }
+            ));
         }
         for k in &self.method_collapsed {
             out.push('C');
@@ -859,16 +959,21 @@ impl App {
 
     /// The active document's source markdown path.
     pub fn method_path(&self) -> Option<&Path> {
-        self.method_docs.get(self.method_doc).map(|d| d.path.as_path())
+        self.method_docs
+            .get(self.method_doc)
+            .map(|d| d.path.as_path())
     }
 
     /// Re-parse the active document from disk (after a checkbox flip or edit).
     pub fn method_reload(&mut self) {
-        if let Some(d) = self.method_docs.get_mut(self.method_doc) {
-            if let Ok(md) = fs::read_to_string(&d.path) {
-                d.tree = methodology::parse(&md);
-            }
+        if let Some(d) = self.method_docs.get_mut(self.method_doc)
+            && let Ok(md) = fs::read_to_string(&d.path)
+        {
+            d.tree = methodology::parse(&md);
+            d.revision = d.revision.wrapping_add(1);
         }
+        self.method_rows_cache.borrow_mut().clear();
+        self.jump_vocab_cache.borrow_mut().clear();
     }
 }
 
@@ -877,12 +982,177 @@ fn print_usage() {
         "f1nder — typo-tolerant search / browse / methodology for pentest commands\n\n\
          Usage:\n  \
          f1nder                 launch the TUI\n  \
+         f1nder --print         TUI on /dev/tty; print selection to stdout\n  \
+         f1nder --shell-init [zsh|bash]  print shell integration to eval\n  \
          f1nder --import FILE   bulk-import cmd-maker template blocks from FILE\n  \
          f1nder --help          show this help\n\n\
          --import (-i) reads a file of `--- TITLE ---` … `--- COMMANDS ---` blocks,\n\
          routes each to JSONs/cmds/<SOURCE-FILE>-CMDs.json, and skips duplicates.\n\
          --audit-vars prints what the fill-in-the-blanks detector finds per source file."
     );
+}
+
+/// zsh integration. Two entry points, because there are two ways to reach the
+/// TUI and they need different plumbing:
+///
+/// * The `f1nder` function shadows the binary, so simply *running* `f1nder` puts
+///   the chosen command on your next prompt via `print -z` — the shell owns the
+///   line editor, so nothing but the shell can write to it, and `print -z` is
+///   the supported way to hand it a line.
+/// * The `^G` widget does the same from inside an existing prompt (fzf-style),
+///   keeping whatever you had already typed out of the way.
+///
+/// Neither runs anything: the command lands unrun with the cursor at its end.
+const ZSH_INIT: &str = r#"# f1nder shell integration
+# add to ~/.zshrc:  eval "$(__F1NDER__ --shell-init zsh)"
+f1nder() {
+  local out
+  out="$(__F1NDER__ --print "$@")" || return
+  [[ -n $out ]] && print -z -- "$out"
+}
+# Guarded, because a shell with no line editor (zsh -c, a script) cannot take
+# a widget and would print an error on every start.
+if [[ -o zle ]]; then
+  f1nder-widget() {
+    local out
+    out="$(__F1NDER__ --print)" || return
+    if [[ -n $out ]]; then
+      BUFFER=$out
+      CURSOR=${#BUFFER}
+    fi
+    zle reset-prompt
+  }
+  zle -N f1nder-widget
+  bindkey '^G' f1nder-widget
+fi
+# Launching the binary by path instead of through the wrapper (./f1nder, a tmux
+# binding, an alias) skips --print entirely, so it leaves the copied command in
+# a file named after this shell. Pick it up, once, and delete it.
+_f1nder_precmd() {
+  local -a f
+  f=("${XDG_CACHE_HOME:-$HOME/.cache}"/f1nder/prompt-$$.cmd(Nmm-5))
+  (( $#f )) || return
+  local cmd="$(<$f[1])"
+  command rm -f -- "$f[1]"
+  [[ -n $cmd ]] && print -z -- "$cmd"
+}
+typeset -ga precmd_functions
+(( $precmd_functions[(I)_f1nder_precmd] )) || precmd_functions+=(_f1nder_precmd)
+"#;
+
+/// bash integration. bash has no `print -z` equivalent, so the plain-invocation
+/// wrapper pushes the command into history instead — one Up-arrow away, still
+/// unrun. The `^G` readline widget is the exact analogue of the zsh one.
+const BASH_INIT: &str = r#"# f1nder shell integration
+# add to ~/.bashrc:  eval "$(__F1NDER__ --shell-init bash)"
+f1nder() {
+  local out
+  out="$(__F1NDER__ --print "$@")" || return
+  [[ -n $out ]] || return
+  history -s "$out"
+  printf '%s\n' "$out"
+}
+# Only an interactive shell has readline to bind into.
+if [[ $- == *i* ]]; then
+  f1nder-widget() {
+    local out
+    out="$(__F1NDER__ --print)" || return
+    if [[ -n $out ]]; then
+      READLINE_LINE=$out
+      READLINE_POINT=${#READLINE_LINE}
+    fi
+  }
+  bind -x '"\C-g":f1nder-widget'
+fi
+# Same fallback as zsh, but bash has no way to preload the prompt, so the
+# command goes into history instead — one Up-arrow away, still unrun.
+_f1nder_prompt_cmd() {
+  local f="${XDG_CACHE_HOME:-$HOME/.cache}/f1nder/prompt-$$.cmd"
+  [[ -r $f ]] || return
+  local cmd
+  cmd="$(<"$f")"
+  command rm -f -- "$f"
+  [[ -n $cmd ]] && history -s "$cmd"
+}
+case "$PROMPT_COMMAND" in
+  *_f1nder_prompt_cmd*) ;;
+  *) PROMPT_COMMAND="_f1nder_prompt_cmd${PROMPT_COMMAND:+;$PROMPT_COMMAND}" ;;
+esac
+"#;
+
+/// Print the shell snippet to eval. `shell` may be empty, in which case it is
+/// taken from `$SHELL`.
+fn shell_init(shell: &str) -> Result<()> {
+    let shell = if shell.is_empty() {
+        std::env::var("SHELL")
+            .ok()
+            .and_then(|s| PathBuf::from(s).file_name().map(|f| f.to_string_lossy().into_owned()))
+            .unwrap_or_default()
+    } else {
+        shell.to_string()
+    };
+
+    // Reference the running binary by absolute path. It is usually not on
+    // PATH (build.sh drops it in the repo), and the wrapper function shadows
+    // the name `f1nder`, so a bare `f1nder` inside it would recurse.
+    let bin = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "f1nder".to_string());
+
+    let template = match shell.as_str() {
+        "zsh" => ZSH_INIT,
+        "bash" => BASH_INIT,
+        other => {
+            return Err(eyre!(
+                "--shell-init supports zsh and bash (got {:?})",
+                other
+            ));
+        }
+    };
+    print!("{}", template.replace("__F1NDER__", &bin));
+    Ok(())
+}
+
+fn find_root() -> Result<PathBuf> {
+    let mut tried = Vec::new();
+    let mut candidates = Vec::new();
+    if let Some(p) = std::env::var_os("F1NDER_HOME") {
+        candidates.push(PathBuf::from(p));
+    }
+    for start in [
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(Path::to_path_buf)),
+        std::env::current_dir().ok(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        candidates.extend(start.ancestors().take(6).map(Path::to_path_buf));
+    }
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")));
+    if let Some(p) = config {
+        candidates.push(p.join("f1nder"));
+    }
+    for p in candidates {
+        if tried.contains(&p) {
+            continue;
+        }
+        tried.push(p.clone());
+        if p.join("JSONs/cmds").is_dir() {
+            return Ok(p.canonicalize().unwrap_or(p));
+        }
+    }
+    Err(eyre!(
+        "Cannot find F1nder data root. Tried:\n{}",
+        tried
+            .iter()
+            .map(|p| format!("  {}", p.display()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    ))
 }
 
 fn main() -> Result<()> {
@@ -893,13 +1163,17 @@ fn main() -> Result<()> {
     let mut import_file: Option<PathBuf> = None;
     let mut audit_vars = false;
     let mut audit_filter: Option<String> = None;
+    let mut print_result = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--audit-vars" => audit_vars = true,
-            other if audit_vars && audit_filter.is_none() => {
-                audit_filter = Some(other.to_string())
+            "--print" => print_result = true,
+            "--shell-init" => {
+                // The shell name is optional; without it we read $SHELL.
+                return shell_init(&args.next().unwrap_or_default());
             }
+            "--audit-vars" => audit_vars = true,
+            other if audit_vars && audit_filter.is_none() => audit_filter = Some(other.to_string()),
             "-h" | "--help" => {
                 print_usage();
                 return Ok(());
@@ -918,13 +1192,7 @@ fn main() -> Result<()> {
         }
     }
 
-    let exe_path = std::env::current_exe()?;
-    let root = exe_path
-        .parent()
-        .and_then(|p| p.parent())
-        .and_then(|p| p.parent())
-        .ok_or_else(|| eyre!("Could not determine root path from executable location"))?
-        .canonicalize()?;
+    let root = find_root()?;
 
     let cmds_dir = root.join("JSONs/cmds");
     let chains_dir = root.join("JSONs/chains");
@@ -938,12 +1206,14 @@ fn main() -> Result<()> {
     }
 
     let mut entries: Vec<Entry> = Vec::new();
+    let mut loaded_cmd_files = HashSet::new();
     for dir_entry in fs::read_dir(&cmds_dir)? {
         let path = dir_entry?.path();
         if path.extension() != Some(OsStr::new("json")) {
             continue;
         }
         let text = fs::read_to_string(&path)?;
+        loaded_cmd_files.insert(path.clone());
         let ef: EntriesFile = serde_json::from_str(&text)
             .wrap_err_with(|| format!("corrupt commands file: {}", path.display()))?;
         for mut e in ef.entries {
@@ -974,12 +1244,14 @@ fn main() -> Result<()> {
     }
 
     let mut chains: Vec<Chain> = Vec::new();
+    let mut loaded_chain_files = HashSet::new();
     for dir_entry in fs::read_dir(&chains_dir)? {
         let path = dir_entry?.path();
         if path.extension() != Some(OsStr::new("json")) {
             continue;
         }
         let text = fs::read_to_string(&path)?;
+        loaded_chain_files.insert(path.clone());
         let cf: ChainsFile = serde_json::from_str(&text)
             .wrap_err_with(|| format!("corrupt chains file: {}", path.display()))?;
         chains.extend(cf.chains);
@@ -1021,6 +1293,7 @@ fn main() -> Result<()> {
                     name,
                     path,
                     tree: methodology::parse(&md),
+                    revision: 0,
                 });
             }
         }
@@ -1029,10 +1302,14 @@ fn main() -> Result<()> {
             name: "METHODOLOGY".to_string(),
             path: root.join("JSONs/methodology.md"),
             tree: methodology::parse(&md),
+            revision: 0,
         });
     }
 
     let mut app = App::new(entries, chains, cmds_dir, chains_dir, method_docs);
+    app.loaded_cmd_files = loaded_cmd_files;
+    app.loaded_chain_files = loaded_chain_files;
+    app.print_result = print_result;
     // Persist the cleaned-up chains on quit if load had to heal stale steps.
     if chains_healed {
         app.dirty = true;
@@ -1065,7 +1342,28 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    ratatui::run(|terminal| ui::run_event_loop(terminal, &mut app))?;
+    if print_result {
+        match OpenOptions::new().read(true).write(true).open("/dev/tty") {
+            Ok(tty) => {
+                let mut writer = tty.try_clone()?;
+                enable_raw_mode()?;
+                execute!(writer, EnterAlternateScreen, Hide)?;
+                let backend = CrosstermBackend::new(tty);
+                let mut terminal = Terminal::new(backend)?;
+                let run = ui::run_event_loop(&mut terminal, &mut app);
+                disable_raw_mode()?;
+                execute!(writer, LeaveAlternateScreen, Show)?;
+                run?;
+            }
+            Err(e) => {
+                eprintln!("f1nder: cannot open /dev/tty ({e}); falling back to clipboard mode");
+                app.print_result = false;
+                ratatui::run(|terminal| ui::run_event_loop(terminal, &mut app))?;
+            }
+        }
+    } else {
+        ratatui::run(|terminal| ui::run_event_loop(terminal, &mut app))?;
+    }
 
     if app.dirty {
         app.write_entries_to_json()?;
@@ -1074,6 +1372,10 @@ fn main() -> Result<()> {
     app.save_prev_search();
     app.save_prev_browse();
     app.save_prev_method();
+
+    if print_result && let Some(result) = app.result.take() {
+        println!("{result}");
+    }
 
     Ok(())
 }
@@ -1107,5 +1409,21 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         let _ = fs::remove_file(&tmp);
         return Err(e.into());
     }
+    Ok(())
+}
+
+pub fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let tmp = path.with_extension(format!(
+        "{}.tmp",
+        path.extension().and_then(OsStr::to_str).unwrap_or("data")
+    ));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    fs::rename(&tmp, path)?;
     Ok(())
 }

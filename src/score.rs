@@ -21,6 +21,8 @@
 //! The all-words gate is unchanged: every query word must match something, or
 //! the entry is dropped. A fuzzy hit counts as a match.
 
+use std::collections::HashMap;
+
 use crate::{Entry, SearchMode};
 
 /// Scores are fixed-point with two implied decimals, so the coverage-scaled
@@ -350,7 +352,7 @@ fn fields_for<'a>(ix: &'a EntryIndex, mode: &SearchMode) -> Vec<(&'a FieldIndex,
             (&ix.tool, 80_000, 0, true),
             (&ix.cmd, 40_000, ADJ_CMD, true),
         ],
-        SearchMode::ALL => vec![
+        SearchMode::ALL | SearchMode::RECENT => vec![
             (&ix.title, W_TITLE, ADJ_TITLE, true),
             (&ix.tool, W_TOOL, 0, true),
             (&ix.heading, W_HEADING, ADJ_HEADING, true),
@@ -399,37 +401,57 @@ pub fn rank<F>(
     index: &[EntryIndex],
     query: &str,
     mode: &SearchMode,
+    frecency: &HashMap<String, i64>,
     keep: F,
 ) -> Vec<usize>
 where
     F: Fn(&Entry) -> bool,
 {
+    // In RECENT mode usage leads the ordering, so favorites drop to a tiebreak
+    // and unused commands sink below used ones instead of being filtered out.
+    let by_use = matches!(mode, SearchMode::RECENT);
+    let used = |i: usize| frecency.get(&entries[i].id).copied().unwrap_or(0);
+
     let tokens = query_tokens(query);
     if tokens.is_empty() {
-        let mut results: Vec<usize> = (0..entries.len()).filter(|&i| keep(&entries[i])).collect();
-        results.sort_by_key(|&i| !entries[i].favorite);
+        let mut results: Vec<usize> = (0..entries.len())
+            .filter(|&i| keep(&entries[i]))
+            // An empty query in RECENT mode means "show me my history", so
+            // anything never run is noise rather than a low-ranked match.
+            .filter(|&i| !by_use || used(i) > 0)
+            .collect();
+        if by_use {
+            results.sort_by(|&a, &b| used(b).cmp(&used(a)).then(a.cmp(&b)));
+        } else {
+            results.sort_by_key(|&i| !entries[i].favorite);
+        }
         return results;
     }
 
-    let mut scored: Vec<(usize, bool, usize, i64)> = Vec::new();
+    let mut scored: Vec<(usize, bool, usize, i64, i64)> = Vec::new();
     for (i, entry) in entries.iter().enumerate() {
         if !keep(entry) {
             continue;
         }
         let Some(ix) = index.get(i) else { continue };
         if let Some((fuzzy, score)) = score_entry(ix, &tokens, mode) {
-            scored.push((i, entry.favorite, fuzzy, score));
+            scored.push((i, entry.favorite, fuzzy, score, used(i)));
         }
     }
 
     // Favorites first (they're already all-words-relevant since they matched),
     // then literal matches ahead of typo matches, then by score.
     scored.sort_by(|a, b| {
-        b.1.cmp(&a.1)
-            .then(a.2.cmp(&b.2))
-            .then(b.3.cmp(&a.3))
+        if by_use {
+            b.4.cmp(&a.4)
+                .then(b.1.cmp(&a.1))
+                .then(a.2.cmp(&b.2))
+                .then(b.3.cmp(&a.3))
+        } else {
+            b.1.cmp(&a.1).then(a.2.cmp(&b.2)).then(b.3.cmp(&a.3))
+        }
     });
-    scored.into_iter().map(|(i, _, _, _)| i).collect()
+    scored.into_iter().map(|(i, ..)| i).collect()
 }
 
 /// The filter-only gate shared by the Browse tab and the methodology jump
@@ -494,7 +516,7 @@ mod tests {
     fn titles(query: &str) -> Vec<String> {
         let e = corpus();
         let ix = build_index(&e);
-        rank(&e, &ix, query, &SearchMode::ALL, |_| true)
+        rank(&e, &ix, query, &SearchMode::ALL, &HashMap::new(), |_| true)
             .into_iter()
             .map(|i| e[i].title.clone())
             .collect()
@@ -599,11 +621,11 @@ mod tests {
             &["Lateral Movement", "Linux"],
         ));
         let ix = build_index(&e);
-        let hit = rank(&e, &ix, "evilwinrm", &SearchMode::ALL, |_| true);
+        let hit = rank(&e, &ix, "evilwinrm", &SearchMode::ALL, &HashMap::new(), |_| true);
         assert_eq!(hit.len(), 1);
         assert_eq!(e[hit[0]].title, "Connect over WinRM with Evil-WinRM");
         // and the way it is actually written
-        assert_eq!(rank(&e, &ix, "evil-winrm", &SearchMode::ALL, |_| true), hit);
+        assert_eq!(rank(&e, &ix, "evil-winrm", &SearchMode::ALL, &HashMap::new(), |_| true), hit);
     }
 
     #[test]
@@ -611,7 +633,7 @@ mod tests {
         let mut e = corpus();
         e[0].favorite = true;
         let ix = build_index(&e);
-        let out = rank(&e, &ix, "writable", &SearchMode::ALL, |_| true);
+        let out = rank(&e, &ix, "writable", &SearchMode::ALL, &HashMap::new(), |_| true);
         assert_eq!(out[0], 0);
     }
 

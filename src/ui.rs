@@ -6,6 +6,7 @@ use std::fs;
 use std::io::stdout;
 use std::path::{Path, PathBuf};
 
+use crate::keys::{self, Scope};
 use crate::methodology::{MethodKind, MethodNode};
 use crate::score;
 use crate::{App, Chain, Entry, MethodPos, SearchMode, SearchPane, TreeNode};
@@ -23,7 +24,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph,
 };
-use ratatui::{DefaultTerminal, Frame};
+use ratatui::{Frame, Terminal, backend::Backend};
+use std::hash::{Hash, Hasher};
 use std::process::Command;
 use std::sync::OnceLock;
 
@@ -58,6 +60,67 @@ const IC_ITEM: &str = "\u{f105}"; //
 
 static EDITOR_TEMP_PATH: OnceLock<String> = OnceLock::new();
 
+struct SuspendedTui {
+    print_mode: bool,
+}
+
+impl SuspendedTui {
+    fn new(print_mode: bool) -> Result<Self> {
+        disable_raw_mode()?;
+        if print_mode {
+            let mut tty = fs::OpenOptions::new().write(true).open("/dev/tty")?;
+            execute!(tty, LeaveAlternateScreen, Show)?;
+        } else {
+            execute!(stdout(), LeaveAlternateScreen, Show)?;
+        }
+        Ok(Self { print_mode })
+    }
+}
+
+impl Drop for SuspendedTui {
+    fn drop(&mut self) {
+        let _ = enable_raw_mode();
+        if self.print_mode {
+            if let Ok(mut tty) = fs::OpenOptions::new().write(true).open("/dev/tty") {
+                let _ = execute!(tty, EnterAlternateScreen, Hide);
+            }
+        } else {
+            let _ = execute!(stdout(), EnterAlternateScreen, Hide);
+        }
+    }
+}
+
+fn with_editor<B: Backend, T>(
+    terminal: &mut Terminal<B>,
+    print_mode: bool,
+    path: &str,
+    line: Option<usize>,
+    initial: &str,
+    f: impl FnOnce(&str) -> Result<T>,
+) -> Result<Option<T>> {
+    fs::write(path, initial)?;
+    let guard = SuspendedTui::new(print_mode)?;
+    let opened = match line {
+        Some(line) => open_editor_at(path, line),
+        None => open_editor(path),
+    };
+    if opened.is_err() {
+        drop(guard);
+        let _ = fs::remove_file(path);
+        terminal
+            .clear()
+            .map_err(|_| eyre!("terminal clear failed"))?;
+        return Ok(None);
+    }
+    let edited = fs::read_to_string(path)?;
+    let _ = fs::remove_file(path);
+    drop(guard);
+    terminal
+        .clear()
+        .map_err(|_| eyre!("terminal clear failed"))?;
+    f(&edited).map(Some)
+}
+
 pub fn get_editor_temp_path() -> &'static str {
     EDITOR_TEMP_PATH.get_or_init(|| {
         #[cfg(target_os = "windows")]
@@ -77,10 +140,12 @@ enum Section {
     SourceFile,
 }
 
-pub fn run_event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> Result<()> {
+pub fn run_event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
     search(app, false);
     loop {
-        terminal.draw(|frame| render(frame, app))?;
+        terminal
+            .draw(|frame| render(frame, app))
+            .map_err(|_| eyre!("terminal draw failed"))?;
         if handle_key_event(app, terminal)? {
             break Ok(());
         }
@@ -111,7 +176,7 @@ fn copy_to_clipboard(text: &str) -> bool {
             }
             return child.wait().map(|s| s.success()).unwrap_or(false);
         }
-        return false;
+        false
     }
 
     #[cfg(target_os = "linux")]
@@ -159,7 +224,7 @@ fn entry_to_template(entry: &Entry) -> String {
     out.push('\n');
 
     out.push_str("--- SOURCE-FILE ---\n");
-    out.push_str(&entry.source_file.to_str().unwrap_or_default());
+    out.push_str(entry.source_file.to_str().unwrap_or_default());
     out.push('\n');
 
     out.push_str("--- COMMANDS ---\n");
@@ -295,18 +360,6 @@ pub fn parse_template_str(
         favorite,
     };
     Ok(new_entry)
-}
-
-fn parse_template(entry_id: &str, app: &App) -> Result<Entry> {
-    let contents = fs::read_to_string(get_editor_temp_path())?;
-    // Preserve the star across an in-place edit (new entries default false).
-    let favorite = app
-        .entry_index
-        .get(entry_id)
-        .and_then(|&i| app.entries.get(i))
-        .map(|e| e.favorite)
-        .unwrap_or(false);
-    parse_template_str(entry_id, &contents, &app.cmds_dir, favorite)
 }
 
 fn open_editor(path: &str) -> std::io::Result<std::process::ExitStatus> {
@@ -505,23 +558,29 @@ fn chain_present(app: &mut App) {
 }
 
 /// Open the given entry in `$EDITOR` via the cmd-maker template and save changes.
-fn edit_command(app: &mut App, terminal: &mut DefaultTerminal, entry_index: usize) -> Result<()> {
+fn edit_command<B: Backend>(
+    app: &mut App,
+    terminal: &mut Terminal<B>,
+    entry_index: usize,
+) -> Result<()> {
     let Some(entry) = app.entries.get(entry_index).cloned() else {
         return Ok(());
     };
-    disable_raw_mode()?;
-    execute!(stdout(), LeaveAlternateScreen, Show)?;
     let out = entry_to_template(&entry);
-    fs::write(get_editor_temp_path(), out)?;
-    let _ = open_editor(get_editor_temp_path());
-    let updated = parse_template(&entry.id, app)?;
+    let Some(updated) = with_editor(
+        terminal,
+        app.print_result,
+        get_editor_temp_path(),
+        None,
+        &out,
+        |text| parse_template_str(&entry.id, text, &app.cmds_dir, entry.favorite),
+    )?
+    else {
+        return Ok(());
+    };
     app.entries[entry_index] = updated;
     app.index[entry_index] = score::index_entry(&app.entries[entry_index]);
     app.dirty = true;
-    let _ = fs::remove_file(get_editor_temp_path());
-    enable_raw_mode()?;
-    execute!(stdout(), EnterAlternateScreen, Hide)?;
-    terminal.clear()?;
     Ok(())
 }
 
@@ -543,10 +602,10 @@ fn file_filter_toggle(app: &mut App, idx: usize) {
         app.file_selected.clear();
         return;
     }
-    if let Some(name) = app.file_filters.get(idx).cloned() {
-        if !app.file_selected.remove(&name) {
-            app.file_selected.insert(name);
-        }
+    if let Some(name) = app.file_filters.get(idx).cloned()
+        && !app.file_selected.remove(&name)
+    {
+        app.file_selected.insert(name);
     }
 }
 
@@ -577,7 +636,392 @@ fn handle_file_filter_key(app: &mut App, key: KeyEvent) -> Result<bool> {
     Ok(false)
 }
 
-fn handle_key_event(app: &mut App, terminal: &mut DefaultTerminal) -> Result<bool> {
+/// The modes the ⇥ picker offers, in display order. `RECENT` ranks by what you
+/// have actually run, which is a Search-tab idea, so the Browse filter is only
+/// offered the four field modes.
+fn mode_options(top_tab: usize) -> &'static [SearchMode] {
+    const MODES: &[SearchMode] = &[
+        SearchMode::ALL,
+        SearchMode::TITLE,
+        SearchMode::HEADING,
+        SearchMode::CMD,
+        SearchMode::RECENT,
+    ];
+    if top_tab == 1 { &MODES[..4] } else { MODES }
+}
+
+/// One-line explanation of what each mode matches, shown beside its number.
+fn mode_desc(mode: SearchMode) -> &'static str {
+    match mode {
+        SearchMode::ALL => "title, heading and command",
+        SearchMode::TITLE => "title only",
+        SearchMode::HEADING => "heading only",
+        SearchMode::CMD => "command only",
+        SearchMode::RECENT => "ranked by what you have run",
+    }
+}
+
+/// Apply a picked mode to whichever tab opened the picker.
+fn set_search_mode(app: &mut App, mode: SearchMode) {
+    if app.top_tab == 1 {
+        app.browse_mode = mode;
+        app.browse_collapsed.clear();
+        app.browse_state.select(Some(0));
+    } else {
+        app.mode = mode;
+        search(app, true);
+    }
+}
+
+/// Modal key handling for the numbered search-mode picker (⇥). A digit picks a
+/// mode and closes the popup; Enter/Esc/⇥ close it leaving the mode alone.
+fn handle_mode_popup_key(app: &mut App, key: KeyEvent) -> Result<bool> {
+    match key.code {
+        KeyCode::Esc | KeyCode::Enter | KeyCode::Tab | KeyCode::BackTab => {
+            app.mode_popup_active = false;
+        }
+        KeyCode::Char(c) if c.is_ascii_digit() => {
+            let opts = mode_options(app.top_tab);
+            if let Some(&mode) = (c.to_digit(10).unwrap() as usize)
+                .checked_sub(1)
+                .and_then(|i| opts.get(i))
+            {
+                set_search_mode(app, mode);
+                app.mode_popup_active = false;
+            }
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+fn recent_indices(app: &App) -> Vec<usize> {
+    let mut seen = HashSet::new();
+    app.recent
+        .iter()
+        .enumerate()
+        .filter_map(|(i, u)| seen.insert(u.entry_id.clone()).then_some(i))
+        .take(20)
+        .collect()
+}
+
+fn handle_recents_key(app: &mut App, key: KeyEvent) -> Result<bool> {
+    let indices = recent_indices(app);
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('r')
+            if key.code == KeyCode::Esc || key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            app.recents_active = false
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.recent_sel = (app.recent_sel + 1).min(indices.len().saturating_sub(1))
+        }
+        KeyCode::Up | KeyCode::Char('k') => app.recent_sel = app.recent_sel.saturating_sub(1),
+        KeyCode::Enter => {
+            if let Some(use_idx) = indices.get(app.recent_sel).copied() {
+                let id = app.recent[use_idx].entry_id.clone();
+                if let Some(&entry_idx) = app.entry_index.get(&id) {
+                    app.recents_active = false;
+                    return open_fill_or_copy(app, entry_idx);
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+fn render_recents(frame: &mut Frame, area: Rect, app: &App) {
+    let popup = centered_rect(
+        area.width.saturating_sub(8).min(100),
+        24.min(area.height.saturating_sub(2)),
+        area,
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(C_ACCENT))
+        .title(" Recents · Enter reopen · Esc close ");
+    let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+    let items: Vec<ListItem> = recent_indices(app)
+        .iter()
+        .enumerate()
+        .map(|(row, &i)| {
+            let u = &app.recent[i];
+            let available = app.entry_index.contains_key(&u.entry_id);
+            let marker = if row == app.recent_sel { "▸" } else { " " };
+            let text = format!(
+                "{marker} {:>4}  {}  —  {}",
+                crate::usage::age_label(&u.ts),
+                u.title,
+                u.cmd.replace('\n', " ")
+            );
+            ListItem::new(text).style(Style::default().fg(if available {
+                C_TITLE
+            } else {
+                C_GUIDE
+            }))
+        })
+        .collect();
+    frame.render_widget(
+        List::new(items).highlight_style(Style::default().bg(C_HIGHLIGHT_BG)),
+        inner,
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Engagement profiles (Ctrl+P)
+//
+// The sticky store, the usage log, and the env export are all machine-wide by
+// default, which quietly mixes one client's hosts and credentials into
+// another's completions. Switching profiles repoints all three at once.
+// ─────────────────────────────────────────────────────────────────────────
+
+fn open_profiles(app: &mut App) {
+    let names = crate::profile::list(&app.jsons_dir);
+    let sel = names.iter().position(|n| *n == app.profile).unwrap_or(0);
+    app.profile_ui = Some(crate::profile::ProfileUi {
+        names,
+        sel,
+        ..Default::default()
+    });
+}
+
+/// Repoint every profile-scoped path and drop the caches built from the old
+/// one. `var_ctx` is rebuilt lazily on the next fill, so clearing it is enough.
+fn switch_profile(app: &mut App, name: String) {
+    if name == app.profile {
+        return;
+    }
+    crate::profile::set_active(&name);
+    app.vars_path = crate::profile::vars_path(&app.jsons_dir, &name);
+    app.recent = crate::usage::load(&name);
+    app.recall = crate::usage::recall(&app.recent);
+    app.frecency = crate::usage::frecency(&app.recent);
+    app.recent_sel = 0;
+    app.var_ctx = None;
+    app.profile = name;
+    search(app, true);
+}
+
+fn handle_profile_key(app: &mut App, key: KeyEvent) -> Result<bool> {
+    let ctrl = key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER);
+    let Some(ui) = app.profile_ui.as_mut() else {
+        return Ok(false);
+    };
+    ui.error = None;
+
+    // Naming a new profile: a tiny inline text field, so it owns every key.
+    if let Some(name) = ui.naming.as_mut() {
+        match key.code {
+            KeyCode::Esc => ui.naming = None,
+            KeyCode::Backspace => {
+                name.pop();
+            }
+            KeyCode::Enter => {
+                let name = name.clone();
+                if !crate::profile::valid_name(&name) {
+                    ui.error = Some("letters, digits, - _ . only; `default` is taken".into());
+                } else if crate::profile::create(&app.jsons_dir, &name).is_err() {
+                    ui.error = Some("could not create the profile directory".into());
+                } else {
+                    app.profile_ui = None;
+                    switch_profile(app, name);
+                }
+            }
+            KeyCode::Char(c) if !ctrl => name.push(c),
+            _ => {}
+        }
+        return Ok(false);
+    }
+
+    // Deleting is irreversible and takes an engagement's credentials with it.
+    if let Some(doomed) = ui.confirm_delete.clone() {
+        match key.code {
+            KeyCode::Char('y' | 'Y') => {
+                let _ = crate::profile::remove(&app.jsons_dir, &doomed);
+                for path in [
+                    crate::usage::history_path(&doomed),
+                    crate::usage::env_path(&doomed),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    let _ = fs::remove_file(&path);
+                    // The per-profile directory only ever held that one file;
+                    // remove_dir refuses if anything else is in it.
+                    if let Some(parent) = path.parent() {
+                        let _ = fs::remove_dir(parent);
+                    }
+                }
+                if app.profile == doomed {
+                    switch_profile(app, crate::profile::DEFAULT.to_string());
+                }
+                open_profiles(app);
+            }
+            _ => ui.confirm_delete = None,
+        }
+        return Ok(false);
+    }
+
+    match key.code {
+        KeyCode::Esc => app.profile_ui = None,
+        KeyCode::Char('p' | 'P') if ctrl => app.profile_ui = None,
+        KeyCode::Down | KeyCode::Char('j') => {
+            ui.sel = (ui.sel + 1).min(ui.names.len().saturating_sub(1))
+        }
+        KeyCode::Up | KeyCode::Char('k') => ui.sel = ui.sel.saturating_sub(1),
+        KeyCode::Char('n') => ui.naming = Some(String::new()),
+        KeyCode::Char('d') => {
+            if let Some(name) = ui.names.get(ui.sel).cloned() {
+                if name == crate::profile::DEFAULT {
+                    ui.error = Some("the default profile can't be deleted".into());
+                } else {
+                    ui.confirm_delete = Some(name);
+                }
+            }
+        }
+        KeyCode::Enter => {
+            if let Some(name) = ui.names.get(ui.sel).cloned() {
+                app.profile_ui = None;
+                switch_profile(app, name);
+            }
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+fn render_profiles(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(ui) = app.profile_ui.as_ref() else {
+        return;
+    };
+    let rows = ui.names.len() as u16 + 4;
+    let popup = centered_rect(
+        area.width.saturating_sub(8).min(62),
+        rows.min(area.height.saturating_sub(2)),
+        area,
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(C_ACCENT))
+        .title(" Profiles ")
+        .title_bottom(keys::hint(keys::Scope::Profiles));
+    let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+
+    let mut lines: Vec<Line> = ui
+        .names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let cursor = if i == ui.sel { "▸ " } else { "  " };
+            let active = if *name == app.profile { " ●" } else { "" };
+            Line::from(vec![
+                Span::styled(cursor, Style::default().fg(C_ACCENT)),
+                Span::styled(name.clone(), Style::default().fg(C_TITLE)),
+                Span::styled(active, Style::default().fg(C_ACCENT)),
+            ])
+        })
+        .collect();
+
+    if let Some(name) = &ui.naming {
+        lines.push(Line::from(vec![
+            Span::styled("  new: ", Style::default().fg(C_GUIDE)),
+            Span::styled(name.clone(), Style::default().fg(C_TITLE)),
+            Span::styled("▏", Style::default().fg(C_ACCENT)),
+        ]));
+    }
+    if let Some(name) = &ui.confirm_delete {
+        lines.push(Line::from(Span::styled(
+            format!("  delete {name} and its history? y/n"),
+            Style::default().fg(C_ACCENT),
+        )));
+    }
+    if let Some(err) = &ui.error {
+        lines.push(Line::from(Span::styled(
+            format!("  {err}"),
+            Style::default().fg(C_GUIDE),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn render_help(frame: &mut Frame, area: Rect, app: &App) {
+    // Two fixed-width cells per line, so the second column starts at the same
+    // place in every row regardless of how long the descriptions are.
+    const KEY_W: usize = 11;
+    const DESC_W: usize = 25;
+    let mut lines: Vec<Line> = Vec::new();
+    for &scope in keys::ALL_SCOPES {
+        let cells: Vec<String> = keys::KEYS
+            .iter()
+            .filter(|(s, _, _)| *s == scope)
+            .map(|(_, k, d)| {
+                let pad = KEY_W.saturating_sub(k.chars().count());
+                format!("{k}{}{d:<DESC_W$}", " ".repeat(pad))
+            })
+            .collect();
+        if cells.is_empty() {
+            continue;
+        }
+        lines.push(Line::from(Span::styled(
+            scope.label(),
+            Style::default().fg(C_ACCENT).add_modifier(Modifier::BOLD),
+        )));
+        for pair in cells.chunks(2) {
+            lines.push(Line::from(Span::styled(
+                pair.join("  ").trim_end().to_string(),
+                Style::default().fg(C_TITLE),
+            )));
+        }
+        lines.push(Line::from(""));
+    }
+
+    let width = ((KEY_W + DESC_W) * 2 + 6) as u16;
+    let popup = centered_rect(
+        area.width.saturating_sub(8).min(width),
+        area.height.saturating_sub(4).min(lines.len() as u16 + 2),
+        area,
+    );
+    let inner = block_for_help(frame, popup, lines.len(), inner_height(popup));
+    let max = lines.len().saturating_sub(inner.height as usize);
+    frame.render_widget(
+        Paragraph::new(lines).scroll((app.help_scroll.min(max) as u16, 0)),
+        inner,
+    );
+}
+
+fn inner_height(popup: Rect) -> usize {
+    popup.height.saturating_sub(2) as usize
+}
+
+/// Draw the help frame and return the area for its content. The title carries
+/// the scroll hint only when there is something below the fold.
+fn block_for_help(frame: &mut Frame, popup: Rect, total: usize, shown: usize) -> Rect {
+    let title = if total > shown {
+        " Keys · j/k scroll · Esc/q/? close ".to_string()
+    } else {
+        " Keys · Esc/q/? close ".to_string()
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(C_ACCENT))
+        .title(title);
+    let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+    inner
+}
+
+fn handle_key_event<B: Backend>(app: &mut App, terminal: &mut Terminal<B>) -> Result<bool> {
     if let Event::Key(key) = event::read()? {
         if key.kind != KeyEventKind::Press {
             return Ok(false);
@@ -587,14 +1031,56 @@ fn handle_key_event(app: &mut App, terminal: &mut DefaultTerminal) -> Result<boo
         if app.fill.is_some() {
             return handle_fill_key(app, key);
         }
+        if app.help_active {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q' | '?') | KeyCode::F(1) => {
+                    app.help_active = false;
+                    app.help_scroll = 0;
+                }
+                KeyCode::Down | KeyCode::Char('j') | KeyCode::PageDown => {
+                    app.help_scroll += 1;
+                }
+                KeyCode::Up | KeyCode::Char('k') | KeyCode::PageUp => {
+                    app.help_scroll = app.help_scroll.saturating_sub(1);
+                }
+                _ => {}
+            }
+            return Ok(false);
+        }
+        if app.recents_active {
+            return handle_recents_key(app, key);
+        }
+        if app.profile_ui.is_some() {
+            return handle_profile_key(app, key);
+        }
+        // Ctrl+P is the profile switcher everywhere except inside the fill
+        // modal, which claims it first for suggestion cycling.
+        if matches!(key.code, KeyCode::Char('p' | 'P'))
+            && key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+        {
+            open_profiles(app);
+            return Ok(false);
+        }
+        if key.code == KeyCode::F(1)
+            || (key.code == KeyCode::Char('?')
+                && (app.top_tab == 2 || app.search_nav || app.browse_nav))
+        {
+            app.help_active = true;
+            return Ok(false);
+        }
         // The file-filter popup is modal on any tab (it is shared).
         if app.file_filter_active {
             return handle_file_filter_key(app, key);
         }
+        // So is the search-mode picker.
+        if app.mode_popup_active {
+            return handle_mode_popup_key(app, key);
+        }
         // The Browse and Methodology tabs have their own key handling. Esc (quit)
         // and `[`/`]` (tab switching) still fall through to the shared match below.
-        if key.code != KeyCode::Esc
-            && !matches!(key.code, KeyCode::Char('[') | KeyCode::Char(']'))
+        if key.code != KeyCode::Esc && !matches!(key.code, KeyCode::Char('[') | KeyCode::Char(']'))
         {
             if app.top_tab == 1 {
                 return handle_browse_key(app, terminal, key);
@@ -631,7 +1117,21 @@ fn handle_key_event(app: &mut App, terminal: &mut DefaultTerminal) -> Result<boo
                     app.method_jump_nav = false;
                     return Ok(false);
                 }
+                if let Some((doc, section, card, selection)) = app.method_return.take() {
+                    app.method_doc = doc.min(app.method_docs.len().saturating_sub(1));
+                    app.method_section = section;
+                    app.method_card = card;
+                    app.method_tree_state.select(selection);
+                    app.top_tab = 2;
+                    return Ok(false);
+                }
                 return Ok(true);
+            }
+            KeyCode::Char('r' | 'R')
+                if key.modifiers.contains(KeyModifiers::CONTROL) && app.top_tab == 0 =>
+            {
+                app.recents_active = true;
+                app.recent_sel = 0;
             }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 app.query.clear();
@@ -670,17 +1170,18 @@ fn handle_key_event(app: &mut App, terminal: &mut DefaultTerminal) -> Result<boo
                 let id = format!("{:08x}", rng.random::<u32>());
                 entry.id = id;
 
-                // Disable raw mode and leave alternate screen
-                disable_raw_mode()?;
-                execute!(stdout(), LeaveAlternateScreen, Show)?;
-
                 let out = entry_to_template(&entry);
-                fs::write(get_editor_temp_path(), out)?;
-
-                open_editor(get_editor_temp_path()).expect("Failed to execute editor");
-                let updated_entry = parse_template(&entry.id, &app)?;
-
-                fs::remove_file(get_editor_temp_path())?;
+                let Some(updated_entry) = with_editor(
+                    terminal,
+                    app.print_result,
+                    get_editor_temp_path(),
+                    None,
+                    &out,
+                    |text| parse_template_str(&entry.id, text, &app.cmds_dir, false),
+                )?
+                else {
+                    return Ok(false);
+                };
 
                 app.entries.push(updated_entry);
                 app.rebuild_entry_index();
@@ -692,21 +1193,18 @@ fn handle_key_event(app: &mut App, terminal: &mut DefaultTerminal) -> Result<boo
                     app.list_state.select(Some(filtered_pos));
                 }
                 app.current_chain_index = 0;
-
-                // Re-enable raw mode and re-enter alternate screen
-                enable_raw_mode()?;
-                execute!(stdout(), EnterAlternateScreen, Hide)?;
-                terminal.clear()?;
             }
             // Chain-edit toggle: Super+C (or Ctrl+C) — moved off 'n' so Super+N is
             // free for list-nav.
             KeyCode::Char('c')
-                if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
             {
-                if !app.is_chain_edit_mode {
-                    if let Some(entry) = app.selected_entry() {
-                        app.prev_selected_entry_id = entry.id.clone();
-                    }
+                if !app.is_chain_edit_mode
+                    && let Some(entry) = app.selected_entry()
+                {
+                    app.prev_selected_entry_id = entry.id.clone();
                 }
                 app.is_chain_edit_mode = !app.is_chain_edit_mode;
                 app.query.clear();
@@ -715,7 +1213,9 @@ fn handle_key_event(app: &mut App, terminal: &mut DefaultTerminal) -> Result<boo
             }
             // Super+S (or Ctrl+S): toggle the selected command as a favorite.
             KeyCode::Char('s')
-                if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
             {
                 if let Some(idx) = app.selected_entry_index() {
                     app.entries[idx].favorite = !app.entries[idx].favorite;
@@ -751,7 +1251,10 @@ fn handle_key_event(app: &mut App, terminal: &mut DefaultTerminal) -> Result<boo
                     ) =>
             {
                 let steps = displayed_chain_steps(app);
-                if let Some(i) = steps.get(app.chain_sel).and_then(|id| app.entry_index.get(id)) {
+                if let Some(i) = steps
+                    .get(app.chain_sel)
+                    .and_then(|id| app.entry_index.get(id))
+                {
                     let i = *i;
                     edit_command(app, terminal, i)?;
                 }
@@ -791,38 +1294,30 @@ fn handle_key_event(app: &mut App, terminal: &mut DefaultTerminal) -> Result<boo
                 chain_present(app);
             }
             KeyCode::Enter => {
-                if let Some(idx) = app.results.get(app.list_state.selected().unwrap_or(0)).copied()
+                if let Some(idx) = app
+                    .results
+                    .get(app.list_state.selected().unwrap_or(0))
+                    .copied()
                 {
                     return open_fill_or_copy(app, idx);
                 }
                 return Ok(true);
             }
             KeyCode::BackTab => {
-                app.mode = match app.mode {
-                    SearchMode::HEADING => SearchMode::CMD,
-                    SearchMode::TITLE => SearchMode::HEADING,
-                    SearchMode::ALL => SearchMode::TITLE,
-                    SearchMode::CMD => SearchMode::ALL,
-                };
-                search(app, true);
+                app.mode_popup_active = true;
             }
             KeyCode::Tab => {
                 // While typing, Tab accepts a pending ghost-text completion;
-                // otherwise it cycles the search mode.
+                // otherwise it opens the numbered search-mode picker.
                 if !app.search_nav
+                    && app.cursor_index == app.query.len()
                     && let Some(sfx) = complete_suffix(&app.vocab, last_token(&app.query))
                 {
                     app.query.push_str(&sfx);
                     app.cursor_index = app.query.len();
                     search(app, true);
                 } else {
-                    app.mode = match app.mode {
-                        SearchMode::CMD => SearchMode::HEADING,
-                        SearchMode::HEADING => SearchMode::TITLE,
-                        SearchMode::TITLE => SearchMode::ALL,
-                        SearchMode::ALL => SearchMode::CMD,
-                    };
-                    search(app, true);
+                    app.mode_popup_active = true;
                 }
             }
             // File filter: Ctrl+F or Super+F opens the numbered file-filter popup.
@@ -885,7 +1380,9 @@ fn handle_key_event(app: &mut App, terminal: &mut DefaultTerminal) -> Result<boo
             }
             // Super+N (or Ctrl+N) toggles nav mode (pane focus + list nav).
             KeyCode::Char('n')
-                if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
             {
                 if app.search_nav {
                     // Leave nav but keep the focused pane, so you can now scroll it.
@@ -1028,6 +1525,18 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     if app.file_filter_active {
         render_file_filter(frame, chunks[3], app);
     }
+    if app.mode_popup_active {
+        render_mode_popup(frame, chunks[3], app);
+    }
+    if app.recents_active {
+        render_recents(frame, frame.area(), app);
+    }
+    if app.profile_ui.is_some() {
+        render_profiles(frame, frame.area(), app);
+    }
+    if app.help_active {
+        render_help(frame, frame.area(), app);
+    }
 
     // The fill modal sits above everything else.
     if app.fill.is_some() {
@@ -1093,12 +1602,17 @@ fn render_file_filter(frame: &mut Frame, area: Rect, app: &mut App) {
             name.trim_end_matches("-CMDs")
         };
         let name_style = if selected {
-            Style::default().fg(C_FG_BRIGHT).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(C_FG_BRIGHT)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(C_DIM)
         };
         lines.push(Line::from(vec![
-            Span::styled(format!(" {i}  "), Style::default().fg(C_ACCENT).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!(" {i}  "),
+                Style::default().fg(C_ACCENT).add_modifier(Modifier::BOLD),
+            ),
             Span::styled(
                 format!("{mark} "),
                 Style::default().fg(if selected { C_STAR } else { C_DIM }),
@@ -1117,21 +1631,103 @@ fn render_file_filter(frame: &mut Frame, area: Rect, app: &mut App) {
     );
 }
 
+/// The numbered search-mode picker (⇥). The modes are mutually exclusive, so the
+/// active one is marked the way every other selected row in the app is — a
+/// highlighted band — rather than with a radio glyph.
+fn render_mode_popup(frame: &mut Frame, area: Rect, app: &App) {
+    let opts = mode_options(app.top_tab);
+    let active = if app.top_tab == 1 {
+        app.browse_mode
+    } else {
+        app.mode
+    };
+
+    let width = 50u16.min(area.width.saturating_sub(4)).max(24);
+    let height = ((opts.len() as u16) + 2).clamp(3, area.height.saturating_sub(2).max(3));
+    let popup = centered_rect(width, height, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(C_ACCENT))
+        .padding(Padding::new(1, 1, 0, 0))
+        .title(" Search mode ")
+        .title_alignment(Alignment::Center);
+    let inner = block.inner(popup);
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, mode) in opts.iter().enumerate() {
+        let selected = *mode == active;
+        let bg = if selected {
+            C_HIGHLIGHT_BG
+        } else {
+            Color::Reset
+        };
+        let num = format!(" {}  ", i + 1);
+        let name = format!("{mode:<7}");
+        let desc = format!("  {}", mode_desc(*mode));
+        // Pad the row out to the full inner width so the highlight reads as a band.
+        let used = num.chars().count() + name.chars().count() + desc.chars().count();
+        let pad = (inner.width as usize).saturating_sub(used);
+
+        lines.push(Line::from(vec![
+            Span::styled(
+                num,
+                Style::default()
+                    .fg(C_ACCENT)
+                    .bg(bg)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                name,
+                if selected {
+                    Style::default()
+                        .fg(C_FG_BRIGHT)
+                        .bg(bg)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(C_TITLE)
+                },
+            ),
+            Span::styled(desc, Style::default().fg(C_DIM).bg(bg)),
+            Span::styled(" ".repeat(pad), Style::default().bg(bg)),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
 /// A dim key-hint strip in the reserved bottom row, with the app name pinned right.
 fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
-    let hint = if app.fill.is_some() {
-        "⏎ next field · ⇥ move · ^P/^N suggestions · ^T target · ^R reset · ^Y copy now · Esc cancel"
+    let scope = if app.fill.is_some() {
+        Scope::Fill
     } else {
         match app.top_tab {
-            0 => "⌘N nav · hjkl panels · ⇧HJKL resize · ⌘F filter · nav+Space reset · e edit",
-            1 => "↑↓ move · ⇥ complete · h/l fold · Enter copy · ⌘F file · ⌘N nav",
-            _ => "Tab section · ⌘F doc · hjkl move · Space check · / jump",
+            0 => Scope::Search,
+            1 => Scope::Browse,
+            _ => Scope::Methodology,
         }
     };
-    let brand = "F1nder";
-    let left = format!("  {}   [ ] switch tab", hint);
-    let pad = (area.width as usize)
-        .saturating_sub(left.chars().count() + brand.chars().count() + 2);
+    let hint = format!("{} · {}", keys::hint(scope), keys::hint(Scope::Global));
+    // A named profile has to be visible at all times: it decides which
+    // engagement's credentials the fill modal is about to complete from.
+    let brand = if app.profile == crate::profile::DEFAULT {
+        "F1nder".to_string()
+    } else {
+        format!("{}  ·  F1nder", app.profile)
+    };
+    // The brand carries the active profile, so it must always be visible; trim
+    // the hint rather than letting the two collide on a narrow terminal.
+    let room = (area.width as usize).saturating_sub(brand.chars().count() + 6);
+    let mut hint = hint;
+    if hint.chars().count() > room {
+        hint = hint.chars().take(room.saturating_sub(1)).collect::<String>() + "…";
+    }
+    let left = format!("  {hint}");
+    let pad =
+        (area.width as usize).saturating_sub(left.chars().count() + brand.chars().count() + 2);
     let line = Line::from(vec![
         Span::styled(left, Style::default().fg(C_DIM)),
         Span::raw(" ".repeat(pad)),
@@ -1188,7 +1784,11 @@ fn browse_match_set(app: &App) -> HashSet<usize> {
                 SearchMode::TITLE => vec![&ix.title],
                 SearchMode::HEADING => vec![&ix.heading],
                 SearchMode::CMD => vec![&ix.cmd, &ix.tool],
-                SearchMode::ALL => vec![&ix.title, &ix.heading, &ix.cmd, &ix.tool],
+                // Browse is a tree filter, not a ranking, so RECENT has
+                // nothing extra to offer here — it matches like ALL.
+                SearchMode::ALL | SearchMode::RECENT => {
+                    vec![&ix.title, &ix.heading, &ix.cmd, &ix.tool]
+                }
             };
             if score::matches_fields(&fields, &terms) {
                 Some(i)
@@ -1279,7 +1879,13 @@ fn flatten(
 
 /// Emit one node (and its visible descendants). `depth` is the *display* depth;
 /// `prefix` is the parent's real NUL-joined key.
-fn emit_node(node: &TreeNode, depth: usize, prefix: &str, ctx: &FlattenCtx, out: &mut Vec<BrowseRow>) {
+fn emit_node(
+    node: &TreeNode,
+    depth: usize,
+    prefix: &str,
+    ctx: &FlattenCtx,
+    out: &mut Vec<BrowseRow>,
+) {
     // Command leaf — emitted as-is.
     if node.entry_index.is_some() {
         out.push(BrowseRow {
@@ -1474,12 +2080,12 @@ fn browse_sel_up(app: &mut App) {
 fn browse_toggle_folder(app: &mut App) {
     let filtering = !app.browse_query.trim().is_empty();
     let rows = browse_rows(app);
-    if let Some(row) = app.browse_state.selected().and_then(|s| rows.get(s)) {
-        if row.is_folder {
-            let key = row.key.clone();
-            let expanded_now = row.expanded;
-            set_folder_expanded(app, &key, !expanded_now, filtering);
-        }
+    if let Some(row) = app.browse_state.selected().and_then(|s| rows.get(s))
+        && row.is_folder
+    {
+        let key = row.key.clone();
+        let expanded_now = row.expanded;
+        set_folder_expanded(app, &key, !expanded_now, filtering);
     }
 }
 
@@ -1487,34 +2093,43 @@ fn browse_toggle_folder(app: &mut App) {
 fn browse_collapse_or_parent(app: &mut App) {
     let filtering = !app.browse_query.trim().is_empty();
     let rows = browse_rows(app);
-    if let Some(sel) = app.browse_state.selected() {
-        if let Some(row) = rows.get(sel) {
-            if row.is_folder && row.expanded {
-                let key = row.key.clone();
-                set_folder_expanded(app, &key, false, filtering);
-            } else {
-                let depth = row.depth;
-                for j in (0..sel).rev() {
-                    if rows[j].depth < depth {
-                        app.browse_state.select(Some(j));
-                        break;
-                    }
+    if let Some(sel) = app.browse_state.selected()
+        && let Some(row) = rows.get(sel)
+    {
+        if row.is_folder && row.expanded {
+            let key = row.key.clone();
+            set_folder_expanded(app, &key, false, filtering);
+        } else {
+            let depth = row.depth;
+            for j in (0..sel).rev() {
+                if rows[j].depth < depth {
+                    app.browse_state.select(Some(j));
+                    break;
                 }
             }
         }
     }
 }
 
-fn handle_browse_key(app: &mut App, terminal: &mut DefaultTerminal, key: KeyEvent) -> Result<bool> {
+fn handle_browse_key<B: Backend>(
+    app: &mut App,
+    terminal: &mut Terminal<B>,
+    key: KeyEvent,
+) -> Result<bool> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    let plain = !ctrl && !key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::SUPER);
+    let plain = !ctrl
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::ALT | KeyModifiers::SUPER);
     match key.code {
         // Arrows always move the selection (both typing and nav modes).
         KeyCode::Down => browse_sel_down(app),
         KeyCode::Up => browse_sel_up(app),
         // Super+N (or Ctrl+N) toggles list-nav (j/k navigate, typing off).
         KeyCode::Char('n')
-            if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
+            if key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
         {
             if app.browse_nav {
                 app.browse_nav = false;
@@ -1531,7 +2146,7 @@ fn handle_browse_key(app: &mut App, terminal: &mut DefaultTerminal, key: KeyEven
         KeyCode::Char('l') if app.browse_nav && plain => browse_toggle_folder(app),
         KeyCode::Char('h') if app.browse_nav && plain => browse_collapse_or_parent(app),
         // Tab accepts a pending ghost-text completion while typing; with no
-        // completion pending it falls through to the mode-cycle Tab arm below.
+        // completion pending it falls through to the mode-picker Tab arm below.
         KeyCode::Tab
             if !app.browse_nav
                 && complete_suffix(&app.vocab, last_token(&app.browse_query)).is_some() =>
@@ -1569,28 +2184,32 @@ fn handle_browse_key(app: &mut App, terminal: &mut DefaultTerminal, key: KeyEven
                 .browse_state
                 .selected()
                 .and_then(|s| rows.get(s))
-                .map(|r| (r.is_folder, r.depth, r.key.clone(), r.text.clone(), r.entry_index));
+                .map(|r| {
+                    (
+                        r.is_folder,
+                        r.depth,
+                        r.key.clone(),
+                        r.text.clone(),
+                        r.entry_index,
+                    )
+                });
 
             if let Some((is_folder, depth, key, text, entry_index)) = selected {
                 if is_folder {
                     // depth 0 is the source-file node — not an editable heading.
                     if depth >= 1 {
-                        disable_raw_mode()?;
-                        execute!(stdout(), LeaveAlternateScreen, Show)?;
-
-                        fs::write(get_editor_temp_path(), format!("{}\n", text))?;
-                        let _ = open_editor(get_editor_temp_path());
-                        let new_name = fs::read_to_string(get_editor_temp_path())?
-                            .lines()
-                            .next()
-                            .unwrap_or("")
-                            .trim()
-                            .to_string();
-                        fs::remove_file(get_editor_temp_path())?;
-
-                        enable_raw_mode()?;
-                        execute!(stdout(), EnterAlternateScreen, Hide)?;
-                        terminal.clear()?;
+                        let initial = format!("{}\n", text);
+                        let Some(new_name) = with_editor(
+                            terminal,
+                            app.print_result,
+                            get_editor_temp_path(),
+                            None,
+                            &initial,
+                            |edited| Ok(edited.lines().next().unwrap_or("").trim().to_string()),
+                        )?
+                        else {
+                            return Ok(false);
+                        };
 
                         if !new_name.is_empty() && new_name != text {
                             rename_heading(app, &key, &new_name);
@@ -1600,20 +2219,21 @@ fn handle_browse_key(app: &mut App, terminal: &mut DefaultTerminal, key: KeyEven
                 } else if let Some(idx) = entry_index {
                     let entry = app.entries[idx].clone();
 
-                    disable_raw_mode()?;
-                    execute!(stdout(), LeaveAlternateScreen, Show)?;
-
-                    fs::write(get_editor_temp_path(), entry_to_template(&entry))?;
-                    let _ = open_editor(get_editor_temp_path());
-                    let updated_entry = parse_template(&entry.id, app)?;
+                    let initial = entry_to_template(&entry);
+                    let Some(updated_entry) = with_editor(
+                        terminal,
+                        app.print_result,
+                        get_editor_temp_path(),
+                        None,
+                        &initial,
+                        |text| parse_template_str(&entry.id, text, &app.cmds_dir, entry.favorite),
+                    )?
+                    else {
+                        return Ok(false);
+                    };
                     app.entries[idx] = updated_entry;
                     app.index[idx] = score::index_entry(&app.entries[idx]);
                     app.dirty = true;
-                    fs::remove_file(get_editor_temp_path())?;
-
-                    enable_raw_mode()?;
-                    execute!(stdout(), EnterAlternateScreen, Hide)?;
-                    terminal.clear()?;
                 }
             }
         }
@@ -1643,21 +2263,22 @@ fn handle_browse_key(app: &mut App, terminal: &mut DefaultTerminal, key: KeyEven
             let mut rng = rand::rng();
             entry.id = format!("{:08x}", rng.random::<u32>());
 
-            disable_raw_mode()?;
-            execute!(stdout(), LeaveAlternateScreen, Show)?;
-
-            fs::write(get_editor_temp_path(), entry_to_template(&entry))?;
-            open_editor(get_editor_temp_path()).expect("Failed to execute editor");
-            let updated_entry = parse_template(&entry.id, app)?;
-            fs::remove_file(get_editor_temp_path())?;
+            let initial = entry_to_template(&entry);
+            let Some(updated_entry) = with_editor(
+                terminal,
+                app.print_result,
+                get_editor_temp_path(),
+                None,
+                &initial,
+                |text| parse_template_str(&entry.id, text, &app.cmds_dir, false),
+            )?
+            else {
+                return Ok(false);
+            };
 
             app.entries.push(updated_entry);
             app.rebuild_entry_index();
             app.dirty = true;
-
-            enable_raw_mode()?;
-            execute!(stdout(), EnterAlternateScreen, Hide)?;
-            terminal.clear()?;
         }
         // File filter: Ctrl+F or Super+F opens the numbered file-filter popup.
         KeyCode::Char('f' | 'F')
@@ -1667,27 +2288,10 @@ fn handle_browse_key(app: &mut App, terminal: &mut DefaultTerminal, key: KeyEven
         {
             app.file_filter_active = true;
         }
-        // Cycle the filter field mode (TITLE / HEADING / CMD / ALL), like the
-        // regular search's Tab. Shift+Tab cycles in reverse.
-        KeyCode::Tab => {
-            app.browse_mode = match app.browse_mode {
-                SearchMode::CMD => SearchMode::HEADING,
-                SearchMode::HEADING => SearchMode::TITLE,
-                SearchMode::TITLE => SearchMode::ALL,
-                SearchMode::ALL => SearchMode::CMD,
-            };
-            app.browse_collapsed.clear();
-            app.browse_state.select(Some(0));
-        }
-        KeyCode::BackTab => {
-            app.browse_mode = match app.browse_mode {
-                SearchMode::HEADING => SearchMode::CMD,
-                SearchMode::TITLE => SearchMode::HEADING,
-                SearchMode::ALL => SearchMode::TITLE,
-                SearchMode::CMD => SearchMode::ALL,
-            };
-            app.browse_collapsed.clear();
-            app.browse_state.select(Some(0));
+        // Pick the filter field mode (TITLE / HEADING / CMD / ALL) from the same
+        // numbered picker the Search tab uses.
+        KeyCode::Tab | KeyCode::BackTab => {
+            app.mode_popup_active = true;
         }
         // Incremental filter typing. Editing the filter resets transient
         // collapse state so new matches are revealed.
@@ -2155,6 +2759,19 @@ fn complete_suffix(words: &[String], token: &str) -> Option<String> {
 /// Frequency-ranked words from the methodology jump targets, for the jump
 /// palette's inline autocomplete.
 fn jump_vocab(app: &App) -> Vec<String> {
+    let revision = app
+        .method_docs
+        .get(app.method_doc)
+        .map(|d| d.revision)
+        .unwrap_or(0);
+    if let Some(words) = app
+        .jump_vocab_cache
+        .borrow()
+        .get(&(app.method_doc, revision))
+        .cloned()
+    {
+        return words;
+    }
     use std::collections::HashMap;
     let mut counts: HashMap<String, u32> = HashMap::new();
     for t in jump_targets(app) {
@@ -2170,7 +2787,11 @@ fn jump_vocab(app: &App) -> Vec<String> {
             .then(a.0.len().cmp(&b.0.len()))
             .then(a.0.cmp(&b.0))
     });
-    words.into_iter().map(|(w, _)| w).collect()
+    let out: Vec<String> = words.into_iter().map(|(w, _)| w).collect();
+    app.jump_vocab_cache
+        .borrow_mut()
+        .insert((app.method_doc, revision), out.clone());
+    out
 }
 fn render_browse_filter(frame: &mut Frame, area: Rect, app: &App) {
     let mut title = Line::from(vec![
@@ -2194,7 +2815,10 @@ fn render_browse_filter(frame: &mut Frame, area: Rect, app: &App) {
     if app.browse_nav {
         title.spans.push(Span::styled(
             " NAV ",
-            Style::default().bg(C_CHECK).fg(C_ACCENT_BG).add_modifier(Modifier::BOLD),
+            Style::default()
+                .bg(C_CHECK)
+                .fg(C_ACCENT_BG)
+                .add_modifier(Modifier::BOLD),
         ));
         title.spans.push(Span::raw(" "));
     }
@@ -2215,10 +2839,10 @@ fn render_browse_filter(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled(app.browse_query.as_str(), Style::default().fg(C_FG_BRIGHT)),
         ];
         // Inline ghost-text completion (Browse filter is append-only).
-        if !app.browse_nav {
-            if let Some(sfx) = complete_suffix(&app.vocab, last_token(&app.browse_query)) {
-                spans.push(Span::styled(sfx, Style::default().fg(C_GUIDE)));
-            }
+        if !app.browse_nav
+            && let Some(sfx) = complete_suffix(&app.vocab, last_token(&app.browse_query))
+        {
+            spans.push(Span::styled(sfx, Style::default().fg(C_GUIDE)));
         }
         Line::from(spans)
     };
@@ -2255,7 +2879,11 @@ fn render_folder_view(frame: &mut Frame, area: Rect, app: &mut App) {
             let indent = "  ".repeat(r.depth);
             if r.is_folder {
                 let marker = if r.expanded { "▾" } else { "▸" };
-                let folder = if r.expanded { IC_FOLDER_OPEN } else { IC_FOLDER };
+                let folder = if r.expanded {
+                    IC_FOLDER_OPEN
+                } else {
+                    IC_FOLDER
+                };
                 ListItem::new(Line::from(vec![
                     Span::raw(indent),
                     Span::styled(format!("{} ", marker), Style::default().fg(C_GUIDE)),
@@ -2363,7 +2991,8 @@ fn render_browse_detail(frame: &mut Frame, area: Rect, entry: Option<&Entry>) {
 const C_CHECK: Color = Color::Rgb(112, 222, 152);
 
 /// A flattened row of the detail checklist tree for the selected attack card.
-struct MethodRow {
+#[derive(Clone)]
+pub(crate) struct MethodRow {
     depth: usize,
     key: String,
     title: String,
@@ -2522,6 +3151,24 @@ fn card_rows(
 
 /// Rows for a section+card by index (recomputes the card list).
 fn rows_for(app: &App, si: usize, ci: usize) -> Vec<MethodRow> {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut collapsed: Vec<_> = app.method_collapsed.iter().collect();
+    collapsed.sort();
+    collapsed.hash(&mut hasher);
+    let revision = app
+        .method_docs
+        .get(app.method_doc)
+        .map(|d| d.revision)
+        .unwrap_or(0);
+    let key = format!(
+        "{}:{revision}:{si}:{ci}:{}:{}",
+        app.method_doc,
+        app.method_show_comments,
+        hasher.finish()
+    );
+    if let Some(rows) = app.method_rows_cache.borrow().get(&key).cloned() {
+        return rows;
+    }
     let sections = crate::methodology::sections(app.method_tree());
     let Some(sec) = sections.get(si) else {
         return Vec::new();
@@ -2530,14 +3177,16 @@ fn rows_for(app: &App, si: usize, ci: usize) -> Vec<MethodRow> {
     let Some((_, roots)) = cards.get(ci) else {
         return Vec::new();
     };
-    card_rows(
+    let rows = card_rows(
         roots,
         app.method_doc,
         si,
         ci,
         &app.method_collapsed,
         app.method_show_comments,
-    )
+    );
+    app.method_rows_cache.borrow_mut().insert(key, rows.clone());
+    rows
 }
 
 fn method_section_count(app: &App) -> usize {
@@ -2698,10 +3347,15 @@ fn method_row_item<'a>(r: &'a MethodRow, inner_width: u16) -> ListItem<'a> {
                 let (m, ts) = if r.checked {
                     (
                         format!("{} ", IC_CHECK_ON),
-                        Style::default().fg(C_DIM).add_modifier(Modifier::CROSSED_OUT),
+                        Style::default()
+                            .fg(C_DIM)
+                            .add_modifier(Modifier::CROSSED_OUT),
                     )
                 } else {
-                    (format!("{} ", IC_CHECK_OFF), Style::default().fg(C_FG_BRIGHT))
+                    (
+                        format!("{} ", IC_CHECK_OFF),
+                        Style::default().fg(C_FG_BRIGHT),
+                    )
                 };
                 let ms = Style::default().fg(if r.checked { C_CHECK } else { C_DIM });
                 // Parent items show a rollup of their leaf checks.
@@ -2795,16 +3449,25 @@ fn render_method_bar(frame: &mut Frame, area: Rect, app: &App) {
         .title_top(Line::from(title))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(if app.method_jump_active || app.method_pending_reset {
-            C_ACCENT
-        } else {
-            C_BORDER
-        }));
+        .border_style(
+            Style::default().fg(if app.method_jump_active || app.method_pending_reset {
+                C_ACCENT
+            } else {
+                C_BORDER
+            }),
+        );
 
     let line = if app.method_pending_reset {
-        let name = app.method_docs.get(app.method_doc).map(|d| d.name.as_str()).unwrap_or("");
+        let name = app
+            .method_docs
+            .get(app.method_doc)
+            .map(|d| d.name.as_str())
+            .unwrap_or("");
         Line::from(vec![Span::styled(
-            format!("  Reset ALL checks in {}?  press y to confirm, any key to cancel", name),
+            format!(
+                "  Reset ALL checks in {}?  press y to confirm, any key to cancel",
+                name
+            ),
             Style::default().fg(C_CHECK).add_modifier(Modifier::BOLD),
         )])
     } else if app.method_jump_active {
@@ -2815,23 +3478,34 @@ fn render_method_bar(frame: &mut Frame, area: Rect, app: &App) {
         if app.method_jump_nav {
             spans.push(Span::styled(
                 " NAV ",
-                Style::default().bg(C_CHECK).fg(C_ACCENT_BG).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .bg(C_CHECK)
+                    .fg(C_ACCENT_BG)
+                    .add_modifier(Modifier::BOLD),
             ));
             spans.push(Span::raw(" "));
         }
-        spans.push(Span::styled(app.method_query.as_str(), Style::default().fg(C_FG_BRIGHT)));
+        spans.push(Span::styled(
+            app.method_query.as_str(),
+            Style::default().fg(C_FG_BRIGHT),
+        ));
         // Inline ghost-text completion (jump query is append-only).
-        if !app.method_jump_nav {
-            if let Some(sfx) = complete_suffix(&jump_vocab(app), last_token(&app.method_query)) {
-                spans.push(Span::styled(sfx, Style::default().fg(C_GUIDE)));
-            }
+        if !app.method_jump_nav
+            && let Some(sfx) = complete_suffix(&jump_vocab(app), last_token(&app.method_query))
+        {
+            spans.push(Span::styled(sfx, Style::default().fg(C_GUIDE)));
         }
         Line::from(spans)
     } else {
         Line::from(vec![Span::styled(
             format!(
-                "  ⌘F doc · Tab/1-9 section · hjkl move · gg/G ends · Space check · e/a/d edit · R reset · c comments {} · / jump",
-                if app.method_show_comments { "on" } else { "off" }
+                "  {} · comments {}",
+                keys::hint(Scope::Methodology),
+                if app.method_show_comments {
+                    "on"
+                } else {
+                    "off"
+                }
             ),
             Style::default().fg(C_DIM),
         )])
@@ -2867,7 +3541,9 @@ fn render_method_sections(frame: &mut Frame, area: Rect, app: &App) {
         spans.push(Span::raw("  "));
         spans.push(Span::styled(
             sec.title.clone(),
-            Style::default().fg(C_FG_BRIGHT).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(C_FG_BRIGHT)
+                .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::styled(
             format!("  {}/{}", d, t),
@@ -2919,6 +3595,7 @@ fn render_jump_palette(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_stateful_widget(list, area, &mut state);
 }
 
+#[allow(clippy::type_complexity)]
 fn render_method_view(frame: &mut Frame, area: Rect, app: &mut App) {
     let vparts = Layout::vertical([
         Constraint::Length(3),
@@ -2941,7 +3618,7 @@ fn render_method_view(frame: &mut Frame, area: Rect, app: &mut App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
+                .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(C_BORDER)),
         );
         frame.render_widget(p, vparts[2]);
@@ -2999,7 +3676,9 @@ fn render_method_view(frame: &mut Frame, area: Rect, app: &mut App) {
             ListItem::new(Line::from(vec![
                 Span::styled(
                     format!("▸ {}", title),
-                    Style::default().fg(C_FG_BRIGHT).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(C_FG_BRIGHT)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     format!("  {}/{}", d, t),
@@ -3019,11 +3698,15 @@ fn render_method_view(frame: &mut Frame, area: Rect, app: &mut App) {
     if !card_meta.is_empty() {
         cstate.select(Some(ci));
     }
-    let clist = List::new(items).block(cblock).highlight_style(if cards_focused {
-        Style::default().bg(C_HIGHLIGHT_BG).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().bg(C_HIGHLIGHT_DIM)
-    });
+    let clist = List::new(items)
+        .block(cblock)
+        .highlight_style(if cards_focused {
+            Style::default()
+                .bg(C_HIGHLIGHT_BG)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().bg(C_HIGHLIGHT_DIM)
+        });
     frame.render_stateful_widget(clist, cols[0], &mut cstate);
 
     // Right: jump palette, or the detail checklist tree.
@@ -3051,7 +3734,10 @@ fn render_method_view(frame: &mut Frame, area: Rect, app: &mut App) {
         .border_style(Style::default().fg(if tree_focused { C_ACCENT } else { C_BORDER }))
         .title(format!(
             " {} ",
-            card_meta.get(ci).map(|(t, _, _)| t.as_str()).unwrap_or("DETAIL")
+            card_meta
+                .get(ci)
+                .map(|(t, _, _)| t.as_str())
+                .unwrap_or("DETAIL")
         ))
         .title_alignment(Alignment::Center);
     if rows.is_empty() {
@@ -3066,22 +3752,36 @@ fn render_method_view(frame: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
     let inner_width = cols[1].width.saturating_sub(4);
-    let titems: Vec<ListItem> = rows.iter().map(|r| method_row_item(r, inner_width)).collect();
-    let tlist = List::new(titems).block(tblock).highlight_style(if tree_focused {
-        Style::default().bg(C_HIGHLIGHT_BG).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().bg(C_HIGHLIGHT_DIM)
-    });
+    let titems: Vec<ListItem> = rows
+        .iter()
+        .map(|r| method_row_item(r, inner_width))
+        .collect();
+    let tlist = List::new(titems)
+        .block(tblock)
+        .highlight_style(if tree_focused {
+            Style::default()
+                .bg(C_HIGHLIGHT_BG)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().bg(C_HIGHLIGHT_DIM)
+        });
     frame.render_stateful_widget(tlist, cols[1], &mut app.method_tree_state);
 }
 
-fn handle_method_key(app: &mut App, terminal: &mut DefaultTerminal, key: KeyEvent) -> Result<bool> {
+fn handle_method_key<B: Backend>(
+    app: &mut App,
+    terminal: &mut Terminal<B>,
+    key: KeyEvent,
+) -> Result<bool> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
     // Jump palette captures all typing while active.
     if app.method_jump_active {
         // Esc is handled in the shared match (it backs out of nav, then cancels).
-        let plain = !ctrl && !key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::SUPER);
+        let plain = !ctrl
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::ALT | KeyModifiers::SUPER);
         let sel_down = |app: &mut App| {
             let n = jump_filtered(app).len();
             if n > 0 {
@@ -3092,7 +3792,9 @@ fn handle_method_key(app: &mut App, terminal: &mut DefaultTerminal, key: KeyEven
             KeyCode::Enter => commit_method_jump(app),
             // Super+N (or Ctrl+N) toggles list-nav (j/k navigate, typing off).
             KeyCode::Char('n')
-                if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
             {
                 if app.method_jump_nav {
                     app.method_jump_nav = false;
@@ -3118,7 +3820,8 @@ fn handle_method_key(app: &mut App, terminal: &mut DefaultTerminal, key: KeyEven
             }
             // Tab accepts the inline ghost-text completion.
             KeyCode::Tab if !app.method_jump_nav => {
-                if let Some(sfx) = complete_suffix(&jump_vocab(app), last_token(&app.method_query)) {
+                if let Some(sfx) = complete_suffix(&jump_vocab(app), last_token(&app.method_query))
+                {
                     app.method_query.push_str(&sfx);
                     app.method_jump_sel = 0;
                 }
@@ -3148,6 +3851,7 @@ fn handle_method_key(app: &mut App, terminal: &mut DefaultTerminal, key: KeyEven
     app.method_g_pending = false;
 
     match key.code {
+        KeyCode::Char('o') => method_to_commands(app),
         KeyCode::Char('/') => {
             app.method_jump_active = true;
             app.method_jump_nav = false;
@@ -3186,7 +3890,9 @@ fn handle_method_key(app: &mut App, terminal: &mut DefaultTerminal, key: KeyEven
         }
         // Switch document (Web ⇄ AD ⇄ …): Super+F / Ctrl+F forward, +Shift reverse.
         KeyCode::Char('f' | 'F')
-            if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
+            if key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
         {
             let n = app.method_docs.len();
             if n > 0 {
@@ -3258,10 +3964,11 @@ fn handle_method_key(app: &mut App, terminal: &mut DefaultTerminal, key: KeyEven
                 focus_method_tree(app);
             } else {
                 let rows = rows_for(app, app.method_section, app.method_card);
-                if let Some(r) = app.method_tree_state.selected().and_then(|s| rows.get(s)) {
-                    if r.has_children && !r.expanded {
-                        app.method_collapsed.remove(&r.key);
-                    }
+                if let Some(r) = app.method_tree_state.selected().and_then(|s| rows.get(s))
+                    && r.has_children
+                    && !r.expanded
+                {
+                    app.method_collapsed.remove(&r.key);
                 }
             }
         }
@@ -3275,10 +3982,10 @@ fn handle_method_key(app: &mut App, terminal: &mut DefaultTerminal, key: KeyEven
                         app.method_collapsed.insert(k);
                     }
                     Some(r) if r.depth > 0 => {
-                        if let Some((parent, _)) = r.key.rsplit_once('/') {
-                            if let Some(pos) = rows.iter().position(|x| x.key == parent) {
-                                app.method_tree_state.select(Some(pos));
-                            }
+                        if let Some((parent, _)) = r.key.rsplit_once('/')
+                            && let Some(pos) = rows.iter().position(|x| x.key == parent)
+                        {
+                            app.method_tree_state.select(Some(pos));
                         }
                     }
                     // A card-root row (or nothing selected) — back to the cards.
@@ -3338,6 +4045,66 @@ fn handle_method_key(app: &mut App, terminal: &mut DefaultTerminal, key: KeyEven
     Ok(false)
 }
 
+fn method_to_commands(app: &mut App) {
+    let doc = app.method_doc;
+    let section = app.method_section;
+    let card = app.method_card;
+    let selection = app.method_tree_state.selected();
+    let sections = crate::methodology::sections(app.method_tree());
+    let Some(sec) = sections.get(section) else {
+        return;
+    };
+    let cards = card_roots(sec);
+    let row_title = rows_for(app, section, card)
+        .get(selection.unwrap_or(0))
+        .map(|r| r.title.clone())
+        .unwrap_or_default();
+    let card_title = cards.get(card).map(|c| c.0.clone()).unwrap_or_default();
+    let raw = format!("{} {} {}", short_section(&sec.title), card_title, row_title);
+    let stop = [
+        "the",
+        "and",
+        "for",
+        "with",
+        "from",
+        "into",
+        "this",
+        "that",
+        "using",
+        "check",
+        "enumerate",
+    ];
+    let mut words: Vec<String> = raw
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
+        .map(|w| {
+            w.trim_matches(|c: char| !c.is_ascii_alphanumeric())
+                .to_lowercase()
+        })
+        .filter(|w| {
+            w.len() > 2
+                && !stop.contains(&w.as_str())
+                && !(w.starts_with("t-") && w[2..].chars().all(|c| c.is_ascii_digit()))
+        })
+        .collect();
+    words.dedup();
+    words.truncate(5);
+    if words.is_empty() {
+        return;
+    }
+    app.method_return = Some((doc, section, card, selection));
+    app.top_tab = 0;
+    app.mode = SearchMode::ALL;
+    for _ in 0..3 {
+        app.query = words.join(" ");
+        app.cursor_index = app.query.len();
+        search(app, true);
+        if !app.results.is_empty() || words.len() <= 1 {
+            break;
+        }
+        words.pop();
+    }
+}
+
 /// Save the live position of the current (doc, section) into `method_pos` and
 /// record it as the document's active section.
 fn stash_method_pos(app: &mut App) {
@@ -3357,9 +4124,17 @@ fn stash_method_pos(app: &mut App) {
 /// Clamp the live section/card/row against the active doc's actual shape.
 fn clamp_method_live(app: &mut App) {
     let nsec = method_section_count(app);
-    app.method_section = if nsec == 0 { 0 } else { app.method_section.min(nsec - 1) };
+    app.method_section = if nsec == 0 {
+        0
+    } else {
+        app.method_section.min(nsec - 1)
+    };
     let ncards = method_card_count(app, app.method_section);
-    app.method_card = if ncards == 0 { 0 } else { app.method_card.min(ncards - 1) };
+    app.method_card = if ncards == 0 {
+        0
+    } else {
+        app.method_card.min(ncards - 1)
+    };
     let len = rows_for(app, app.method_section, app.method_card).len();
     if len == 0 {
         app.method_tree_state.select(None);
@@ -3420,7 +4195,11 @@ fn switch_method_doc(app: &mut App, idx: usize) {
 
     let section = app.method_doc_section.get(idx).copied().unwrap_or(0);
     app.method_section = section;
-    let p = app.method_pos.get(&(idx, section)).cloned().unwrap_or_default();
+    let p = app
+        .method_pos
+        .get(&(idx, section))
+        .cloned()
+        .unwrap_or_default();
     app.method_card = p.card;
     app.method_focus = p.focus;
     app.method_tree_state.select(p.tree_sel.or(Some(0)));
@@ -3466,7 +4245,7 @@ fn apply_method_checks(app: &mut App, lines: &[usize], checked: bool) {
         }
     }
     normalize_parent_markers(&mut fl);
-    let _ = fs::write(&path, fl.join("\n") + "\n");
+    let _ = crate::write_bytes_atomic(&path, (fl.join("\n") + "\n").as_bytes());
     app.method_reload();
 }
 
@@ -3478,10 +4257,11 @@ fn normalize_parent_markers(fl: &mut [String]) {
         for c in &node.children {
             visit(c, fl);
         }
-        if node.kind == MethodKind::Check && !node.is_leaf_check() {
-            if let Some(l) = fl.get_mut(node.src_line) {
-                set_marker_line(l, node.all_leaves_checked());
-            }
+        if node.kind == MethodKind::Check
+            && !node.is_leaf_check()
+            && let Some(l) = fl.get_mut(node.src_line)
+        {
+            set_marker_line(l, node.all_leaves_checked());
         }
     }
     for n in &tree {
@@ -3531,10 +4311,13 @@ fn reset_method_doc(app: &mut App) {
     if let Ok(content) = fs::read_to_string(&path) {
         let out: String = content
             .lines()
-            .map(|l| l.replacen("- [x]", "- [ ]", 1).replacen("- [X]", "- [ ]", 1))
+            .map(|l| {
+                l.replacen("- [x]", "- [ ]", 1)
+                    .replacen("- [X]", "- [ ]", 1)
+            })
             .collect::<Vec<_>>()
             .join("\n");
-        let _ = fs::write(&path, out + "\n");
+        let _ = crate::write_bytes_atomic(&path, (out + "\n").as_bytes());
         app.method_reload();
     }
 }
@@ -3582,10 +4365,14 @@ fn delete_method_card(app: &mut App) {
         if start < lines.len() {
             let end = end.min(lines.len());
             lines.drain(start..end);
-            let _ = fs::write(&path, lines.join("\n") + "\n");
+            let _ = crate::write_bytes_atomic(&path, (lines.join("\n") + "\n").as_bytes());
             app.method_reload();
             let n = method_card_count(app, app.method_section);
-            app.method_card = if n == 0 { 0 } else { app.method_card.min(n - 1) };
+            app.method_card = if n == 0 {
+                0
+            } else {
+                app.method_card.min(n - 1)
+            };
             app.method_tree_state.select(Some(0));
         }
     }
@@ -3601,7 +4388,11 @@ fn card_block_range(app: &App, si: usize, ci: usize) -> Option<(usize, usize)> {
         return None;
     }
     let heading_idx = if has_general { ci - 1 } else { ci };
-    let heading = sec.children.iter().filter(|c| c.is_heading()).nth(heading_idx)?;
+    let heading = sec
+        .children
+        .iter()
+        .filter(|c| c.is_heading())
+        .nth(heading_idx)?;
     let path = app.method_path()?;
     let content = fs::read_to_string(path).ok()?;
     let lines: Vec<&str> = content.lines().collect();
@@ -3622,7 +4413,7 @@ fn next_heading_boundary(lines: &[&str], from: usize) -> usize {
     lines.len()
 }
 
-fn delete_file_line(path: &Path, line_idx: usize) -> std::io::Result<()> {
+fn delete_file_line(path: &Path, line_idx: usize) -> Result<()> {
     let content = fs::read_to_string(path)?;
     let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
     if line_idx < lines.len() {
@@ -3634,14 +4425,16 @@ fn delete_file_line(path: &Path, line_idx: usize) -> std::io::Result<()> {
     }
     let mut out = lines.join("\n");
     out.push('\n');
-    fs::write(path, out)
+    crate::write_bytes_atomic(path, out.as_bytes())
 }
 
 /// Jump to a selected palette destination: switch section/card, expand the
 /// target heading's ancestors, and select its row.
 fn commit_method_jump(app: &mut App) {
     let cands = jump_filtered(app);
-    let target = cands.get(app.method_jump_sel).map(|t| (t.si, t.ci, t.key.clone()));
+    let target = cands
+        .get(app.method_jump_sel)
+        .map(|t| (t.si, t.ci, t.key.clone()));
     app.method_jump_active = false;
     app.method_jump_nav = false;
     app.method_query.clear();
@@ -3675,7 +4468,11 @@ fn commit_method_jump(app: &mut App) {
 /// techniques and items). With `add`, a fresh `## New Technique` card scaffold
 /// is inserted before the editor opens. On save the slice is spliced back and
 /// the tree re-parsed.
-fn edit_method_section(app: &mut App, terminal: &mut DefaultTerminal, add: bool) -> Result<()> {
+fn edit_method_section<B: Backend>(
+    app: &mut App,
+    terminal: &mut Terminal<B>,
+    add: bool,
+) -> Result<()> {
     let (start, end_opt) = {
         let sections = crate::methodology::sections(app.method_tree());
         let Some(sec) = sections.get(app.method_section) else {
@@ -3729,15 +4526,18 @@ fn edit_method_section(app: &mut App, terminal: &mut DefaultTerminal, add: bool)
         cursor_line = ins + 4;
     }
 
-    disable_raw_mode()?;
-    execute!(stdout(), LeaveAlternateScreen, Show)?;
-    fs::write(get_editor_temp_path(), format!("{}\n", buf.join("\n")))?;
-    let _ = open_editor_at(get_editor_temp_path(), cursor_line);
-    let edited = fs::read_to_string(get_editor_temp_path())?;
-    fs::remove_file(get_editor_temp_path())?;
-    enable_raw_mode()?;
-    execute!(stdout(), EnterAlternateScreen, Hide)?;
-    terminal.clear()?;
+    let initial = format!("{}\n", buf.join("\n"));
+    let Some(edited) = with_editor(
+        terminal,
+        app.print_result,
+        get_editor_temp_path(),
+        Some(cursor_line),
+        &initial,
+        |text| Ok(text.to_string()),
+    )?
+    else {
+        return Ok(());
+    };
 
     let mut new_lines: Vec<String> = Vec::with_capacity(all.len());
     new_lines.extend_from_slice(&all[..start]);
@@ -3745,7 +4545,7 @@ fn edit_method_section(app: &mut App, terminal: &mut DefaultTerminal, add: bool)
     new_lines.extend_from_slice(&all[end..]);
     let mut out = new_lines.join("\n");
     out.push('\n');
-    fs::write(&path, out)?;
+    crate::write_bytes_atomic(&path, out.as_bytes())?;
 
     app.method_reload();
     // Reclamp selections against the new tree.
@@ -3786,9 +4586,7 @@ fn render_top_tabs(frame: &mut Frame, area: Rect, app: &App) {
         let text = format!("{}  {}", icon, label);
         let w = text.chars().count();
         let style = if active {
-            Style::default()
-                .fg(C_ACCENT)
-                .add_modifier(Modifier::BOLD)
+            Style::default().fg(C_ACCENT).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(C_DIM)
         };
@@ -3803,25 +4601,28 @@ fn render_top_tabs(frame: &mut Frame, area: Rect, app: &App) {
             col += GAP;
         }
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)), Rect { height: 1, ..area });
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)),
+        Rect { height: 1, ..area },
+    );
 
     // Row 1: a heavy accent underline sitting under just the active tab.
-    if area.height > 1 {
-        if let Some(&(start, w)) = ranges.get(app.top_tab) {
-            let underline = Line::from(vec![
-                Span::raw(" ".repeat(start)),
-                Span::styled("━".repeat(w), Style::default().fg(C_ACCENT)),
-            ]);
-            frame.render_widget(
-                Paragraph::new(underline),
-                Rect {
-                    x: area.x,
-                    y: area.y + 1,
-                    width: area.width,
-                    height: 1,
-                },
-            );
-        }
+    if area.height > 1
+        && let Some(&(start, w)) = ranges.get(app.top_tab)
+    {
+        let underline = Line::from(vec![
+            Span::raw(" ".repeat(start)),
+            Span::styled("━".repeat(w), Style::default().fg(C_ACCENT)),
+        ]);
+        frame.render_widget(
+            Paragraph::new(underline),
+            Rect {
+                x: area.x,
+                y: area.y + 1,
+                width: area.width,
+                height: 1,
+            },
+        );
     }
 }
 
@@ -3829,7 +4630,7 @@ fn render_search_input(frame: &mut Frame, area: Rect, app: &App) {
     let mut mode_spans = vec![
         Span::styled(format!(" {} ", IC_SEARCH), Style::default().fg(C_ACCENT)),
         Span::styled(
-            format!(" {} ", app.mode.to_string()),
+            format!(" {} ", app.mode),
             Style::default()
                 .bg(C_CHIP_BG)
                 .fg(C_ACCENT)
@@ -3848,6 +4649,26 @@ fn render_search_input(frame: &mut Frame, area: Rect, app: &App) {
         Style::default().fg(C_TITLE),
     ));
     mode_spans.push(Span::raw(" "));
+    if let Some((doc, section, _, _)) = app.method_return {
+        let doc_name = app
+            .method_docs
+            .get(doc)
+            .map(|d| d.name.as_str())
+            .unwrap_or("Method");
+        let sec = app
+            .method_docs
+            .get(doc)
+            .and_then(|d| {
+                crate::methodology::sections(&d.tree)
+                    .get(section)
+                    .map(|s| short_section(&s.title))
+            })
+            .unwrap_or_default();
+        mode_spans.push(Span::styled(
+            format!(" ← {doc_name} · {sec} "),
+            Style::default().bg(C_CHIP_BG).fg(C_ACCENT),
+        ));
+    }
     // NAV badge when the results list has focus (j/k navigate, typing is off).
     if app.search_nav {
         mode_spans.push(Span::styled(
@@ -3882,10 +4703,11 @@ fn render_search_input(frame: &mut Frame, area: Rect, app: &App) {
             Span::styled(app.query.as_str(), Style::default().fg(C_FG_BRIGHT)),
         ];
         // Inline ghost-text completion, only while typing at the end of the query.
-        if !app.search_nav && app.cursor_index == app.query.len() {
-            if let Some(sfx) = complete_suffix(&app.vocab, last_token(&app.query)) {
-                spans.push(Span::styled(sfx, Style::default().fg(C_GUIDE)));
-            }
+        if !app.search_nav
+            && app.cursor_index == app.query.len()
+            && let Some(sfx) = complete_suffix(&app.vocab, last_token(&app.query))
+        {
+            spans.push(Span::styled(sfx, Style::default().fg(C_GUIDE)));
         }
         Line::from(spans)
     };
@@ -3971,6 +4793,7 @@ fn search(app: &mut App, reset_selection: bool) {
         &app.index,
         &app.query,
         &app.mode,
+        &app.frecency,
         |e| app.entry_passes_file(e),
     );
 
@@ -4025,7 +4848,9 @@ fn render_results(frame: &mut Frame, area: Rect, app: &mut App) {
             let mut lines: Vec<Line> = Vec::new();
 
             // Title (bold), with a small ✦ pinned top-right on favorites.
-            let title_style = Style::default().fg(C_FG_BRIGHT).add_modifier(Modifier::BOLD);
+            let title_style = Style::default()
+                .fg(C_FG_BRIGHT)
+                .add_modifier(Modifier::BOLD);
             let tw = if e.favorite {
                 inner_width.saturating_sub(2).max(1)
             } else {
@@ -4133,7 +4958,9 @@ fn render_chain(
                         .add_modifier(Modifier::BOLD),
                 )
             } else if is_current {
-                let s = Style::default().fg(C_FG_BRIGHT).add_modifier(Modifier::BOLD);
+                let s = Style::default()
+                    .fg(C_FG_BRIGHT)
+                    .add_modifier(Modifier::BOLD);
                 ("• ", s, s)
             } else {
                 let s = Style::default().fg(C_DIM);
@@ -4217,7 +5044,10 @@ fn render_detail(frame: &mut Frame, area: Rect, app: &mut App) {
 
     let mut lines = vec![
         Line::from(""),
-        Line::from(Span::styled(entry.title.clone(), Style::default().fg(C_TITLE))),
+        Line::from(Span::styled(
+            entry.title.clone(),
+            Style::default().fg(C_TITLE),
+        )),
     ];
     lines.extend(lines_iter);
 
@@ -4247,14 +5077,748 @@ fn render_detail(frame: &mut Frame, area: Rect, app: &mut App) {
     frame.render_widget(top, area);
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Fill-in-the-blanks
+//
+// Enter on a command opens this modal instead of copying blindly: each
+// detected variable becomes a row, pre-filled from the best source we can find
+// (last used → /etc/hosts → shell history → env → local tunnel IP → the
+// original literal). Enter walks the rows accepting defaults; the last Enter
+// copies the finished command and exits, exactly like Enter always has.
+// ─────────────────────────────────────────────────────────────────────────
+
+use crate::fill::{self, FillState, Origin};
+
+/// Enter on a command. With no detected blanks this is the old behaviour
+/// verbatim — copy and quit. Otherwise it opens the fill modal.
+fn open_fill_or_copy(app: &mut App, idx: usize) -> Result<bool> {
+    let cmd = app.entries[idx].cmd.clone();
+    let title = app.entries[idx].title.clone();
+    let entry_id = app.entries[idx].id.clone();
+    let (mut fields, slots) = fill::detect(&cmd);
+    // Bare switches get rows so they can be dropped, but they are not a reason
+    // to stop and open the modal — Enter on a command with nothing to fill has
+    // always just copied it.
+    if !fields.iter().any(|f| f.role == fill::Role::Value) {
+        finish_output(app, idx, cmd, std::collections::HashMap::new())?;
+        return Ok(true);
+    }
+
+    // Building the context shells out (ifconfig) and reads the history files,
+    // so it happens here on first use rather than at startup.
+    if app.var_ctx.is_none() {
+        app.var_ctx = Some(fill::VarContext::build(&app.vars_path));
+    }
+    let ctx = app.var_ctx.as_ref().unwrap();
+    let targets = ctx.hosts.clone();
+    let recall = app.recall.get(&entry_id);
+    for f in fields.iter_mut() {
+        // A bare switch has no value to suggest; its literal is the whole row.
+        if f.role != fill::Role::Value {
+            continue;
+        }
+        // Duplicate labels retain their grouping suffix in `canon`; reordering
+        // a template intentionally invalidates that per-entry recall key.
+        f.suggestions = ctx.suggest(f, targets.first(), recall);
+        let (v, o) = f
+            .suggestions
+            .first()
+            .cloned()
+            .unwrap_or((String::new(), Origin::Empty));
+        f.cursor = v.len();
+        f.value = v;
+        f.origin = o;
+    }
+
+    app.fill = Some(Box::new(FillState {
+        title,
+        cmd,
+        slots,
+        fields,
+        cur: 0,
+        targets,
+        target_idx: 0,
+        field_scroll: 0,
+        preview_scroll: 0,
+        notice: None,
+    }));
+    Ok(false)
+}
+
+/// Substitute, copy, remember the values, quit — the same exit path Enter has
+/// always taken.
+fn fill_finish(app: &mut App) -> Result<bool> {
+    let Some(st) = app.fill.take() else {
+        return Ok(true);
+    };
+    let rendered = fill::render_filled(&st);
+
+    let mut sticky = app
+        .var_ctx
+        .as_ref()
+        .map(|c| c.sticky.clone())
+        .unwrap_or_default();
+    for f in &st.fields {
+        if f.role == fill::Role::Value
+            && f.sticky
+            && !f.dropped
+            && !f.value.trim().is_empty()
+        {
+            sticky.insert(f.canon.clone(), f.value.clone());
+        }
+    }
+    fill::save_sticky(&app.vars_path, &sticky);
+    let vars: std::collections::HashMap<String, String> = st
+        .fields
+        .iter()
+        .filter(|f| f.role == fill::Role::Value && !f.dropped && !f.value.trim().is_empty())
+        .map(|f| (f.canon.clone(), f.value.clone()))
+        .collect();
+    let idx = app
+        .entries
+        .iter()
+        .position(|e| e.cmd == st.cmd && e.title == st.title);
+    if let Some(idx) = idx {
+        finish_output(app, idx, rendered, vars)?;
+    } else if app.print_result {
+        app.result = Some(rendered);
+    } else {
+        copy_to_clipboard(&rendered);
+        let _ = crate::usage::drop_for_prompt(&rendered);
+    }
+    Ok(true)
+}
+
+fn finish_output(
+    app: &mut App,
+    idx: usize,
+    rendered: String,
+    vars: std::collections::HashMap<String, String>,
+) -> Result<()> {
+    let entry = &app.entries[idx];
+    if app.print_result {
+        app.result = Some(rendered.clone());
+    } else {
+        copy_to_clipboard(&rendered);
+    }
+    let item = crate::usage::Use {
+        ts: crate::usage::now_iso(),
+        entry_id: entry.id.clone(),
+        title: entry.title.clone(),
+        source_stem: entry
+            .source_file
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        cmd: rendered,
+        vars: vars.clone(),
+    };
+    if !app.vars_path.to_string_lossy().contains("f1nder-test-vars") {
+        // Only the clipboard path needs the drop file: with --print the shell
+        // already has the command in hand, and pushing it twice would double it.
+        if !app.print_result {
+            let _ = crate::usage::drop_for_prompt(&item.cmd);
+        }
+        let _ = crate::usage::append(&app.profile, item.clone());
+        if !vars.is_empty() {
+            let _ = crate::usage::export_env(&app.profile, &vars);
+        }
+    }
+    app.recall.insert(item.entry_id.clone(), vars);
+    app.recent.insert(0, item);
+    app.recent.truncate(500);
+    Ok(())
+}
+
+fn prev_boundary(s: &str, i: usize) -> usize {
+    s[..i]
+        .chars()
+        .next_back()
+        .map(|c| i - c.len_utf8())
+        .unwrap_or(0)
+}
+
+fn next_boundary(s: &str, i: usize) -> usize {
+    s[i..].chars().next().map(|c| i + c.len_utf8()).unwrap_or(i)
+}
+
+/// Move the focus, keeping the visible window over the field list in sync.
+fn fill_focus(st: &mut FillState, next: usize) {
+    st.cur = next.min(st.fields.len().saturating_sub(1));
+    if st.cur < st.field_scroll {
+        st.field_scroll = st.cur;
+    }
+}
+
+fn fill_completion(app: &App) -> Option<String> {
+    let st = app.fill.as_ref()?;
+    let f = st.fields.get(st.cur)?;
+    if f.dropped || f.cursor != f.value.len() {
+        return None;
+    }
+    let mut candidates: Vec<String> = f.suggestions.iter().map(|(v, _)| v.clone()).collect();
+    if let Some(values) = app.var_ctx.as_ref().and_then(|c| c.by_kind.get(&f.kind)) {
+        candidates.extend(values.iter().cloned());
+    }
+    if f.kind == fill::VarKind::File
+        && let Some(path) = cached_complete_path(app, &f.value)
+    {
+        candidates.insert(0, path);
+    }
+    fill::complete_value(&candidates, &f.value)
+}
+
+/// `complete_path` behind a one-entry memo keyed on the typed value, so the
+/// directory is read once per keystroke rather than once per rendered frame.
+fn cached_complete_path(app: &App, typed: &str) -> Option<String> {
+    if let Some((key, hit)) = app.path_cache.borrow().as_ref()
+        && key == typed
+    {
+        return hit.clone();
+    }
+    let hit = complete_path(typed);
+    *app.path_cache.borrow_mut() = Some((typed.to_string(), hit.clone()));
+    hit
+}
+
+fn complete_path(typed: &str) -> Option<String> {
+    if !(typed.contains('/') || typed.starts_with('~') || typed.starts_with('.')) {
+        return None;
+    }
+    let slash = typed.rfind('/');
+    let (shown_dir, base) = slash.map_or(("./", typed), |i| (&typed[..=i], &typed[i + 1..]));
+    let expanded = if let Some(rest) = shown_dir.strip_prefix('~') {
+        PathBuf::from(std::env::var_os("HOME")?).join(rest.trim_start_matches('/'))
+    } else {
+        PathBuf::from(shown_dir)
+    };
+    let mut entries: Vec<_> = fs::read_dir(expanded).ok()?.flatten().collect();
+    entries.sort_by_key(|e| e.file_name());
+    let base_l = base.to_lowercase();
+    entries.into_iter().find_map(|entry| {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.to_lowercase().starts_with(&base_l) || name.len() <= base.len() {
+            return None;
+        }
+        let slash = if entry.file_type().ok()?.is_dir() {
+            "/"
+        } else {
+            ""
+        };
+        Some(format!("{shown_dir}{name}{slash}"))
+    })
+}
+
+/// Cycle through the candidates gathered for the focused field.
+fn fill_cycle_suggestion(st: &mut FillState, forward: bool) {
+    let cur = st.cur;
+    let n = st.fields[cur].suggestions.len();
+    if n == 0 {
+        return;
+    }
+    let f = &mut st.fields[cur];
+    f.sugg_idx = if forward {
+        (f.sugg_idx + 1) % n
+    } else {
+        (f.sugg_idx + n - 1) % n
+    };
+    let (v, o) = f.suggestions[f.sugg_idx].clone();
+    f.cursor = v.len();
+    f.value = v;
+    f.origin = o;
+    f.edited = false;
+}
+
+fn handle_fill_key(app: &mut App, key: KeyEvent) -> Result<bool> {
+    let ctrl = key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER);
+
+    let completion = fill_completion(app);
+    match key.code {
+        KeyCode::Esc => {
+            app.fill = None;
+        }
+        // Ctrl+Enter / Ctrl+Y finish from any field, leaving the rest at their
+        // defaults. (Not every terminal reports Ctrl+Enter, hence both.)
+        KeyCode::Enter if ctrl => return fill_finish(app),
+        KeyCode::Char('y' | 'Y') if ctrl => return fill_finish(app),
+        KeyCode::Enter => {
+            let last = {
+                let st = app.fill.as_ref().unwrap();
+                st.cur + 1 >= st.fields.len()
+            };
+            if last {
+                return fill_finish(app);
+            }
+            let st = app.fill.as_mut().unwrap();
+            fill_focus(st, st.cur + 1);
+        }
+        KeyCode::Tab if completion.is_some() => {
+            let suffix = completion.unwrap();
+            let st = app.fill.as_mut().unwrap();
+            let f = &mut st.fields[st.cur];
+            f.value.push_str(&suffix);
+            f.cursor = f.value.len();
+            f.edited = true;
+        }
+        KeyCode::Tab | KeyCode::Down => {
+            let st = app.fill.as_mut().unwrap();
+            let next = (st.cur + 1) % st.fields.len();
+            fill_focus(st, next);
+        }
+        KeyCode::BackTab | KeyCode::Up => {
+            let st = app.fill.as_mut().unwrap();
+            let n = st.fields.len();
+            let next = (st.cur + n - 1) % n;
+            fill_focus(st, next);
+        }
+        // Suggestions live on ←/→ paging with Alt, and on Ctrl+N/Ctrl+P, so the
+        // arrows stay free for cursor movement inside the value.
+        KeyCode::Char('n' | 'N') if ctrl => fill_cycle_suggestion(app.fill.as_mut().unwrap(), true),
+        KeyCode::Char('p' | 'P') if ctrl => {
+            fill_cycle_suggestion(app.fill.as_mut().unwrap(), false)
+        }
+        // Cycle the active /etc/hosts target; host-shaped fields you have not
+        // typed into follow it.
+        KeyCode::Char('t' | 'T') if ctrl => {
+            let st = app.fill.as_mut().unwrap();
+            if !st.targets.is_empty() {
+                st.target_idx = (st.target_idx + 1) % st.targets.len();
+                let target = st.targets[st.target_idx].clone();
+                if let Some(ctx) = app.var_ctx.as_ref() {
+                    let st = app.fill.as_mut().unwrap();
+                    ctx.apply_target(&mut st.fields, Some(&target));
+                }
+            }
+        }
+        // Reset the focused field to its detected default.
+        KeyCode::Char('r' | 'R') if ctrl => {
+            let st = app.fill.as_mut().unwrap();
+            let f = &mut st.fields[st.cur];
+            f.sugg_idx = 0;
+            let (v, o) = f
+                .suggestions
+                .first()
+                .cloned()
+                .unwrap_or((String::new(), Origin::Empty));
+            f.cursor = v.len();
+            f.value = v;
+            f.origin = o;
+            f.edited = false;
+        }
+        KeyCode::Char('u' | 'U') if ctrl => {
+            let st = app.fill.as_mut().unwrap();
+            let f = &mut st.fields[st.cur];
+            f.value.clear();
+            f.cursor = 0;
+            f.edited = true;
+            f.origin = Origin::Empty;
+        }
+        KeyCode::Char('x' | 'X') if ctrl => {
+            let st = app.fill.as_mut().unwrap();
+            let cur = st.cur;
+            // An added row is not part of the stored command, so it goes away
+            // entirely rather than being struck through.
+            if fill::remove_added(st, cur) {
+                st.cur = cur.min(st.fields.len().saturating_sub(1));
+                st.notice = None;
+                return Ok(false);
+            }
+            let can_drop = st.slots.iter().any(|s| s.field == cur && s.drop.is_some());
+            if can_drop {
+                st.fields[cur].dropped = !st.fields[cur].dropped;
+                st.notice = None;
+            } else {
+                st.notice = Some("can't drop this one — it's inside a larger token".into());
+            }
+        }
+        // Add an argument at the focused row's position in the command.
+        KeyCode::Char('a' | 'A') if ctrl => {
+            let st = app.fill.as_mut().unwrap();
+            let cur = st.cur;
+            st.cur = fill::insert_arg(st, cur);
+            st.notice = None;
+        }
+        KeyCode::PageUp => {
+            let st = app.fill.as_mut().unwrap();
+            st.preview_scroll = st.preview_scroll.saturating_sub(1);
+        }
+        KeyCode::PageDown => {
+            let st = app.fill.as_mut().unwrap();
+            st.preview_scroll = st.preview_scroll.saturating_add(1);
+        }
+        KeyCode::Char('w' | 'W') if ctrl => {
+            let st = app.fill.as_mut().unwrap();
+            let f = &mut st.fields[st.cur];
+            let head = &f.value[..f.cursor];
+            let keep = head
+                .trim_end()
+                .rfind(|c: char| c.is_whitespace())
+                .map_or(0, |i| i + 1);
+            f.value.replace_range(keep..f.cursor, "");
+            f.cursor = keep;
+            f.edited = true;
+        }
+        KeyCode::Left => {
+            let st = app.fill.as_mut().unwrap();
+            let f = &mut st.fields[st.cur];
+            f.cursor = prev_boundary(&f.value, f.cursor);
+        }
+        KeyCode::Right if completion.is_some() => {
+            let suffix = completion.unwrap();
+            let st = app.fill.as_mut().unwrap();
+            let f = &mut st.fields[st.cur];
+            f.value.push_str(&suffix);
+            f.cursor = f.value.len();
+            f.edited = true;
+        }
+        KeyCode::Right => {
+            let st = app.fill.as_mut().unwrap();
+            let f = &mut st.fields[st.cur];
+            f.cursor = next_boundary(&f.value, f.cursor);
+        }
+        KeyCode::Home => {
+            let st = app.fill.as_mut().unwrap();
+            st.fields[st.cur].cursor = 0;
+        }
+        KeyCode::End => {
+            let st = app.fill.as_mut().unwrap();
+            let f = &mut st.fields[st.cur];
+            f.cursor = f.value.len();
+        }
+        KeyCode::Backspace => {
+            let st = app.fill.as_mut().unwrap();
+            let f = &mut st.fields[st.cur];
+            if f.cursor > 0 {
+                let at = prev_boundary(&f.value, f.cursor);
+                f.value.replace_range(at..f.cursor, "");
+                f.cursor = at;
+                f.edited = true;
+            }
+        }
+        KeyCode::Delete => {
+            let st = app.fill.as_mut().unwrap();
+            let f = &mut st.fields[st.cur];
+            if f.cursor < f.value.len() {
+                let to = next_boundary(&f.value, f.cursor);
+                f.value.replace_range(f.cursor..to, "");
+                f.edited = true;
+            }
+        }
+        KeyCode::Char(c) if !ctrl => {
+            let st = app.fill.as_mut().unwrap();
+            let f = &mut st.fields[st.cur];
+            f.value.insert(f.cursor, c);
+            f.cursor += c.len_utf8();
+            f.edited = true;
+            f.origin = Origin::Empty;
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+/// Break `text` into spans, starting a new `Line` at every newline so
+/// multi-line commands render as they will be pasted.
+fn push_preview(
+    lines: &mut Vec<Line<'static>>,
+    cur: &mut Vec<Span<'static>>,
+    text: &str,
+    style: Style,
+) {
+    let mut first = true;
+    for part in text.split('\n') {
+        if !first {
+            lines.push(Line::from(std::mem::take(cur)));
+        }
+        first = false;
+        if !part.is_empty() {
+            cur.push(Span::styled(part.to_string(), style));
+        }
+    }
+}
+
+/// The live command preview: the original text with every slot substituted, the
+/// focused field's occurrences picked out in reverse video.
+fn fill_preview_lines(st: &FillState) -> Vec<Line<'static>> {
+    if st.fields.iter().any(|f| f.dropped) {
+        return fill::render_filled(st)
+            .split('\n')
+            .map(|line| Line::from(Span::styled(line.to_string(), Style::default().fg(C_TITLE))))
+            .collect();
+    }
+    let plain = Style::default().fg(C_TITLE);
+    let filled = Style::default().fg(C_ACCENT);
+    let focused = Style::default()
+        .fg(C_FG_BRIGHT)
+        .bg(C_HIGHLIGHT_BG)
+        .add_modifier(Modifier::BOLD);
+    let empty = Style::default().fg(C_DIM).add_modifier(Modifier::ITALIC);
+
+    let mut lines: Vec<Line> = Vec::new();
+    let mut cur: Vec<Span> = Vec::new();
+    let mut at = 0usize;
+    for slot in &st.slots {
+        if slot.start > at {
+            push_preview(&mut lines, &mut cur, &st.cmd[at..slot.start], plain);
+        }
+        let f = &st.fields[slot.field];
+        let (text, style) = if f.value.is_empty() {
+            (format!("«{}»", f.label), empty)
+        } else if slot.field == st.cur {
+            (f.value.clone(), focused)
+        } else {
+            (f.value.clone(), filled)
+        };
+        push_preview(&mut lines, &mut cur, &text, style);
+        at = slot.end;
+    }
+    if at < st.cmd.len() {
+        push_preview(&mut lines, &mut cur, &st.cmd[at..], plain);
+    }
+    lines.push(Line::from(cur));
+    lines
+}
+
+/// Render the fill modal. Returns nothing; the cursor is placed on the focused
+/// field's value so typing reads naturally.
+fn render_fill(frame: &mut Frame, area: Rect, app: &mut App) {
+    let ghost = fill_completion(app);
+    let Some(st) = app.fill.as_mut() else { return };
+
+    let width = area.width.saturating_sub(6).clamp(40, 110);
+    let inner_w = width.saturating_sub(4).max(10);
+
+    let preview = fill_preview_lines(st);
+    // Paragraph wraps, so estimate the wrapped height to size the popup.
+    let wanted_preview_h: u16 = preview
+        .iter()
+        .map(|l| {
+            let w = l.width().max(1) as u16;
+            w.div_ceil(inner_w).max(1)
+        })
+        .sum::<u16>()
+        .max(1);
+
+    let max_height = (area.height.saturating_mul(4) / 5).max(7);
+    let shown = st.fields.len().min(max_height.saturating_sub(5) as usize);
+    let preview_h = wanted_preview_h.min(max_height.saturating_sub(shown as u16 + 4).max(1));
+    // Keep the focused row inside the window.
+    if st.cur >= st.field_scroll + shown {
+        st.field_scroll = st.cur + 1 - shown;
+    }
+    if st.cur < st.field_scroll {
+        st.field_scroll = st.cur;
+    }
+
+    let height = (preview_h + shown as u16 + 4).min(area.height.saturating_sub(2).max(7));
+    let popup = centered_rect(width, height, area);
+
+    let filled_n = st.fields.iter().filter(|f| !f.value.is_empty()).count();
+    let window = if st.fields.len() > shown {
+        format!(" · {}/{} ▾", st.cur + 1, st.fields.len())
+    } else {
+        String::new()
+    };
+    let title = format!(" Fill  ·  {}/{} set{} ", filled_n, st.fields.len(), window);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(C_ACCENT))
+        .padding(Padding::new(1, 1, 0, 0))
+        .title(title)
+        .title_alignment(Alignment::Center);
+    let inner = block.inner(popup);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(block, popup);
+
+    let rows = Layout::vertical([
+        Constraint::Length(preview_h),
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+
+    let total_preview = preview.len();
+    let start = st.preview_scroll.min(total_preview.saturating_sub(1));
+    let mut shown_preview: Vec<_> = preview
+        .into_iter()
+        .skip(start)
+        .take(preview_h as usize)
+        .collect();
+    if start + shown_preview.len() < total_preview && !shown_preview.is_empty() {
+        let more = total_preview - start - shown_preview.len();
+        *shown_preview.last_mut().unwrap() = Line::from(Span::styled(
+            format!("… +{more} more lines"),
+            Style::default().fg(C_GUIDE),
+        ));
+    }
+    frame.render_widget(
+        Paragraph::new(shown_preview).wrap(Wrap { trim: false }),
+        rows[0],
+    );
+
+    // ── field rows ────────────────────────────────────────────────────
+    let label_w = st
+        .fields
+        .iter()
+        .map(|f| f.label.chars().count())
+        .max()
+        .unwrap_or(6)
+        .clamp(6, 18);
+    let hint_w = 15usize;
+    let value_w = (rows[2].width as usize).saturating_sub(2 + label_w + 1 + hint_w + 1);
+
+    let mut items: Vec<Line> = Vec::new();
+    for (i, f) in st
+        .fields
+        .iter()
+        .enumerate()
+        .skip(st.field_scroll)
+        .take(shown)
+    {
+        let focused = i == st.cur;
+        let marker = if f.dropped {
+            "⨯ "
+        } else if focused {
+            "▸ "
+        } else if f.role == fill::Role::Added {
+            "+ "
+        } else if f.role == fill::Role::Flag {
+            "⚑ "
+        } else {
+            "  "
+        };
+        let label_style = if focused {
+            Style::default()
+                .fg(C_FG_BRIGHT)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(C_DIM)
+        };
+        let (value_text, mut value_style) = if !f.value.is_empty() {
+            (
+                f.value.clone(),
+                Style::default().fg(if focused { C_FG_BRIGHT } else { C_TITLE }),
+            )
+        } else if f.role == fill::Role::Flag {
+            // A bare switch is its own value: show the token it will drop
+            // rather than an em dash that looks like an unfilled blank.
+            (
+                f.literal.clone(),
+                Style::default().fg(C_GUIDE).add_modifier(Modifier::DIM),
+            )
+        } else {
+            (
+                "—".to_string(),
+                Style::default().fg(C_GUIDE).add_modifier(Modifier::ITALIC),
+            )
+        };
+        if f.dropped {
+            value_style = value_style.add_modifier(Modifier::DIM | Modifier::CROSSED_OUT);
+        }
+        let shown_value: String = value_text.chars().take(value_w.max(4)).collect();
+        let ghost_text = if focused && !f.dropped && f.cursor == f.value.len() {
+            ghost
+                .as_deref()
+                .unwrap_or("")
+                .chars()
+                .take(value_w.saturating_sub(shown_value.chars().count()))
+                .collect::<String>()
+        } else {
+            String::new()
+        };
+        let pad = value_w.saturating_sub(shown_value.chars().count() + ghost_text.chars().count());
+
+        // For host-derived values the useful hint is *which* target, and the
+        // short name identifies it better than the full FQDN in 15 columns.
+        let mut hint = f.origin.label().to_string();
+        if f.origin == Origin::Hosts
+            && let Some(t) = st.targets.get(st.target_idx)
+        {
+            hint = if t.short.is_empty() {
+                t.display().to_string()
+            } else {
+                t.short.clone()
+            };
+        }
+        let counter = if f.suggestions.len() > 1 {
+            format!(" {}/{}", f.sugg_idx + 1, f.suggestions.len())
+        } else {
+            String::new()
+        };
+        // Trim the name, not the counter — the tail is the part worth keeping.
+        let room = hint_w.saturating_sub(counter.chars().count());
+        if hint.chars().count() > room {
+            hint = hint
+                .chars()
+                .take(room.saturating_sub(1))
+                .collect::<String>()
+                + "…";
+        }
+        let hint = format!("{hint}{counter}");
+
+        items.push(Line::from(vec![
+            Span::styled(
+                marker,
+                Style::default().fg(if focused { C_ACCENT } else { C_BORDER }),
+            ),
+            Span::styled(format!("{:<w$} ", f.label, w = label_w), label_style),
+            Span::styled(shown_value, value_style),
+            Span::styled(ghost_text, Style::default().fg(C_GUIDE)),
+            Span::raw(" ".repeat(pad + 1)),
+            Span::styled(format!("{hint:>hint_w$}"), Style::default().fg(C_GUIDE)),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(items), rows[2]);
+
+    // ── hint bar ──────────────────────────────────────────────────────
+    let last = st.cur + 1 >= st.fields.len();
+    let advance = if last { "⏎ copy & exit" } else { "⏎ next" };
+    let target_hint = if st.targets.len() > 1 {
+        format!(" · ^T target ({}/{})", st.target_idx + 1, st.targets.len())
+    } else {
+        String::new()
+    };
+    // Everything after `⏎` comes from the single key table, so the modal's bar
+    // and the footer cannot drift apart (`^A add arg` was already missing here).
+    let rest = keys::hint(Scope::Fill)
+        .split(" · ")
+        .filter(|part| !part.starts_with('⏎') && !part.starts_with("^T"))
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let hint = st.notice.clone().unwrap_or_else(|| {
+        format!("{advance} · {rest}{target_hint} · env.sh · Esc cancel")
+    });
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(hint, Style::default().fg(C_DIM))))
+            .alignment(Alignment::Center),
+        rows[3],
+    );
+
+    // ── cursor on the focused value ───────────────────────────────────
+    if st.cur >= st.field_scroll && st.cur < st.field_scroll + shown {
+        let f = &st.fields[st.cur];
+        let col = f.value[..f.cursor].chars().count().min(value_w.max(4));
+        let x = rows[2].x + 2 + label_w as u16 + 1 + col as u16;
+        let y = rows[2].y + (st.cur - st.field_scroll) as u16;
+        if x < rows[2].x + rows[2].width && y < rows[2].y + rows[2].height {
+            frame.set_cursor_position(Position::new(x, y));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        chain_present, file_filter_toggle, handle_fill_key, init_chain_sel, open_fill_or_copy,
-        parse_template_str, reset_search_view, search_nav_down, search_scroll_down,
+        chain_present, file_filter_toggle, handle_fill_key, handle_mode_popup_key, init_chain_sel,
+        mode_options, open_fill_or_copy, parse_template_str, reset_search_view, search_nav_down,
+        search_scroll_down,
     };
     use crate::fill;
-    use crate::{App, Chain, Entry, SearchPane};
+    use crate::{App, Chain, Entry, SearchMode, SearchPane};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::path::{Path, PathBuf};
 
@@ -4422,6 +5986,44 @@ azurenum --interactive\n";
     }
 
     #[test]
+    fn the_mode_picker_numbers_map_to_modes() {
+        let mut app = App::new(
+            vec![mk_entry("a")],
+            vec![],
+            PathBuf::from("/tmp"),
+            PathBuf::from("/tmp"),
+            vec![],
+        );
+        app.top_tab = 0;
+        app.mode_popup_active = true;
+
+        // "4" is CMD in the Search list; picking closes the popup.
+        handle_mode_popup_key(&mut app, key(KeyCode::Char('4'))).unwrap();
+        assert_eq!(app.mode, SearchMode::CMD);
+        assert!(!app.mode_popup_active);
+
+        // A number past the end of the list is ignored, popup stays open.
+        app.mode_popup_active = true;
+        handle_mode_popup_key(&mut app, key(KeyCode::Char('9'))).unwrap();
+        assert_eq!(app.mode, SearchMode::CMD);
+        assert!(app.mode_popup_active);
+
+        // Esc closes without changing the mode.
+        handle_mode_popup_key(&mut app, key(KeyCode::Esc)).unwrap();
+        assert_eq!(app.mode, SearchMode::CMD);
+        assert!(!app.mode_popup_active);
+
+        // On Browse the picker drives browse_mode, and RECENT is not offered.
+        app.top_tab = 1;
+        app.mode_popup_active = true;
+        assert_eq!(mode_options(1).len(), 4);
+        assert!(!mode_options(1).contains(&SearchMode::RECENT));
+        handle_mode_popup_key(&mut app, key(KeyCode::Char('2'))).unwrap();
+        assert_eq!(app.browse_mode, SearchMode::TITLE);
+        assert_eq!(app.mode, SearchMode::CMD); // Search mode untouched
+    }
+
+    #[test]
     fn rejects_block_missing_commands() {
         let no_cmds = "--- TITLE ---\nX\n--- HEADING_PATH ---\nA > B\n\
                        --- DESCRIPTION ---\nd\n--- SOURCE-FILE ---\nOAOTC\n--- COMMANDS ---\n";
@@ -4444,7 +6046,13 @@ azurenum --interactive\n";
     fn app_named(cmd: &str, tag: &str) -> App {
         let mut e = mk_entry("z");
         e.cmd = cmd.to_string();
-        let mut app = App::new(vec![e], vec![], PathBuf::from("/tmp"), PathBuf::from("/tmp"), vec![]);
+        let mut app = App::new(
+            vec![e],
+            vec![],
+            PathBuf::from("/tmp"),
+            PathBuf::from("/tmp"),
+            vec![],
+        );
         app.results = vec![0];
         app.list_state.select(Some(0));
         // Keep the test off the machine's real /etc/hosts and shell history.
@@ -4454,6 +6062,7 @@ azurenum --interactive\n";
             history: Default::default(),
             env: Default::default(),
             local_ip: None,
+            by_kind: Default::default(),
         });
         app.vars_path = PathBuf::from(format!("/tmp/f1nder-test-vars-{tag}.json"));
         let _ = std::fs::remove_file(&app.vars_path);
@@ -4548,474 +6157,5 @@ azurenum --interactive\n";
         assert!(handle_fill_key(&mut app, ctrl('y')).unwrap());
         assert!(app.fill.is_none());
         let _ = std::fs::remove_file("/tmp/f1nder-test-vars-copynow.json");
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────
-// Fill-in-the-blanks
-//
-// Enter on a command opens this modal instead of copying blindly: each
-// detected variable becomes a row, pre-filled from the best source we can find
-// (last used → /etc/hosts → shell history → env → local tunnel IP → the
-// original literal). Enter walks the rows accepting defaults; the last Enter
-// copies the finished command and exits, exactly like Enter always has.
-// ─────────────────────────────────────────────────────────────────────────
-
-use crate::fill::{self, FillState, Origin};
-
-/// Enter on a command. With no detected blanks this is the old behaviour
-/// verbatim — copy and quit. Otherwise it opens the fill modal.
-fn open_fill_or_copy(app: &mut App, idx: usize) -> Result<bool> {
-    let cmd = app.entries[idx].cmd.clone();
-    let title = app.entries[idx].title.clone();
-    let (mut fields, slots) = fill::detect(&cmd);
-    if fields.is_empty() {
-        copy_to_clipboard(&cmd);
-        return Ok(true);
-    }
-
-    // Building the context shells out (ifconfig) and reads the history files,
-    // so it happens here on first use rather than at startup.
-    if app.var_ctx.is_none() {
-        app.var_ctx = Some(fill::VarContext::build(&app.vars_path));
-    }
-    let ctx = app.var_ctx.as_ref().unwrap();
-    let targets = ctx.hosts.clone();
-    for f in fields.iter_mut() {
-        f.suggestions = ctx.suggest(f, targets.first());
-        let (v, o) = f
-            .suggestions
-            .first()
-            .cloned()
-            .unwrap_or((String::new(), Origin::Empty));
-        f.cursor = v.len();
-        f.value = v;
-        f.origin = o;
-    }
-
-    app.fill = Some(Box::new(FillState {
-        title,
-        cmd,
-        slots,
-        fields,
-        cur: 0,
-        targets,
-        target_idx: 0,
-        field_scroll: 0,
-    }));
-    Ok(false)
-}
-
-/// Substitute, copy, remember the values, quit — the same exit path Enter has
-/// always taken.
-fn fill_finish(app: &mut App) -> Result<bool> {
-    let Some(st) = app.fill.take() else {
-        return Ok(true);
-    };
-    copy_to_clipboard(&fill::render_filled(&st));
-
-    let mut sticky = app
-        .var_ctx
-        .as_ref()
-        .map(|c| c.sticky.clone())
-        .unwrap_or_default();
-    for f in &st.fields {
-        if f.sticky && !f.value.trim().is_empty() {
-            sticky.insert(f.canon.clone(), f.value.clone());
-        }
-    }
-    fill::save_sticky(&app.vars_path, &sticky);
-    Ok(true)
-}
-
-fn prev_boundary(s: &str, i: usize) -> usize {
-    s[..i].chars().next_back().map(|c| i - c.len_utf8()).unwrap_or(0)
-}
-
-fn next_boundary(s: &str, i: usize) -> usize {
-    s[i..].chars().next().map(|c| i + c.len_utf8()).unwrap_or(i)
-}
-
-/// Move the focus, keeping the visible window over the field list in sync.
-fn fill_focus(st: &mut FillState, next: usize) {
-    st.cur = next.min(st.fields.len().saturating_sub(1));
-    if st.cur < st.field_scroll {
-        st.field_scroll = st.cur;
-    }
-}
-
-/// Cycle through the candidates gathered for the focused field.
-fn fill_cycle_suggestion(st: &mut FillState, forward: bool) {
-    let cur = st.cur;
-    let n = st.fields[cur].suggestions.len();
-    if n == 0 {
-        return;
-    }
-    let f = &mut st.fields[cur];
-    f.sugg_idx = if forward {
-        (f.sugg_idx + 1) % n
-    } else {
-        (f.sugg_idx + n - 1) % n
-    };
-    let (v, o) = f.suggestions[f.sugg_idx].clone();
-    f.cursor = v.len();
-    f.value = v;
-    f.origin = o;
-    f.edited = false;
-}
-
-fn handle_fill_key(app: &mut App, key: KeyEvent) -> Result<bool> {
-    let ctrl = key
-        .modifiers
-        .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER);
-
-    match key.code {
-        KeyCode::Esc => {
-            app.fill = None;
-        }
-        // Ctrl+Enter / Ctrl+Y finish from any field, leaving the rest at their
-        // defaults. (Not every terminal reports Ctrl+Enter, hence both.)
-        KeyCode::Enter if ctrl => return fill_finish(app),
-        KeyCode::Char('y' | 'Y') if ctrl => return fill_finish(app),
-        KeyCode::Enter => {
-            let last = {
-                let st = app.fill.as_ref().unwrap();
-                st.cur + 1 >= st.fields.len()
-            };
-            if last {
-                return fill_finish(app);
-            }
-            let st = app.fill.as_mut().unwrap();
-            fill_focus(st, st.cur + 1);
-        }
-        KeyCode::Tab | KeyCode::Down => {
-            let st = app.fill.as_mut().unwrap();
-            let next = (st.cur + 1) % st.fields.len();
-            fill_focus(st, next);
-        }
-        KeyCode::BackTab | KeyCode::Up => {
-            let st = app.fill.as_mut().unwrap();
-            let n = st.fields.len();
-            let next = (st.cur + n - 1) % n;
-            fill_focus(st, next);
-        }
-        // Suggestions live on ←/→ paging with Alt, and on Ctrl+N/Ctrl+P, so the
-        // arrows stay free for cursor movement inside the value.
-        KeyCode::Char('n' | 'N') if ctrl => {
-            fill_cycle_suggestion(app.fill.as_mut().unwrap(), true)
-        }
-        KeyCode::Char('p' | 'P') if ctrl => {
-            fill_cycle_suggestion(app.fill.as_mut().unwrap(), false)
-        }
-        // Cycle the active /etc/hosts target; host-shaped fields you have not
-        // typed into follow it.
-        KeyCode::Char('t' | 'T') if ctrl => {
-            let st = app.fill.as_mut().unwrap();
-            if !st.targets.is_empty() {
-                st.target_idx = (st.target_idx + 1) % st.targets.len();
-                let target = st.targets[st.target_idx].clone();
-                if let Some(ctx) = app.var_ctx.as_ref() {
-                    let st = app.fill.as_mut().unwrap();
-                    ctx.apply_target(&mut st.fields, Some(&target));
-                }
-            }
-        }
-        // Reset the focused field to its detected default.
-        KeyCode::Char('r' | 'R') if ctrl => {
-            let st = app.fill.as_mut().unwrap();
-            let f = &mut st.fields[st.cur];
-            f.sugg_idx = 0;
-            let (v, o) = f
-                .suggestions
-                .first()
-                .cloned()
-                .unwrap_or((String::new(), Origin::Empty));
-            f.cursor = v.len();
-            f.value = v;
-            f.origin = o;
-            f.edited = false;
-        }
-        KeyCode::Char('u' | 'U') if ctrl => {
-            let st = app.fill.as_mut().unwrap();
-            let f = &mut st.fields[st.cur];
-            f.value.clear();
-            f.cursor = 0;
-            f.edited = true;
-            f.origin = Origin::Empty;
-        }
-        KeyCode::Char('w' | 'W') if ctrl => {
-            let st = app.fill.as_mut().unwrap();
-            let f = &mut st.fields[st.cur];
-            let head = &f.value[..f.cursor];
-            let keep = head.trim_end().rfind(|c: char| c.is_whitespace()).map_or(0, |i| i + 1);
-            f.value.replace_range(keep..f.cursor, "");
-            f.cursor = keep;
-            f.edited = true;
-        }
-        KeyCode::Left => {
-            let st = app.fill.as_mut().unwrap();
-            let f = &mut st.fields[st.cur];
-            f.cursor = prev_boundary(&f.value, f.cursor);
-        }
-        KeyCode::Right => {
-            let st = app.fill.as_mut().unwrap();
-            let f = &mut st.fields[st.cur];
-            f.cursor = next_boundary(&f.value, f.cursor);
-        }
-        KeyCode::Home => {
-            let st = app.fill.as_mut().unwrap();
-            st.fields[st.cur].cursor = 0;
-        }
-        KeyCode::End => {
-            let st = app.fill.as_mut().unwrap();
-            let f = &mut st.fields[st.cur];
-            f.cursor = f.value.len();
-        }
-        KeyCode::Backspace => {
-            let st = app.fill.as_mut().unwrap();
-            let f = &mut st.fields[st.cur];
-            if f.cursor > 0 {
-                let at = prev_boundary(&f.value, f.cursor);
-                f.value.replace_range(at..f.cursor, "");
-                f.cursor = at;
-                f.edited = true;
-            }
-        }
-        KeyCode::Delete => {
-            let st = app.fill.as_mut().unwrap();
-            let f = &mut st.fields[st.cur];
-            if f.cursor < f.value.len() {
-                let to = next_boundary(&f.value, f.cursor);
-                f.value.replace_range(f.cursor..to, "");
-                f.edited = true;
-            }
-        }
-        KeyCode::Char(c) if !ctrl => {
-            let st = app.fill.as_mut().unwrap();
-            let f = &mut st.fields[st.cur];
-            f.value.insert(f.cursor, c);
-            f.cursor += c.len_utf8();
-            f.edited = true;
-            f.origin = Origin::Empty;
-        }
-        _ => {}
-    }
-    Ok(false)
-}
-
-/// Break `text` into spans, starting a new `Line` at every newline so
-/// multi-line commands render as they will be pasted.
-fn push_preview(lines: &mut Vec<Line<'static>>, cur: &mut Vec<Span<'static>>, text: &str, style: Style) {
-    let mut first = true;
-    for part in text.split('\n') {
-        if !first {
-            lines.push(Line::from(std::mem::take(cur)));
-        }
-        first = false;
-        if !part.is_empty() {
-            cur.push(Span::styled(part.to_string(), style));
-        }
-    }
-}
-
-/// The live command preview: the original text with every slot substituted, the
-/// focused field's occurrences picked out in reverse video.
-fn fill_preview_lines(st: &FillState) -> Vec<Line<'static>> {
-    let plain = Style::default().fg(C_TITLE);
-    let filled = Style::default().fg(C_ACCENT);
-    let focused = Style::default()
-        .fg(C_FG_BRIGHT)
-        .bg(C_HIGHLIGHT_BG)
-        .add_modifier(Modifier::BOLD);
-    let empty = Style::default().fg(C_DIM).add_modifier(Modifier::ITALIC);
-
-    let mut lines: Vec<Line> = Vec::new();
-    let mut cur: Vec<Span> = Vec::new();
-    let mut at = 0usize;
-    for slot in &st.slots {
-        if slot.start > at {
-            push_preview(&mut lines, &mut cur, &st.cmd[at..slot.start], plain);
-        }
-        let f = &st.fields[slot.field];
-        let (text, style) = if f.value.is_empty() {
-            (format!("«{}»", f.label), empty)
-        } else if slot.field == st.cur {
-            (f.value.clone(), focused)
-        } else {
-            (f.value.clone(), filled)
-        };
-        push_preview(&mut lines, &mut cur, &text, style);
-        at = slot.end;
-    }
-    if at < st.cmd.len() {
-        push_preview(&mut lines, &mut cur, &st.cmd[at..], plain);
-    }
-    lines.push(Line::from(cur));
-    lines
-}
-
-const FILL_PREVIEW_MAX: u16 = 8;
-const FILL_FIELDS_MAX: usize = 12;
-
-/// Render the fill modal. Returns nothing; the cursor is placed on the focused
-/// field's value so typing reads naturally.
-fn render_fill(frame: &mut Frame, area: Rect, app: &mut App) {
-    let Some(st) = app.fill.as_mut() else { return };
-
-    let width = area.width.saturating_sub(6).clamp(40, 110);
-    let inner_w = width.saturating_sub(4).max(10);
-
-    let preview = fill_preview_lines(st);
-    // Paragraph wraps, so estimate the wrapped height to size the popup.
-    let preview_h: u16 = preview
-        .iter()
-        .map(|l| {
-            let w = l.width().max(1) as u16;
-            w.div_ceil(inner_w).max(1)
-        })
-        .sum::<u16>()
-        .clamp(1, FILL_PREVIEW_MAX);
-
-    let shown = st.fields.len().min(FILL_FIELDS_MAX);
-    // Keep the focused row inside the window.
-    if st.cur >= st.field_scroll + shown {
-        st.field_scroll = st.cur + 1 - shown;
-    }
-    if st.cur < st.field_scroll {
-        st.field_scroll = st.cur;
-    }
-
-    let height = (preview_h + shown as u16 + 4).min(area.height.saturating_sub(2).max(7));
-    let popup = centered_rect(width, height, area);
-
-    let filled_n = st.fields.iter().filter(|f| !f.value.is_empty()).count();
-    let title = format!(" Fill  ·  {}/{} set ", filled_n, st.fields.len());
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(C_ACCENT))
-        .padding(Padding::new(1, 1, 0, 0))
-        .title(title)
-        .title_alignment(Alignment::Center);
-    let inner = block.inner(popup);
-    frame.render_widget(Clear, popup);
-    frame.render_widget(block, popup);
-
-    let rows = Layout::vertical([
-        Constraint::Length(preview_h),
-        Constraint::Length(1),
-        Constraint::Min(0),
-        Constraint::Length(1),
-    ])
-    .split(inner);
-
-    frame.render_widget(
-        Paragraph::new(preview).wrap(Wrap { trim: false }),
-        rows[0],
-    );
-
-    // ── field rows ────────────────────────────────────────────────────
-    let label_w = st
-        .fields
-        .iter()
-        .map(|f| f.label.chars().count())
-        .max()
-        .unwrap_or(6)
-        .clamp(6, 18);
-    let hint_w = 15usize;
-    let value_w = (rows[2].width as usize).saturating_sub(2 + label_w + 1 + hint_w + 1);
-
-    let mut items: Vec<Line> = Vec::new();
-    for (i, f) in st
-        .fields
-        .iter()
-        .enumerate()
-        .skip(st.field_scroll)
-        .take(shown)
-    {
-        let focused = i == st.cur;
-        let marker = if focused { "▸ " } else { "  " };
-        let label_style = if focused {
-            Style::default().fg(C_FG_BRIGHT).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(C_DIM)
-        };
-        let (value_text, value_style) = if f.value.is_empty() {
-            (
-                "—".to_string(),
-                Style::default().fg(C_GUIDE).add_modifier(Modifier::ITALIC),
-            )
-        } else {
-            (
-                f.value.clone(),
-                Style::default().fg(if focused { C_FG_BRIGHT } else { C_TITLE }),
-            )
-        };
-        let shown_value: String = value_text.chars().take(value_w.max(4)).collect();
-        let pad = value_w.saturating_sub(shown_value.chars().count());
-
-        // For host-derived values the useful hint is *which* target, and the
-        // short name identifies it better than the full FQDN in 15 columns.
-        let mut hint = f.origin.label().to_string();
-        if f.origin == Origin::Hosts {
-            if let Some(t) = st.targets.get(st.target_idx) {
-                hint = if t.short.is_empty() {
-                    t.display().to_string()
-                } else {
-                    t.short.clone()
-                };
-            }
-        }
-        let counter = if f.suggestions.len() > 1 {
-            format!(" {}/{}", f.sugg_idx + 1, f.suggestions.len())
-        } else {
-            String::new()
-        };
-        // Trim the name, not the counter — the tail is the part worth keeping.
-        let room = hint_w.saturating_sub(counter.chars().count());
-        if hint.chars().count() > room {
-            hint = hint.chars().take(room.saturating_sub(1)).collect::<String>() + "…";
-        }
-        let hint = format!("{hint}{counter}");
-
-        items.push(Line::from(vec![
-            Span::styled(
-                marker,
-                Style::default().fg(if focused { C_ACCENT } else { C_BORDER }),
-            ),
-            Span::styled(format!("{:<w$} ", f.label, w = label_w), label_style),
-            Span::styled(shown_value, value_style),
-            Span::raw(" ".repeat(pad + 1)),
-            Span::styled(format!("{hint:>hint_w$}"), Style::default().fg(C_GUIDE)),
-        ]));
-    }
-    frame.render_widget(Paragraph::new(items), rows[2]);
-
-    // ── hint bar ──────────────────────────────────────────────────────
-    let last = st.cur + 1 >= st.fields.len();
-    let advance = if last { "⏎ copy & exit" } else { "⏎ next" };
-    let target_hint = if st.targets.len() > 1 {
-        format!(" · ^T target ({}/{})", st.target_idx + 1, st.targets.len())
-    } else {
-        String::new()
-    };
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            format!("{advance} · ⇥ move · ^P/^N suggest{target_hint} · ^Y copy now · Esc cancel"),
-            Style::default().fg(C_DIM),
-        )))
-        .alignment(Alignment::Center),
-        rows[3],
-    );
-
-    // ── cursor on the focused value ───────────────────────────────────
-    if st.cur >= st.field_scroll && st.cur < st.field_scroll + shown {
-        let f = &st.fields[st.cur];
-        let col = f.value[..f.cursor].chars().count().min(value_w.max(4));
-        let x = rows[2].x + 2 + label_w as u16 + 1 + col as u16;
-        let y = rows[2].y + (st.cur - st.field_scroll) as u16;
-        if x < rows[2].x + rows[2].width && y < rows[2].y + rows[2].height {
-            frame.set_cursor_position(Position::new(x, y));
-        }
     }
 }
