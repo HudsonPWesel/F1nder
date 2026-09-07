@@ -1345,6 +1345,7 @@ fn main() -> Result<()> {
     if print_result {
         match OpenOptions::new().read(true).write(true).open("/dev/tty") {
             Ok(tty) => {
+                let _paste_mode = ui::PasteModeGuard::new(true)?;
                 let mut writer = tty.try_clone()?;
                 enable_raw_mode()?;
                 execute!(writer, EnterAlternateScreen, Hide)?;
@@ -1356,12 +1357,14 @@ fn main() -> Result<()> {
                 run?;
             }
             Err(e) => {
-                eprintln!("f1nder: cannot open /dev/tty ({e}); falling back to clipboard mode");
+                eprintln!("f1nder: cannot open /dev/tty ({e}); using stdout for the interface");
                 app.print_result = false;
+                let _paste_mode = ui::PasteModeGuard::new(false)?;
                 ratatui::run(|terminal| ui::run_event_loop(terminal, &mut app))?;
             }
         }
     } else {
+        let _paste_mode = ui::PasteModeGuard::new(false)?;
         ratatui::run(|terminal| ui::run_event_loop(terminal, &mut app))?;
     }
 
@@ -1373,7 +1376,7 @@ fn main() -> Result<()> {
     app.save_prev_browse();
     app.save_prev_method();
 
-    if print_result && let Some(result) = app.result.take() {
+    if let Some(result) = app.result.take() {
         println!("{result}");
     }
 

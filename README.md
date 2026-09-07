@@ -2,8 +2,14 @@
 
 An interactive command finder and pentest methodology checklist. Search and
 browse the command library, then fill, complete, add, or drop parameters before
-the finished command is handed back. Enter still copies and exits; F1 shows
-every key (j/k scrolls the overlay).
+the finished command is handed back. Commands invoking `.exe` files, PowerShell
+(`powershell` / `pwsh`), `.ps1` scripts, or recognized PowerShell cmdlets go to
+the clipboard. Other commands print to the terminal after the interface closes.
+Mentioning an `.exe` as a file argument does not trigger clipboard output.
+F1 shows every key (j/k scrolls the overlay). Ctrl+Y outputs the selected command
+and exits from Search or Browse, skipping the fill dialog. Inside the fill
+dialog, Ctrl+Y outputs the current filled command and exits. Both Enter and
+Ctrl+Y use the same destination rules; commands are never executed.
 
 The three tabs are Search, Browse, and Methodology.
 
@@ -17,14 +23,20 @@ own text. Bare switches (`--no-pass`, `-k`, `2>/dev/null`) get rows too, marked
 
 | Key | Does |
 |---|---|
-| `⏎` | accept this row and move on; the last one copies and exits |
+| `⏎` | accept this row and move on; the last one outputs and exits |
 | `⇥` / `→` | accept the ghost-text completion |
 | `^X` | drop the whole parameter from this copy (toggle); deletes an added row |
 | `^A` | add a new argument at the focused row's position in the command |
 | `^U` | clear the row, reverting it to the template's own text |
+| `^D` | disable autofill for this dialog and restore the entire base template, with literal tokens |
 | `^P` / `^N` | cycle the ranked suggestions |
 | `^T` | switch `/etc/hosts` target |
-| `^Y` | copy now, leaving the remaining rows at their defaults |
+| `^Y` | output and exit, leaving remaining rows at their defaults |
+
+Ctrl+D resets all rows, including your edits, added arguments, and dropped
+parameters. You can then edit manually, press Ctrl+Y to output the literal template,
+or use Enter to send it through shell integration. Autofill resumes the next
+time you open a command.
 
 Dropping and adding change only the copy you are about to use. The stored JSON
 is never touched, and a dialog you Enter straight through reproduces the stored
@@ -61,9 +73,10 @@ working and there is nothing to migrate. Named profiles live in
 
 ## Shell prompt integration
 
-By default the chosen command goes to the clipboard and you paste it. The shell
-integration removes that step — the command lands on your prompt, unrun, cursor
-at the end. Add one line to `~/.zshrc` (or `~/.bashrc`):
+Windows executable and PowerShell commands go to the clipboard, including with
+shell integration enabled. Other commands print to stdout; shell integration
+places them on your prompt, unrun, cursor at the end. Add one line to `~/.zshrc`
+(or `~/.bashrc`):
 
 ```sh
 eval "$(/path/to/f1nder --shell-init zsh)"   # or: bash
@@ -90,14 +103,14 @@ the command one Up-arrow away instead.
 
 Only the wrapper function passes `--print`, so a binary started any other way
 (`./f1nder`, an absolute path, a tmux popup) has no stdout anyone is reading. In
-that case it copies as before **and** writes the command to
+that case it prints non-Windows commands **and**, when using Enter, writes them to
 `$XDG_CACHE_HOME/f1nder/prompt-<shell pid>.cmd`; the `precmd` hook installed by
 the same eval reads that file, deletes it, and preloads the prompt. Naming the
 file after the shell means a hook only ever sees its own line — no cross-talk
 between terminals — and files a dead shell never collected are swept after an
 hour. Mode `0600`, and `F1NDER_NO_LOG=1` turns it off along with the rest.
 
-Without a controlling terminal, `--print` warns and falls back to the clipboard.
+Without a controlling terminal, `--print` warns and draws the interface on stdout.
 
 ## Bulk import
 

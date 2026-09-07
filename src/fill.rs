@@ -596,6 +596,8 @@ impl HostTarget {
 }
 
 pub struct FillState {
+    /// Whether automatic suggestions and completions are enabled for this dialog.
+    pub autofill: bool,
     pub title: String,
     pub cmd: String,
     pub slots: Vec<Slot>,
@@ -2463,6 +2465,7 @@ pub fn audit(entries: &[(String, String, String)], filter: Option<&str>) {
             }
             let (fields, slots) = detect(cmd);
             let state = FillState {
+                autofill: true,
                 title: String::new(),
                 cmd: cmd.clone(),
                 slots: slots.clone(),
@@ -2549,6 +2552,7 @@ pub fn audit(entries: &[(String, String, String)], filter: Option<&str>) {
     for (_, title, cmd) in entries {
         let (fields, slots) = detect(cmd);
         let st = FillState {
+            autofill: true,
             title: String::new(),
             cmd: cmd.clone(),
             slots,
@@ -2663,6 +2667,7 @@ mod tests {
     fn roundtrip(cmd: &str) -> String {
         let (fields, slots) = detect(cmd);
         let st = FillState {
+            autofill: true,
             title: String::new(),
             cmd: cmd.to_string(),
             slots,
@@ -3118,6 +3123,7 @@ mod tests {
             .field;
         fields[field].dropped = true;
         render_filled(&FillState {
+            autofill: true,
             title: String::new(),
             cmd: cmd.into(),
             slots,
@@ -3134,6 +3140,7 @@ mod tests {
     fn state_of(cmd: &str) -> FillState {
         let (fields, slots) = detect(cmd);
         FillState {
+            autofill: true,
             title: String::new(),
             cmd: cmd.into(),
             slots,

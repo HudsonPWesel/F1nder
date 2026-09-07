@@ -13,7 +13,9 @@ use crate::{App, Chain, Entry, MethodPos, SearchMode, SearchPane, TreeNode};
 use color_eyre::Result;
 use color_eyre::eyre::eyre;
 use crossterm::cursor::{Hide, Show};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -60,6 +62,37 @@ const IC_ITEM: &str = "\u{f105}"; //
 
 static EDITOR_TEMP_PATH: OnceLock<String> = OnceLock::new();
 
+// This UI consumes key events, not bracketed-paste events. Clear inherited
+// paste mode, and clear it again after editors or on exit so the next program
+// does not receive literal ESC[200~/ESC[201~ wrappers. In --print mode all
+// terminal controls must go to /dev/tty, never the command output stream.
+pub struct PasteModeGuard {
+    print_mode: bool,
+}
+
+impl PasteModeGuard {
+    pub fn new(print_mode: bool) -> Result<Self> {
+        let guard = Self { print_mode };
+        guard.reset()?;
+        Ok(guard)
+    }
+
+    fn reset(&self) -> std::io::Result<()> {
+        if self.print_mode {
+            let mut tty = fs::OpenOptions::new().write(true).open("/dev/tty")?;
+            execute!(tty, DisableBracketedPaste)
+        } else {
+            execute!(stdout(), DisableBracketedPaste)
+        }
+    }
+}
+
+impl Drop for PasteModeGuard {
+    fn drop(&mut self) {
+        let _ = self.reset();
+    }
+}
+
 struct SuspendedTui {
     print_mode: bool,
 }
@@ -82,10 +115,10 @@ impl Drop for SuspendedTui {
         let _ = enable_raw_mode();
         if self.print_mode {
             if let Ok(mut tty) = fs::OpenOptions::new().write(true).open("/dev/tty") {
-                let _ = execute!(tty, EnterAlternateScreen, Hide);
+                let _ = execute!(tty, EnterAlternateScreen, Hide, DisableBracketedPaste);
             }
         } else {
-            let _ = execute!(stdout(), EnterAlternateScreen, Hide);
+            let _ = execute!(stdout(), EnterAlternateScreen, Hide, DisableBracketedPaste);
         }
     }
 }
@@ -148,6 +181,54 @@ pub fn run_event_loop<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> 
             .map_err(|_| eyre!("terminal draw failed"))?;
         if handle_key_event(app, terminal)? {
             break Ok(());
+        }
+    }
+}
+
+/// Recognize executable positions, not .exe filenames passed as arguments.
+fn windows_command(text: &str) -> bool {
+    static COMMAND: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r#"(?im)(?:^|[;|&\n]|\$\()\s*(?:[&.]\s+)?(?:\$[\w:]+\s*=\s*)?(?:"([^"\n]+)"|'([^'\n]+)'|([^\s;|&()]+))"#,
+        )
+        .unwrap()
+    });
+    COMMAND.captures_iter(text).any(|caps| {
+        let token = (1..=3).find_map(|i| caps.get(i)).unwrap().as_str();
+        let name = token.rsplit(['/', '\\']).next().unwrap_or(token).to_ascii_lowercase();
+        if name.ends_with(".exe") || name.ends_with(".ps1")
+            || matches!(name.as_str(), "powershell" | "pwsh" | "iex")
+        {
+            return true;
+        }
+        // PowerShell cmdlets/functions use Verb-Noun names. Restrict the verb
+        // so Unix commands such as ssh-keygen stay in stdout.
+        token.rsplit(['/', '\\']).next().unwrap_or(token).split_once('-')
+            .is_some_and(|(verb, noun)| {
+                matches!(verb.to_ascii_lowercase().as_str(),
+                    "get" | "set" | "new" | "remove" | "add" | "clear" |
+                    "invoke" | "import" | "export" | "start" | "stop" |
+                    "test" | "write" | "read" | "out" | "select" | "where" |
+                    "foreach" | "convertto" | "convertfrom" | "join" | "split" |
+                    "enable" | "disable" | "register" | "unregister")
+                    && !noun.is_empty()
+                    && noun.chars().all(|c| c.is_ascii_alphanumeric())
+            })
+    })
+}
+
+fn deliver_output(app: &mut App, rendered: &str, direct: bool) {
+    if windows_command(rendered) {
+        app.result = None;
+        if !copy_to_clipboard(rendered) {
+            eprintln!("f1nder: could not copy command to clipboard");
+        }
+    } else {
+        app.result = Some(rendered.to_owned());
+        if !app.print_result && !direct
+            && !app.vars_path.to_string_lossy().contains("f1nder-test-vars")
+        {
+            let _ = crate::usage::drop_for_prompt(rendered);
         }
     }
 }
@@ -1077,6 +1158,25 @@ fn handle_key_event<B: Backend>(app: &mut App, terminal: &mut Terminal<B>) -> Re
         // So is the search-mode picker.
         if app.mode_popup_active {
             return handle_mode_popup_key(app, key);
+        }
+        if matches!(key.code, KeyCode::Char('y' | 'Y'))
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && !app.is_chain_edit_mode
+        {
+            let idx = match app.top_tab {
+                0 if app.search_focus == SearchPane::Chain => displayed_chain_steps(app)
+                    .get(app.chain_sel)
+                    .and_then(|id| app.entry_index.get(id).copied()),
+                0 => app.selected_entry_index(),
+                1 => browse_selected_entry_index(app),
+                _ => None,
+            };
+            if let Some(idx) = idx {
+                let cmd = app.entries[idx].cmd.clone();
+                finish_output(app, idx, cmd, Default::default(), true)?;
+                return Ok(true);
+            }
+            return Ok(false);
         }
         // The Browse and Methodology tabs have their own key handling. Esc (quit)
         // and `[`/`]` (tab switching) still fall through to the shared match below.
@@ -5100,7 +5200,7 @@ fn open_fill_or_copy(app: &mut App, idx: usize) -> Result<bool> {
     // to stop and open the modal — Enter on a command with nothing to fill has
     // always just copied it.
     if !fields.iter().any(|f| f.role == fill::Role::Value) {
-        finish_output(app, idx, cmd, std::collections::HashMap::new())?;
+        finish_output(app, idx, cmd, std::collections::HashMap::new(), false)?;
         return Ok(true);
     }
 
@@ -5131,6 +5231,7 @@ fn open_fill_or_copy(app: &mut App, idx: usize) -> Result<bool> {
     }
 
     app.fill = Some(Box::new(FillState {
+        autofill: true,
         title,
         cmd,
         slots,
@@ -5147,7 +5248,7 @@ fn open_fill_or_copy(app: &mut App, idx: usize) -> Result<bool> {
 
 /// Substitute, copy, remember the values, quit — the same exit path Enter has
 /// always taken.
-fn fill_finish(app: &mut App) -> Result<bool> {
+fn fill_finish(app: &mut App, clipboard_only: bool) -> Result<bool> {
     let Some(st) = app.fill.take() else {
         return Ok(true);
     };
@@ -5179,12 +5280,9 @@ fn fill_finish(app: &mut App) -> Result<bool> {
         .iter()
         .position(|e| e.cmd == st.cmd && e.title == st.title);
     if let Some(idx) = idx {
-        finish_output(app, idx, rendered, vars)?;
-    } else if app.print_result {
-        app.result = Some(rendered);
+        finish_output(app, idx, rendered, vars, clipboard_only)?;
     } else {
-        copy_to_clipboard(&rendered);
-        let _ = crate::usage::drop_for_prompt(&rendered);
+        deliver_output(app, &rendered, clipboard_only);
     }
     Ok(true)
 }
@@ -5194,13 +5292,10 @@ fn finish_output(
     idx: usize,
     rendered: String,
     vars: std::collections::HashMap<String, String>,
+    clipboard_only: bool,
 ) -> Result<()> {
+    deliver_output(app, &rendered, clipboard_only);
     let entry = &app.entries[idx];
-    if app.print_result {
-        app.result = Some(rendered.clone());
-    } else {
-        copy_to_clipboard(&rendered);
-    }
     let item = crate::usage::Use {
         ts: crate::usage::now_iso(),
         entry_id: entry.id.clone(),
@@ -5214,11 +5309,6 @@ fn finish_output(
         vars: vars.clone(),
     };
     if !app.vars_path.to_string_lossy().contains("f1nder-test-vars") {
-        // Only the clipboard path needs the drop file: with --print the shell
-        // already has the command in hand, and pushing it twice would double it.
-        if !app.print_result {
-            let _ = crate::usage::drop_for_prompt(&item.cmd);
-        }
         let _ = crate::usage::append(&app.profile, item.clone());
         if !vars.is_empty() {
             let _ = crate::usage::export_env(&app.profile, &vars);
@@ -5252,6 +5342,9 @@ fn fill_focus(st: &mut FillState, next: usize) {
 
 fn fill_completion(app: &App) -> Option<String> {
     let st = app.fill.as_ref()?;
+    if !st.autofill {
+        return None;
+    }
     let f = st.fields.get(st.cur)?;
     if f.dropped || f.cursor != f.value.len() {
         return None;
@@ -5340,16 +5433,16 @@ fn handle_fill_key(app: &mut App, key: KeyEvent) -> Result<bool> {
             app.fill = None;
         }
         // Ctrl+Enter / Ctrl+Y finish from any field, leaving the rest at their
-        // defaults. (Not every terminal reports Ctrl+Enter, hence both.)
-        KeyCode::Enter if ctrl => return fill_finish(app),
-        KeyCode::Char('y' | 'Y') if ctrl => return fill_finish(app),
+        // defaults. Ctrl+Y skips the prompt drop file; both auto-route output.
+        KeyCode::Enter if ctrl => return fill_finish(app, false),
+        KeyCode::Char('y' | 'Y') if ctrl => return fill_finish(app, true),
         KeyCode::Enter => {
             let last = {
                 let st = app.fill.as_ref().unwrap();
                 st.cur + 1 >= st.fields.len()
             };
             if last {
-                return fill_finish(app);
+                return fill_finish(app, false);
             }
             let st = app.fill.as_mut().unwrap();
             fill_focus(st, st.cur + 1);
@@ -5391,6 +5484,22 @@ fn handle_fill_key(app: &mut App, key: KeyEvent) -> Result<bool> {
                     ctx.apply_target(&mut st.fields, Some(&target));
                 }
             }
+        }
+        // Restore the base template, including dropped parameters, and disable
+        // suggestions for this dialog. Empty values render the original tokens
+        // verbatim and are excluded from sticky-value storage.
+        KeyCode::Char('d' | 'D') if ctrl => {
+            let st = app.fill.as_mut().unwrap();
+            let (fields, slots) = fill::detect(&st.cmd);
+            st.fields = fields;
+            st.slots = slots;
+            st.autofill = false;
+            st.targets.clear();
+            st.target_idx = 0;
+            st.cur = 0;
+            st.field_scroll = 0;
+            st.preview_scroll = 0;
+            st.notice = Some("Autofill off · base template restored".into());
         }
         // Reset the focused field to its detected default.
         KeyCode::Char('r' | 'R') if ctrl => {
@@ -5812,6 +5921,37 @@ fn render_fill(frame: &mut Frame, area: Rect, app: &mut App) {
 
 #[cfg(test)]
 mod tests {
+    use super::{finish_output, windows_command};
+    #[test]
+    fn command_output_destination() {
+        for cmd in [
+            "tool.exe /help", "./TOOL.EXE", "& \"C:\\Program Files\\Tool.exe\"",
+            "powershell -Command Get-Date", "pwsh -File script.ps1",
+            "Get-Process", "$x = New-Object System.Object", ". ./script.ps1",
+            "echo ready; tool.exe", "Get-Date | Out-String",
+        ] {
+            assert!(windows_command(cmd), "{cmd}");
+        }
+        for cmd in [
+            "whoami", "ls -la", "ssh-keygen -t ed25519",
+            "curl https://example.com/tool.exe -o tool.exe",
+            "echo powershell", "file tool.exe", "cat script.ps1",
+        ] {
+            assert!(!windows_command(cmd), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn terminal_output_works_with_both_shortcuts_and_print_modes() {
+        for print in [false, true] {
+            for direct in [false, true] {
+                let mut app = app_named("ls -la", "output-routing");
+                app.print_result = print;
+                finish_output(&mut app, 0, "ls -la".into(), Default::default(), direct).unwrap();
+                assert_eq!(app.result.as_deref(), Some("ls -la"));
+            }
+        }
+    }
     use super::{
         chain_present, file_filter_toggle, handle_fill_key, handle_mode_popup_key, init_chain_sel,
         mode_options, open_fill_or_copy, parse_template_str, reset_search_view, search_nav_down,
@@ -6146,16 +6286,68 @@ azurenum --interactive\n";
         assert_eq!(st.fields[0].value, "ab");
     }
 
-    /// Ctrl+Y finishes early, leaving untouched fields at their defaults —
-    /// which, with no context available, is the original literal text.
+    #[test]
+    fn disable_autofill_restores_literal_template() {
+        let cmd = "nxc smb 'TARGET' -u 'USER' -p 'PASSWORD' --no-pass";
+        let mut app = app_named(cmd, "base-template");
+        app.print_result = true;
+        app.var_ctx
+            .as_mut()
+            .unwrap()
+            .sticky
+            .insert("user".into(), "alice".into());
+        open_fill_or_copy(&mut app, 0).unwrap();
+        {
+            let st = app.fill.as_mut().unwrap();
+            st.fields[0].value = "10.0.0.5".into();
+            st.fields[0].dropped = true;
+            fill::insert_arg(st, 0);
+        }
+        assert!(!handle_fill_key(&mut app, ctrl('d')).unwrap());
+        let st = app.fill.as_ref().unwrap();
+        assert!(!st.autofill);
+        assert_eq!(fill::render_filled(st), cmd);
+        assert!(
+            st.fields
+                .iter()
+                .all(|f| !f.dropped && f.role != fill::Role::Added)
+        );
+        assert!(super::fill_completion(&app).is_none());
+        // Navigation and suggestion shortcuts cannot reintroduce autofill.
+        for code in [KeyCode::Tab, KeyCode::Enter] {
+            assert!(!handle_fill_key(&mut app, key(code)).unwrap());
+        }
+        for c in ['t', 'n', 'p', 'r'] {
+            assert!(!handle_fill_key(&mut app, ctrl(c)).unwrap());
+        }
+        assert_eq!(fill::render_filled(app.fill.as_ref().unwrap()), cmd);
+        assert!(
+            handle_fill_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)
+            )
+            .unwrap()
+        );
+        assert_eq!(app.result.as_deref(), Some(cmd));
+        let sticky = fill::load_sticky(&app.vars_path);
+        assert_eq!(sticky.get("user").map(String::as_str), Some("alice"));
+        assert!(!sticky.values().any(|v| v == "TARGET" || v == "PASSWORD"));
+        let _ = std::fs::remove_file(&app.vars_path);
+        open_fill_or_copy(&mut app, 0).unwrap();
+        assert!(app.fill.as_ref().unwrap().autofill);
+    }
+
+    /// Ctrl+Y finishes early, leaving untouched fields at their defaults.
     #[test]
     fn copy_now_leaves_defaults_intact() {
         let cmd = "nxc smb 10.129.5.5 -u htb-student -p 'Password1'";
         let mut app = app_named(cmd, "copynow");
+        app.print_result = true;
         open_fill_or_copy(&mut app, 0).unwrap();
         assert_eq!(fill::render_filled(app.fill.as_ref().unwrap()), cmd);
         assert!(handle_fill_key(&mut app, ctrl('y')).unwrap());
         assert!(app.fill.is_none());
+        assert_eq!(app.result.as_deref(), Some(cmd));
         let _ = std::fs::remove_file("/tmp/f1nder-test-vars-copynow.json");
     }
 }
